@@ -207,7 +207,7 @@ impl OperationScope {
     }
 
     pub async fn begin_kind(kind: OperationKind, command: &str, dry_run: bool) -> Result<Self> {
-        Self::begin_with_wait(kind, command, dry_run, OPERATION_LOCK_WAIT, false).await
+        Self::begin_with_wait(kind, command, dry_run, operation_lock_wait(), false).await
     }
 
     /// The watcher retries contention later rather than delaying its event loop.
@@ -353,7 +353,8 @@ impl OperationScope {
                 return;
             }
         }
-        let started = tokio::task::spawn_blocking(|| open_lazy(OPERATION_LOCK_WAIT)).await;
+        let wait = operation_lock_wait();
+        let started = tokio::task::spawn_blocking(move || open_lazy(wait)).await;
         match started {
             Ok(Ok(true)) => {}
             // an earlier write already ran without a journal; no second try
@@ -915,7 +916,7 @@ fn would_record(state_dir: &Path, tracked: &TrackedSet, kind: OperationKind) -> 
 /// own (an explicit save) holds this for its duration too, so it never
 /// interleaves with a bootstrap, rollback, or undo.
 pub fn take_operation_lock(store: &Store, tracked: &TrackedSet) -> Result<fslock::LockFile> {
-    take_operation_lock_with_wait(store, tracked, OPERATION_LOCK_WAIT)
+    take_operation_lock_with_wait(store, tracked, operation_lock_wait())
 }
 
 /// Network synchronization may skip a capture while a write operation owns
@@ -1014,7 +1015,36 @@ fn acquire_operation_lock(store: &Store, wait: std::time::Duration) -> Result<fs
     Ok(lock)
 }
 
-/// How long an operation waits for a running one, and how often it looks.
+/// How long a command waits for another history operation when one is set.
+static OPERATION_LOCK_WAIT_OVERRIDE: Mutex<Option<std::time::Duration>> = Mutex::new(None);
+
+/// Sets how long this process waits for another history operation.
+///
+/// `mise dot --lock-wait` sets this before it runs a command. Callers that
+/// pass [`std::time::Duration::ZERO`] do not read it: the watcher and
+/// recovery never wait.
+pub fn set_operation_lock_wait(wait: std::time::Duration) {
+    *lock_unpoisoned(&OPERATION_LOCK_WAIT_OVERRIDE) = Some(wait);
+}
+
+#[cfg(test)]
+fn clear_operation_lock_wait() {
+    *lock_unpoisoned(&OPERATION_LOCK_WAIT_OVERRIDE) = None;
+}
+
+fn operation_lock_wait() -> std::time::Duration {
+    lock_unpoisoned(&OPERATION_LOCK_WAIT_OVERRIDE).unwrap_or(OPERATION_LOCK_WAIT)
+}
+
+/// Parses `--lock-wait`. `0` fails at once. Longer than one hour is refused.
+pub fn parse_lock_wait(value: &str) -> Result<std::time::Duration> {
+    let wait = mise_util::duration::parse_duration(value)?;
+    if wait > std::time::Duration::from_secs(60 * 60) {
+        bail!("--lock-wait must be at most 1h, got {value}");
+    }
+    Ok(wait)
+}
+
 const OPERATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 const OPERATION_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -1453,5 +1483,51 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn configured_lock_wait_is_honored_and_zero_callers_are_not() -> Result<()> {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                clear_operation_lock_wait();
+            }
+        }
+        let _reset = Reset;
+        let temp = tempfile::tempdir()?;
+        let store = Store::open_in(temp.path())?;
+        let held = LockFile::at(&store::operation_lock_in(temp.path()))
+            .try_lock()?
+            .unwrap();
+        set_operation_lock_wait(std::time::Duration::from_secs(2));
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let locked = take_operation_lock(&store, &TrackedSet::default());
+        assert!(locked.is_ok(), "{locked:?}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(200));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        drop(locked);
+        release.join().unwrap();
+
+        let held = LockFile::at(&store::operation_lock_in(temp.path()))
+            .try_lock()?
+            .unwrap();
+        set_operation_lock_wait(std::time::Duration::ZERO);
+        let started = std::time::Instant::now();
+        assert!(take_operation_lock(&store, &TrackedSet::default()).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+        set_operation_lock_wait(std::time::Duration::from_secs(5));
+        let started = std::time::Instant::now();
+        assert!(recovery_lock(&store).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        drop(held);
+        assert_eq!(parse_lock_wait("5m")?.as_secs(), 300);
+        assert!(parse_lock_wait("0")?.is_zero());
+        assert!(parse_lock_wait("2h").is_err());
+        Ok(())
     }
 }

@@ -376,14 +376,17 @@ commands still need their recovery data.
 
 Operations that record history take a lock on the history store in
 `MISE_STATE_DIR`. A run that records history waits up to 30 seconds for the
-lock, then fails.
+lock, then fails. `mise dot --lock-wait 5m save` waits up to that duration
+instead. `0` fails at once. The same value is `MISE_HISTORY_LOCK_WAIT`. The
+wait is at most 1 hour. `mise dot watch` and `mise dot recover` never wait,
+and ignore the flag.
 
 A `mise bootstrap` with nothing tracked and no existing history touches the
 history store only when it first rewrites a dotfile or edit, to keep a private
 journal for recovering interrupted writes. If another mise process holds the
 lock at that point, it warns and continues without the journal instead of
 failing. A run that starts with nothing to record but declares tracking before
-it ends waits the same 30 seconds at the end. If the lock is still busy, or an
+it ends waits the same duration at the end. If the lock is still busy, or an
 earlier write already ran without the journal, it warns that its outcome was
 not recorded and keeps its result.
 

@@ -100,12 +100,24 @@ fn select_requests(
         "mise dot track ~/.config/nvim",
         help = "Save the history of a directory in place"
     ),
-    example("mise dot history", help = "List saved checkpoints")
+    example("mise dot history", help = "List saved checkpoints"),
+    example(
+        "mise dot --lock-wait 5m save",
+        help = "Wait up to 5 minutes for a running history operation, then save"
+    )
 )]
 pub(crate) struct Dotfiles {
     /// Work on this machine's local-only history (`mode = "track-local"`), which is never shared
     #[usage(long)]
     local: bool,
+
+    /// How long to wait for another history operation to finish before failing
+    ///
+    /// A duration such as `5m` or `0`. `0` fails at once. When omitted, a
+    /// command waits 30 seconds. At most `1h`. `watch` and `recover` never
+    /// wait, and ignore this flag. Same as `MISE_HISTORY_LOCK_WAIT`.
+    #[usage(long, env = "MISE_HISTORY_LOCK_WAIT", value_name = "DURATION")]
+    lock_wait: Option<String>,
 
     #[usage(subcommand)]
     command: Commands,
@@ -153,6 +165,7 @@ impl Dotfiles {
         if self.local && !local_scope {
             return run_local_argv(true);
         }
+        self.apply_lock_wait()?;
         // Anything a background save had to say is said here, to the
         // person who is now present, before the command they asked for
         // runs. The watcher itself is where those notices come from, so
@@ -177,6 +190,24 @@ impl Dotfiles {
             crate::system::history::notices::drain();
         }
         outcome
+    }
+
+    /// `watch` and `recover` never wait, even when the flag or the
+    /// environment names a duration. A script that exports
+    /// `MISE_HISTORY_LOCK_WAIT` must not make the watcher block.
+    fn apply_lock_wait(&self) -> Result<()> {
+        let Some(value) = &self.lock_wait else {
+            return Ok(());
+        };
+        if matches!(self.command, Commands::Watch(_) | Commands::Recover(_)) {
+            warn!(
+                "--lock-wait does not apply to this command; it never waits for another history operation"
+            );
+            return Ok(());
+        }
+        let wait = crate::system::history::scope::parse_lock_wait(value)?;
+        crate::system::history::scope::set_operation_lock_wait(wait);
+        Ok(())
     }
 
     /// Local-only history has checkpoints to browse, save, and restore, and
