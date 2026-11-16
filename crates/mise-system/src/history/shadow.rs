@@ -484,6 +484,9 @@ impl HistoryRepo {
             }
             None => BTreeMap::new(),
         };
+        // opened once: every cached entry below asks whether its blob is an
+        // encrypted envelope, and opening a repository scans every pack index
+        let gix = self.gix()?;
         for (root, encrypted) in roots.iter_mut().zip(encrypted_by_root) {
             root.files.retain(|rel| !encrypted.contains(rel));
             for rel in encrypted {
@@ -520,7 +523,7 @@ impl HistoryRepo {
                             && entry.scheme == scheme
                     })
                     .filter(|entry| {
-                        self.blob_starts_with(&entry.oid, b"mise-encrypted-file-v1\n")
+                        self.blob_starts_with_in(&gix, &entry.oid, b"mise-encrypted-file-v1\n")
                             .unwrap_or(false)
                     });
                 let previous = in_history.remove(&path);
@@ -560,7 +563,7 @@ impl HistoryRepo {
                                 let encoded = super::sync::files::encode(
                                     &path, mode, &bytes, &scheme, recipients,
                                 )?;
-                                self.hash_blob(&encoded)?
+                                self.hash_blob_in(&gix, &encoded)?
                             }
                         };
                         cache.insert(
@@ -650,6 +653,9 @@ impl HistoryRepo {
         root: &CaptureRoot,
         omitted: &mut Vec<super::store::PathReason>,
     ) -> Result<String> {
+        // opening a repository scans every pack index: one open serves every
+        // file of the root, not one per file
+        let gix = self.gix()?;
         let mut overlays = vec![];
         for rel in &root.files {
             let live = root.path.join(rel);
@@ -658,7 +664,7 @@ impl HistoryRepo {
                 let (mode, oid) = if meta.file_type().is_symlink() {
                     (
                         "120000",
-                        self.hash_blob(path_bytes(&std::fs::read_link(&live)?).as_ref())?,
+                        self.hash_blob_in(&gix, path_bytes(&std::fs::read_link(&live)?).as_ref())?,
                     )
                 } else if meta.is_dir() {
                     ("160000", mise_util::git::Git::new(&live).current_sha()?)
@@ -676,7 +682,7 @@ impl HistoryRepo {
                     )?;
                     (
                         if executable { "100755" } else { "100644" },
-                        self.hash_blob(&bytes)?,
+                        self.hash_blob_in(&gix, &bytes)?,
                     )
                 } else {
                     bail!("cannot capture non-file {}", display_path(&live));
@@ -1305,13 +1311,24 @@ impl HistoryRepo {
     }
 
     pub(crate) fn blob_starts_with(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
-        if let Some(bytes) = self.transient_blob(oid) {
-            return Ok(bytes.starts_with(prefix));
+        if self.transient_blob(oid).is_none() && Self::object_id(oid).is_some() {
+            return self.blob_starts_with_in(&self.gix()?, oid, prefix);
         }
-        if let Some(id) = Self::object_id(oid) {
+        self.blob_starts_with_in_git(oid, prefix)
+    }
+
+    /// [`Self::blob_starts_with`] through an already open repository. Opening
+    /// one scans every pack index, so a walk that asks about many blobs opens
+    /// it once and passes it here, not once per blob.
+    pub(crate) fn blob_starts_with_in(
+        &self,
+        repo: &gix::Repository,
+        oid: &str,
+        prefix: &[u8],
+    ) -> Result<bool> {
+        if let (None, Some(id)) = (self.transient_blob(oid), Self::object_id(oid)) {
             // gix reads a full object id without starting Git; a blob
             // shorter than the prefix cannot match, so it is never read
-            let repo = self.gix()?;
             let header = repo
                 .find_header(id)
                 .wrap_err_with(|| format!("reading {id}"))?;
@@ -1325,6 +1342,14 @@ impl HistoryRepo {
                 .find_object(id)
                 .wrap_err_with(|| format!("reading {id}"))?;
             return Ok(object.data.starts_with(prefix));
+        }
+        self.blob_starts_with_in_git(oid, prefix)
+    }
+
+    /// A transient (not yet written) blob, or a revision only Git resolves.
+    fn blob_starts_with_in_git(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
+        if let Some(bytes) = self.transient_blob(oid) {
+            return Ok(bytes.starts_with(prefix));
         }
         self.git.blob_starts_with(oid, prefix)
     }
@@ -1352,8 +1377,13 @@ impl HistoryRepo {
     /// Writes `bytes` as a blob, as `hash-object -w --stdin` does (no
     /// filters), without starting Git once per file of a snapshot.
     pub(crate) fn hash_blob(&self, bytes: &[u8]) -> Result<String> {
-        Ok(self
-            .gix()?
+        self.hash_blob_in(&self.gix()?, bytes)
+    }
+
+    /// [`Self::hash_blob`] through an already open repository, for a walk that
+    /// writes many blobs (opening one scans every pack index).
+    pub(crate) fn hash_blob_in(&self, repo: &gix::Repository, bytes: &[u8]) -> Result<String> {
+        Ok(repo
             .write_blob(bytes)
             .wrap_err("writing a blob")?
             .to_string())
@@ -1962,11 +1992,16 @@ impl HistoryRepo {
             args.push("-p".to_string());
             args.push(parent.to_string());
         }
-        args.push("-m".to_string());
-        args.push(message.to_string());
+        // The message goes on stdin: a large operation lists every affected
+        // path, which overflows the kernel's per-argument limit as `-m`.
+        let mut body = message.to_string();
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
         let email = super::config::git_email()?;
         self.output_str(
             PlumbingCall::new(args)
+                .stdin(body.as_bytes())
                 .env("GIT_AUTHOR_EMAIL", email.as_str())
                 .env("GIT_COMMITTER_EMAIL", email),
         )
@@ -2333,6 +2368,35 @@ mod tests {
         let checkpoint = repo.read_meta(&commit).unwrap();
         assert_eq!(checkpoint.uuid, commit);
         assert_eq!(checkpoint.description, "sha256 history");
+    }
+
+    /// A message past the kernel's per-argument limit (128 KiB) still commits.
+    #[test]
+    fn commit_tree_accepts_a_message_larger_than_one_argument() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("repo.git");
+        let output = std::process::Command::new(mise_util::git::plumbing_binary().unwrap())
+            .args(["init", "--bare", "--quiet", "--object-format=sha1"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let repo = super::HistoryRepo {
+            git: mise_util::git::GitPlumbing::new(path),
+            transient: Default::default(),
+        };
+        let tree = repo.empty_object("tree").unwrap();
+        let message = format!("apply\n\n{}", "x".repeat(200 * 1024));
+        let commit = repo.commit_tree(&tree, vec![], &message).unwrap();
+        assert_eq!(commit.len(), 40);
+        let git = repo.gix().unwrap();
+        let object = git
+            .find_commit(gix::ObjectId::from_hex(commit.as_bytes()).unwrap())
+            .unwrap();
+        assert_eq!(
+            object.message_raw().unwrap(),
+            format!("{message}\n").as_bytes()
+        );
     }
 
     /// Blobs written in-process get the ids `hash-object` gives them, in

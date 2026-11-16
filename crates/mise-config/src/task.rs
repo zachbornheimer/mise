@@ -22,7 +22,7 @@ pub use confirm::TaskConfirm;
 pub use decl::{TaskDecl, TaskTemplate};
 pub use decls::{TaskDecls, TaskTemplateDecls};
 pub use dep::TaskDep;
-pub use lock::TaskLock;
+pub use lock::{NamedLock, TaskLock};
 pub use outputs::TaskOutputs;
 pub(crate) use schema::{defs as schema_defs, task_template as template_schema};
 pub use secrets::{G7_TEXT, TaskSecrets};
@@ -699,13 +699,16 @@ mod shape_tests {
         let declared = keys::<TaskDependencyTable>();
         assert_eq!(
             declared,
-            ["args", "env", "optional", "task"].map(String::from).into()
+            ["args", "env", "optional", "tag", "task"]
+                .map(String::from)
+                .into()
         );
         for key in &declared {
             let sample = match key.as_str() {
                 "task" => "\"build\"",
                 "args" => "[\"a\"]",
                 "env" => "{ A = \"b\" }",
+                "tag" => "[\"lint\"]",
                 _ => "true",
             };
             let table = format!(

@@ -8,8 +8,12 @@ outline: [2, 3]
 mise does not accept external pull requests, and GitHub does not let anyone
 outside the maintainer team create one. Report bugs in
 [Issues](https://github.com/jdx/mise/issues), and bring questions, ideas, and
-feature requests to [Discussions](https://github.com/jdx/mise/discussions). Say
-what you ran, the relevant config, and what you expected.
+feature requests to [Discussions](https://github.com/jdx/mise/discussions).
+
+Bug reports, in Issues or Discussions, are only for problems you ran into while
+using mise. Say what you were trying to do, what you ran, the relevant config,
+and what happened. Reports found by reading the source or by having an agent
+search the code will be closed.
 
 The rest of this page is the maintainer's reference for building, testing, and
 documenting mise. It is also useful if you want to build from source.
@@ -601,7 +605,7 @@ not install. See
 for the exact flags.
 
 ```sh
-cargo deny check               # advisories, licenses, and allowed sources
+mise x -- cargo-deny check       # advisories, bans, licenses, and allowed sources
 cargo machete --with-metadata  # unused dependencies
 cargo msrv verify              # the minimum supported Rust version
 ```

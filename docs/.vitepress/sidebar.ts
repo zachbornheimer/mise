@@ -20,6 +20,7 @@ export const sidebar: SidebarItem[] = [
       { text: "Editors and IDEs", link: "/ide-integration" },
       { text: "Continuous integration", link: "/continuous-integration" },
       { text: "Docker", link: "/mise-cookbook/docker" },
+      { text: "Coding agents", link: "/agents" },
       { text: "AI assistants (MCP)", link: "/mcp" },
     ],
   },
@@ -273,6 +274,10 @@ export const sidebar: SidebarItem[] = [
           { text: "macOS defaults", link: "/bootstrap/macos-defaults" },
           { text: "macOS LaunchAgents", link: "/bootstrap/launchd" },
           { text: "systemd user units", link: "/bootstrap/systemd" },
+          {
+            text: "Bootstrap settings plugins",
+            link: "/bootstrap/settings-plugins",
+          },
         ],
       },
     ],

@@ -96,10 +96,12 @@ pub(crate) async fn handle_shim() -> Result<()> {
         deny_read: false,
         deny_write: false,
         deny_net: false,
+        deny_unix: false,
         deny_env: false,
         allow_read: vec![],
         allow_write: vec![],
         allow_net: vec![],
+        allow_unix: vec![],
         allow_env: vec![],
         secrets: vec![],
         secrets_all: false,
@@ -219,7 +221,8 @@ pub(crate) async fn apply_native_shim_command_wrapper(
     if !same_command_name(shim_name, program) {
         return Ok(None);
     }
-    let Some(wrapper) = command_wrapper_for(config, ts, shim_name, true).await? else {
+    let Some(wrapper) = command_wrapper_for(config, ts, shim_name, &command[1..], true).await?
+    else {
         return Ok(None);
     };
     trace!("shim[{shim_name}] WRAPPER command: {}", wrapper.command());
@@ -242,6 +245,7 @@ async fn command_wrapper_for(
     config: &mut Arc<Config>,
     ts: &mut Toolset,
     shim_name: &str,
+    call_args: &[String],
     install_command: bool,
 ) -> Result<Option<CommandWrapper>> {
     if is_active_command_wrapper(shim_name) {
@@ -308,7 +312,9 @@ async fn command_wrapper_for(
         })));
     }
     // The toolset context carries the resolved project `[env]`, which `config.tera_ctx` lacks.
-    let ctx = with_source(ts.tera_ctx(config).await?);
+    let mut ctx = with_source(ts.tera_ctx(config).await?);
+    // What the user typed after the command name, for `args` and `env` only.
+    ctx.insert("argv", call_args);
     let args = wrapper
         .args()
         .iter()
@@ -388,7 +394,7 @@ async fn which_shim(
         .build(config)
         .await?;
     if let Some(wrapper) =
-        command_wrapper_for(config, &mut ts, shim_name, !completion_offline).await?
+        command_wrapper_for(config, &mut ts, shim_name, &args[1..], !completion_offline).await?
     {
         trace!("shim[{bin_name}] WRAPPER command: {}", wrapper.command());
         return Ok((ShimCommand::Wrapper(wrapper), ts));
@@ -500,6 +506,14 @@ async fn which_shim(
     let mut tvs = ts.list_rtvs_with_bin(config, shim_name).await?;
     if tvs.is_empty() && shim_name != bin_name {
         tvs = ts.list_rtvs_with_bin(config, bin_name).await?;
+    }
+    // A configured tool with a missing version that may provide this command keeps its own error:
+    // another installed tool shipping the same executable must not stand in for a pinned one.
+    if !missing_version_may_provide(config, &ts, shim_name, bin_name).await
+        && let Some(bin) =
+            crate::shims::installed_fallback_bin(config, &mut ts, &tvs, shim_name, bin_name).await?
+    {
+        return Ok((ShimCommand::Tool(bin), ts));
     }
     match err_no_version_set(config, ts, shim_name, tvs).await {
         Ok(_) => unreachable!("err_no_version_set always returns an error"),

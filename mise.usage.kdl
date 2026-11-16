@@ -647,6 +647,7 @@ Repeat the flag or separate parts with commas. Cannot be combined with `--skip`.
                 choice macos-defaults {
                     alias defaults hide=#true
                 }
+                choice settings
                 choice macos-launchd-agents {
                     alias launchd hide=#true
                 }
@@ -698,6 +699,7 @@ Repeat the flag or separate parts with commas. Cannot be combined with `--only`.
                 choice macos-defaults {
                     alias defaults hide=#true
                 }
+                choice settings
                 choice macos-launchd-agents {
                     alias launchd hide=#true
                 }
@@ -1581,17 +1583,19 @@ on macOS and Windows, use `[bootstrap.services]`.
             }
         }
     }
-    cmd macos subcommand_required=#true help="Manage macOS preferences and LaunchAgents from `[bootstrap.macos]`" effect=read {
+    cmd macos subcommand_required=#true help="Manage macOS preferences and LaunchAgents from `[bootstrap.settings.macos]` and `[bootstrap.macos.launchd]`" effect=read {
         flag "-h --help" help="Print help" action=help builtin=#true
         cmd defaults subcommand_required=#true help="Manage macOS preferences such as Dock, Finder, and keyboard settings" effect=read {
             long_help #"""
 Manage macOS preferences such as Dock, Finder, and keyboard settings
 
-Applies `[bootstrap.macos.defaults]`, `[[bootstrap.macos.defaults_entries]]`,
-and the `[bootstrap.macos.dock]`, `finder`, `keyboard`, and `trackpad`
-sections. Preferences are written the way `defaults write` writes them.
-mise does not restart apps: Dock, Finder, and some others show a change
-only after they relaunch.
+Applies `[bootstrap.settings.macos]`: its `defaults`, `dock`, `finder`,
+`keyboard`, `trackpad`, and `login_items` tables, and its
+`[[bootstrap.settings.macos.defaults_entries]]` array of tables.
+Preferences are written the way `defaults write` writes them. mise does not
+restart apps: Dock, Finder, and some others show a change only after they
+relaunch. Other `[bootstrap.settings.<plugin>]` sections are applied by
+bootstrap settings plugins through `mise bootstrap settings`.
 """#
             flag "-h --help" help="Print help" action=help builtin=#true
             cmd apply help="Write the configured macOS preferences" effect=write {
@@ -1953,10 +1957,12 @@ fi
 Show what applying bootstrap resources would change
 
 Covers accounts, packages, files and directories, system and user services,
-the firewall, and Compose projects, in dependency order. Repositories,
-dotfiles, shell activation, macOS defaults, LaunchAgents, systemd user
-units, the login shell, tools, hooks, and the `bootstrap` task are not
-planned; preview the whole run with `mise bootstrap --dry-run`.
+the firewall, Compose projects, and Git repositories, in dependency order.
+Hooks are listed with the action `run`, since a command cannot be diffed;
+they do not count as changes for `--detailed-exitcode`. Dotfiles, shell
+activation, macOS defaults, LaunchAgents, systemd user units, the login
+shell, tools, and the `bootstrap` task are not planned; preview the whole
+run with `mise bootstrap --dry-run`.
 """#
         flag "-J --json" help="Output a stable machine-readable plan in JSON format"
         flag --detailed-exitcode help="Exit 0 if nothing would change, 2 if something would, 1 on errors or unknown state" {
@@ -2090,6 +2096,7 @@ Repeat the flag or separate parts with commas. Cannot be combined with `--skip`.
                     choice macos-defaults {
                         alias defaults hide=#true
                     }
+                    choice settings
                     choice macos-launchd-agents {
                         alias launchd hide=#true
                     }
@@ -2137,6 +2144,7 @@ Repeat the flag or separate parts with commas. Cannot be combined with `--only`.
                     choice macos-defaults {
                         alias defaults hide=#true
                     }
+                    choice settings
                     choice macos-launchd-agents {
                         alias launchd hide=#true
                     }
@@ -2310,6 +2318,34 @@ also removes one that [bootstrap.linux.systemd.units] or
         example "mise bootstrap services apply --dry-run" help="Show what would change"
         example "mise bootstrap services remove mise-history" help="Uninstall a user service"
     }
+    cmd settings subcommand_required=#true help="[experimental] Apply `[bootstrap.settings]` through bootstrap settings plugins" effect=read {
+        long_help #"""
+[experimental] Apply `[bootstrap.settings]` through bootstrap settings plugins
+
+A bootstrap settings plugin reads and writes the settings of one program or
+desktop, such as a Linux distro's appearance settings. mise compares the
+values in `[bootstrap.settings.<plugin>]` with the values the plugin reports
+and asks it to write only the ones that differ.
+See https://mise.jdx.dev/bootstrap/settings-plugins.html
+"""#
+        flag "-h --help" help="Print help" action=help builtin=#true
+        cmd apply help="Write the settings that differ from `[bootstrap.settings]`" effect=write {
+            long_help #"""
+Write the settings that differ from `[bootstrap.settings]`
+
+It does not ask for confirmation.
+"""#
+            flag "-n --dry-run" help="Show which settings would change without changing them"
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg "[PLUGIN]…" help="Plugins whose sections to apply; all of them by default" required=#false var=#true
+        }
+        cmd status help="Show each setting in `[bootstrap.settings]` and its current value" effect=read {
+            flag --missing help="Exit with status 1 if a setting differs from the config or its plugin cannot run"
+            flag "-J --json" help="Output in JSON format"
+            flag "-h --help" help="Print help" action=help builtin=#true
+            arg "[PLUGIN]…" help="Plugins whose sections to show; all of them by default" required=#false var=#true
+        }
+    }
     cmd status help="Show the state of every configured bootstrap part" effect=read {
         alias ls
         long_help #"""
@@ -2320,6 +2356,7 @@ the firewall, Compose projects, repositories, dotfiles, shell activation,
 macOS defaults, LaunchAgents, systemd user units, the login shell, `[tools]`,
 and the system dependencies of those tools, without changing anything.
 Checking dotfiles can render trusted templates, which may run `exec()`.
+`[bootstrap.settings]` is not checked yet: use `mise bootstrap settings status`.
 
 `--missing` exits with status 1 if anything differs from the config; it
 still lists every entry.
@@ -3743,7 +3780,13 @@ JSON, dotenv, and shell output contain actual variable values, including secrets
 Tools you pass as TOOL@VERSION arguments are installed first if they are missing;
 missing tools from the config are reported, not installed.
 """#
-    flag "-D --dotenv" help="Output in dotenv format" overrides=--shell
+    flag "-D --dotenv" help="Output in dotenv format" overrides=--shell {
+        long_help #"""
+Output in dotenv format
+
+Values are quoted and escaped where needed so mise reads them back unchanged. Tools that do not interpret quotes, such as Docker `--env-file`, receive them literally.
+"""#
+    }
     flag "-J --json" help="Output in JSON format" overrides=--shell
     flag "-s --shell" help="Shell type to generate environment variables for" overrides=--json {
         arg <SHELL> {
@@ -3827,6 +3870,14 @@ https://mise.jdx.dev/sandboxing.html#access-to-particular-hosts
     flag --allow-write help="Allow writes to PATH (implies --deny-write for everything else)" var=#true {
         arg <PATH>
     }
+    flag --allow-unix help="Allow connections to the Unix socket at PATH, or to every socket under it if PATH is a directory (implies --deny-unix for every other socket)" var=#true {
+        long_help #"""
+Allow connections to the Unix socket at PATH, or to every socket under it if PATH is a directory (implies --deny-unix for every other socket)
+
+Abstract sockets created inside the sandbox stay reachable. Linux 7.1 or later only.
+"""#
+        arg <PATH>
+    }
     flag --deny-all help="Block reads, writes, network, and env vars"
     flag --deny-env help="Block env var inheritance except PATH, HOME, USER, SHELL, TERM, COLORTERM, LANG" {
         long_help #"""
@@ -3839,6 +3890,7 @@ SystemRoot and TEMP.
     flag --deny-net help="Block all network access"
     flag --deny-read help="Block filesystem reads (system libs and tool dirs still accessible)"
     flag --deny-write help="Block filesystem writes except temporary and device paths (/tmp, /dev)"
+    flag --deny-unix help="Block connections to Unix sockets outside the sandbox (Linux 7.1 or later)"
     flag --fresh-env help="Bypass the environment cache and recompute the environment"
     flag --no-deps help="Skip automatic dependency preparation"
     flag --raw help="Connect install commands directly to the terminal; implies --jobs=1" overrides=--jobs
@@ -5629,6 +5681,12 @@ directory. This does not install a tool version.
         long_help #"""
 List installed plugins
 
+Plugins installed for every user in a system plugins directory, such as
+`/usr/share/mise/plugins`, are listed after your own and marked `(system)`.
+A package manager or the machine's admin owns them, so `--outdated` skips
+them and `mise plugins update`/`uninstall` leave them alone. A system plugin
+that one of your plugins overrides is marked as overridden.
+
 Use `--core` to list the core tools built into mise instead, or
 `--core --user` for both. `--outdated` checks each plugin's Git remote for
 newer plugin code; it does not compare tool versions. Use `mise ls` for
@@ -5695,7 +5753,9 @@ Update installed plugins
 
 With no names, updates every installed plugin. This updates the plugin code,
 not the tool versions it manages. Linked local plugins are skipped; plugins
-installed from an archive cannot be updated with Git.
+installed from an archive cannot be updated with Git. A system plugin, such
+as one in `/usr/share/mise/plugins`, is skipped with a warning: update it
+with the package or admin that installed it.
 """#
         flag "-j --jobs" help="Number of plugins to update in parallel (default: the `jobs` setting)" {
             arg <JOBS>
@@ -6002,6 +6062,14 @@ It runs in the worktree's copy of the directory mise was started from (not a tas
         arg <CMD>
     }
     flag --all help="Open the task picker with tasks from every project in the monorepo" conflicts=--affected
+    flag --multi help="Open the task picker as a checklist and run every task you check" {
+        long_help #"""
+Open the task picker as a checklist and run every task you check
+
+Space checks a task, `/` filters, and Enter runs the checked tasks as if they were named with `:::`. Needs an interactive terminal. Combine with `--all` to list the tasks from every project in the monorepo.
+"""#
+        conflicts "--affected" "--tag"
+    }
     flag "-c --continue-on-error" help="Continue running tasks even if one fails"
     flag "-C --cd" help="Change to this directory before running the tasks" {
         arg <DIR>
@@ -6097,6 +6165,9 @@ Per-host filtering does not work: Linux and macOS exit with an error, and Window
     flag --allow-write help="Allow writes to a specific path (implies `--deny-write` for everything else)" var=#true {
         arg <PATH>
     }
+    flag --allow-unix help="Allow connections to the Unix socket at a specific path, or to every socket under it if PATH is a directory (implies `--deny-unix` for every other socket). Abstract sockets created inside the sandbox stay reachable. Linux 7.1 or later only." var=#true {
+        arg <PATH>
+    }
     flag --deny-all help="Block reads, writes, network, and env vars"
     flag --deny-env help="Block env var inheritance except PATH, HOME, USER, SHELL, TERM, COLORTERM, and LANG" {
         long_help #"""
@@ -6108,6 +6179,7 @@ On Windows it also keeps the variables programs need to start, such as `SystemRo
     flag --deny-net help="Block all network access"
     flag --deny-read help="Block filesystem reads (system libraries and tool directories stay readable)"
     flag --deny-write help="Block filesystem writes except temporary and device paths (/tmp, /dev)"
+    flag --deny-unix help="Block connections to Unix sockets outside the sandbox (Linux 7.1 or later only)"
     flag --fresh-env help="Bypass the environment cache and recompute the environment"
     flag --no-cache help="Do not use the cache for remote tasks" env=MISE_TASK_REMOTE_NO_CACHE
     flag --no-deps help="Do not run `[deps]` providers that have `auto = true` before the tasks"
@@ -7277,6 +7349,14 @@ It runs in the worktree's copy of the directory mise was started from (not a tas
             arg <CMD>
         }
         flag --all help="Open the task picker with tasks from every project in the monorepo" conflicts=--affected
+        flag --multi help="Open the task picker as a checklist and run every task you check" {
+            long_help #"""
+Open the task picker as a checklist and run every task you check
+
+Space checks a task, `/` filters, and Enter runs the checked tasks as if they were named with `:::`. Needs an interactive terminal. Combine with `--all` to list the tasks from every project in the monorepo.
+"""#
+            conflicts "--affected" "--tag"
+        }
         flag "-c --continue-on-error" help="Continue running tasks even if one fails"
         flag "-C --cd" help="Change to this directory before running the tasks" {
             arg <DIR>
@@ -7372,6 +7452,9 @@ Per-host filtering does not work: Linux and macOS exit with an error, and Window
         flag --allow-write help="Allow writes to a specific path (implies `--deny-write` for everything else)" var=#true {
             arg <PATH>
         }
+        flag --allow-unix help="Allow connections to the Unix socket at a specific path, or to every socket under it if PATH is a directory (implies `--deny-unix` for every other socket). Abstract sockets created inside the sandbox stay reachable. Linux 7.1 or later only." var=#true {
+            arg <PATH>
+        }
         flag --deny-all help="Block reads, writes, network, and env vars"
         flag --deny-env help="Block env var inheritance except PATH, HOME, USER, SHELL, TERM, COLORTERM, and LANG" {
             long_help #"""
@@ -7383,6 +7466,7 @@ On Windows it also keeps the variables programs need to start, such as `SystemRo
         flag --deny-net help="Block all network access"
         flag --deny-read help="Block filesystem reads (system libraries and tool directories stay readable)"
         flag --deny-write help="Block filesystem writes except temporary and device paths (/tmp, /dev)"
+        flag --deny-unix help="Block connections to Unix sockets outside the sandbox (Linux 7.1 or later only)"
         flag --fresh-env help="Bypass the environment cache and recompute the environment"
         flag --no-cache help="Do not use the cache for remote tasks" env=MISE_TASK_REMOTE_NO_CACHE
         flag --no-deps help="Do not run `[deps]` providers that have `auto = true` before the tasks"

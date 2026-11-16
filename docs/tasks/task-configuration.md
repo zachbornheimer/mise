@@ -44,7 +44,7 @@ experimental = true
 | [Skipping work](#skipping-work)                           | [`skip_if`](/tasks/task-configuration.html#skip-if), [`sources`](#sources), [`outputs`](#outputs), [`watch`](#watch), [`cache`](/tasks/task-configuration.html#cache)                                                          |
 | [Execution](#execution)                                   | [`timeout`](#timeout), [`lock`](#lock), [`raw`](#raw), [`interactive`](#interactive)                                                                                                                                           |
 | [Output](#output-properties)                              | [`output`](#output), [`quiet`](#quiet), [`silent`](#silent)                                                                                                                                                                    |
-| [Sandbox](#sandbox)                                       | `deny_all`, `deny_read`, `deny_write`, `deny_net`, `deny_env`, `allow_read`, `allow_write`, `allow_net`, `allow_env`, `pass_through_env`                                                                                       |
+| [Sandbox](#sandbox)                                       | `deny_all`, `deny_read`, `deny_write`, `deny_net`, `deny_env`, `deny_unix`, `allow_read`, `allow_write`, `allow_net`, `allow_unix`, `allow_env`, `pass_through_env`                                                            |
 | [Deprecated](#deprecated)                                 | [`rust_cache`](/tasks/task-configuration.html#rust-cache)                                                                                                                                                                      |
 
 The rest of the page covers [`[task_config]` options](#task-config-options),
@@ -441,6 +441,34 @@ depends = [
 ]
 ```
 
+#### Dependencies by tag
+
+Use `tag` in a table entry to depend on every task in the loaded configs that
+has a [tag](#tags), whatever its name. It does not load other monorepo
+projects to look for tagged tasks. A remote task counts only when the tags are
+in its `mise.toml` entry, not in the `#MISE` header of the file. A list selects the tasks that have any of the
+tags.
+
+```toml
+[tasks.clippy]
+tags = "lint"
+run = "cargo clippy"
+
+[tasks.shellcheck]
+tags = "lint"
+run = "shellcheck scripts/*.sh"
+
+[tasks.ci]
+depends = [{ tag = "lint" }, { tag = ["test", "slow"] }]
+```
+
+With a `task` as well, the entry keeps only the matching tasks that have the
+tag, like `mise run --tag lint 'check:*'`. It fails when no task is selected,
+unless `optional = true`. A task never depends on itself, so a task tagged
+`lint` can sit in a `{ tag = "lint" }` entry of its own. `tag` also works in
+[`depends_post`](/tasks/task-configuration.html#depends-post) and
+[`wait_for`](/tasks/task-configuration.html#wait-for).
+
 ### `depends_post`
 
 - **Type**: same as [`depends`](#depends)
@@ -757,6 +785,15 @@ entry can include a file that an earlier `!` excluded. For example,
 `*.test.ts` file except `src/keep.test.ts`. To match a literal path that starts
 with `!`, escape it as `\!` (`"\\!important.txt"` in a TOML basic string).
 
+To keep freshness checks fast, mise does not walk into a directory when no source
+can come from it. That covers a directory that fails a leading component of a
+pattern (`packages/*/node_modules` for `packages/*/src/**/*`), and one that a `!`
+entry ending in `/**` excludes (`!**/node_modules/**`). This is conservative: any
+positive entry after the `!` entry, even an unrelated one, turns that skipping
+off, and `task_source_files()` still walks excluded directories. An entry
+without the trailing `/**`, such as `!**/node_modules`, excludes only the paths it
+matches, so files below them can still be sources and mise still walks them.
+
 #### Dependency invalidation
 
 When a dependency with `sources` runs or restores its outputs, every task that
@@ -876,7 +913,7 @@ Windows at once. The run-wide timeout does not stop the processes of
 
 ### `lock`
 
-- **Type**: `boolean | string | string[]`
+- **Type**: `boolean | string | { name, count } | (string | { name, count })[]`
 - **Default**: unset
 
 Resources the task holds while its commands run. A run that needs a lock
@@ -900,10 +937,56 @@ lock = true
 
 - A name is shared by every task on this machine that names it, in any project.
   Pick a specific name, such as `shop-test-db` rather than `db`.
+- A name can use [templates](/templates.html), so <code v-pre>lock = "{{config_root}}/package-lock.json"</code>
+  is shared only by tasks of that project, not by every project on the machine.
 - `true` lets one run of the task at a time across every worktree of its
   repository. Another repository with a task of the same name is not affected.
+- `{ name = "...", count = N }` takes N slots of a lock that has several, for a
+  resource that is limited rather than unique, such as the cores or memory of a
+  machine. See [Locks with several slots](#locks-with-several-slots).
 - `false` or an empty list takes no lock, for example to turn off a lock a
   template sets.
+
+#### Locks with several slots
+
+A lock is a pool of slots. By default a name has one, so one run holds it at a
+time. Set [`task.lock_pools`](/configuration/settings.html#task.lock_pools) once
+per machine to give a name more, and let each task take the share it needs:
+
+```toml
+# ~/.config/mise/config.toml
+[settings.task.lock_pools]
+cpu = "8"
+```
+
+```toml
+[tasks.lint]
+run = "..."
+lock = "cpu" # one slot
+
+[tasks.test]
+run = "..."
+lock = [{ name = "cpu", count = 4 }, "test-db"]
+```
+
+Here `lint` and `test` run together while their shares fit in the 8 slots, and
+a run that does not fit waits. A task takes all `count` slots or none, so two
+waiters never each hold part of what the other needs, and a task that does not
+fit leaves room for a smaller one that does. A `count` above the pool's slots
+takes all of them. A task that waits gives up its `--jobs` slot, as it does for
+any lock. Waiting tasks are not queued, so a steady stream of small tasks can
+keep a large one waiting; give the large one the whole pool if that matters.
+
+`MISE_TASK_LOCKS` lists the slots a task holds, for example
+`cpu,cpu:2,cpu:5,cpu:6`: the first slot is the bare name and the others add
+`:N`. A task can use the numbers to pick a resource no other running task has,
+such as a test database or a port. A nested task that needs no more slots than
+its parent holds shares them; one that needs more fails, because two parents
+could each wait for the slots the other holds.
+
+Set the number of slots in one place per machine, normally the global config,
+not in each project: runs that disagree on how many slots a pool has can exceed
+the smaller number between them.
 
 A task takes its locks after its dependencies finish and once mise has decided
 it must run: a task skipped by `skip_if` or fresh `sources`, or restored from
@@ -1025,18 +1108,20 @@ the matching restriction. Relative paths resolve from the task's working
 directory. Support and implicit exceptions differ by platform; see
 [Sandboxing](/sandboxing.html).
 
-| Property                                                        | Type       | Effect                                                                                                                                                     |
-| --------------------------------------------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `deny_all`                                                      | `bool`     | Block filesystem reads and writes, network access, and inherited environment variables. `allow_*` entries add exceptions.                                  |
-| `deny_read`                                                     | `bool`     | Block filesystem reads, except the system and mise paths the task needs to run.                                                                            |
-| `deny_write`                                                    | `bool`     | Block filesystem writes, except implicitly writable paths such as the temporary directory.                                                                 |
-| `deny_net`                                                      | `bool`     | Block network access.                                                                                                                                      |
-| `deny_env`                                                      | `bool`     | Drop inherited environment variables except `PATH`, `HOME`, `USER`, `SHELL`, `TERM`, `COLORTERM`, and `LANG`.                                              |
-| `allow_read`                                                    | `string[]` | Allow reads from these paths and block other reads.                                                                                                        |
-| `allow_write`                                                   | `string[]` | Allow writes to these paths, which also become readable, and block other writes.                                                                           |
-| `allow_net`                                                     | `string[]` | Not supported: on Linux and macOS a task that sets it fails before it runs. See [access to particular hosts](/sandboxing.html#access-to-particular-hosts). |
-| `allow_env`                                                     | `string[]` | Keep these inherited variables, with `*` wildcards such as `MYAPP_*`, and drop the others.                                                                 |
-| `pass_through_env` <Badge type="warning" text="experimental" /> | `string[]` | Keep these inherited variables, with `*` wildcards, when environment inheritance is denied, without adding their values to the task cache key.             |
+| Property                                                        | Type       | Effect                                                                                                                                                                                                                                                                |
+| --------------------------------------------------------------- | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deny_all`                                                      | `bool`     | Block filesystem reads and writes, network access, and inherited environment variables. `allow_*` entries add exceptions.                                                                                                                                             |
+| `deny_read`                                                     | `bool`     | Block filesystem reads, except the system and mise paths the task needs to run.                                                                                                                                                                                       |
+| `deny_write`                                                    | `bool`     | Block filesystem writes, except implicitly writable paths such as the temporary directory.                                                                                                                                                                            |
+| `deny_net`                                                      | `bool`     | Block network access.                                                                                                                                                                                                                                                 |
+| `deny_env`                                                      | `bool`     | Drop inherited environment variables except `PATH`, `HOME`, `USER`, `SHELL`, `TERM`, `COLORTERM`, and `LANG`.                                                                                                                                                         |
+| `deny_unix`                                                     | `bool`     | Block connections to Unix sockets except those in `allow_unix`. Abstract sockets created inside the sandbox stay reachable. Needs Linux 7.1 or later: older kernels and macOS fail before the task runs, and Windows warns and runs the task without the restriction. |
+| `allow_read`                                                    | `string[]` | Allow reads from these paths and block other reads.                                                                                                                                                                                                                   |
+| `allow_write`                                                   | `string[]` | Allow writes to these paths, which also become readable, and block other writes.                                                                                                                                                                                      |
+| `allow_net`                                                     | `string[]` | Not supported: on Linux and macOS a task that sets it fails before it runs. See [access to particular hosts](/sandboxing.html#access-to-particular-hosts).                                                                                                            |
+| `allow_unix`                                                    | `string[]` | Allow connections to these sockets, or to every socket under these directories, and block other Unix sockets. Same platform support as `deny_unix`.                                                                                                                   |
+| `allow_env`                                                     | `string[]` | Keep these inherited variables, with `*` wildcards such as `MYAPP_*`, and drop the others.                                                                                                                                                                            |
+| `pass_through_env` <Badge type="warning" text="experimental" /> | `string[]` | Keep these inherited variables, with `*` wildcards, when environment inheritance is denied, without adding their values to the task cache key.                                                                                                                        |
 
 The `deny_*` properties default to `false` and the lists to `[]`.
 

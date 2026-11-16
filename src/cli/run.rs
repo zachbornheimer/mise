@@ -207,6 +207,14 @@ pub(crate) struct Run {
     #[usage(long, conflicts = ["task", "affected"])]
     pub all: bool,
 
+    /// Open the task picker as a checklist and run every task you check
+    ///
+    /// Space checks a task, `/` filters, and Enter runs the checked tasks as
+    /// if they were named with `:::`. Needs an interactive terminal. Combine
+    /// with `--all` to list the tasks from every project in the monorepo.
+    #[usage(long, conflicts = ["task", "affected", "tag"])]
+    pub multi: bool,
+
     /// Continue running tasks even if one fails
     #[usage(long, short = 'c')]
     pub continue_on_error: bool,
@@ -330,6 +338,11 @@ pub(crate) struct Run {
     #[usage(long, value_name = "PATH")]
     pub allow_write: Vec<std::path::PathBuf>,
 
+    /// Allow connections to the Unix socket at a specific path, or to every socket under it if PATH is a directory (implies
+    /// `--deny-unix` for every other socket). Abstract sockets created inside the sandbox stay reachable. Linux 7.1 or later only.
+    #[usage(long, value_name = "PATH")]
+    pub allow_unix: Vec<std::path::PathBuf>,
+
     /// Block reads, writes, network, and env vars
     #[usage(long)]
     pub deny_all: bool,
@@ -354,6 +367,11 @@ pub(crate) struct Run {
     /// Block filesystem writes except temporary and device paths (/tmp, /dev)
     #[usage(long)]
     pub deny_write: bool,
+
+    /// Block connections to Unix sockets outside the sandbox (Linux 7.1 or
+    /// later only)
+    #[usage(long)]
+    pub deny_unix: bool,
 
     /// Bypass the environment cache and recompute the environment
     #[usage(long)]
@@ -612,6 +630,16 @@ async fn get_affected_task_list(
     let mut lockfile_projects = BTreeMap::<PathBuf, BTreeSet<_>>::new();
 
     for path in changes.paths.iter().cloned() {
+        if let Some(projects) =
+            crate::task::workspace::node::shared_lockfile_projects(&path, &graph)
+        {
+            lockfile_projects
+                .entry(path.clone())
+                .or_default()
+                .extend(projects);
+            regular_paths.insert(path);
+            continue;
+        }
         let Some(lockfile_candidates) =
             graph.affected_projects_for_lockfile(&providers, &path, None, None)?
         else {
@@ -651,7 +679,7 @@ async fn get_affected_task_list(
         .collect::<BTreeSet<_>>();
 
     let args = affected_task_args(args);
-    let mut tasks = get_task_lists(config, &args, true, only, false).await?;
+    let mut tasks = get_task_lists(config, &args, true, only, false, false).await?;
     // Restrict only the task-pattern matches. `Run::run` calls `resolve_depends`
     // after this returns, so prerequisites from unaffected projects remain intact.
     tasks.retain(|task| {
@@ -686,7 +714,7 @@ async fn get_source_affected_task_list(
     use crate::task::task_affected::affected_task_reasons;
 
     let mut repos = crate::task::task_affected::AffectedRepos::new(&revisions, config)?;
-    let mut tasks = get_task_lists(config, args, true, only, false).await?;
+    let mut tasks = get_task_lists(config, args, true, only, false, false).await?;
     // As in a monorepo, finding no tagged task is not an error.
     keep_tagged(config, &mut tasks, tags.tags, tags.no_cache).await?;
     // As in a monorepo, only the pattern matches are filtered: `Run::run` resolves their
@@ -1025,7 +1053,7 @@ impl Run {
                 )
                 .collect_vec();
 
-            let mut task_list = get_task_lists(&config, &args, false, false, false).await?;
+            let mut task_list = get_task_lists(&config, &args, false, false, false, false).await?;
             // Help is for the task `--tag` would run.
             retain_tagged(&config, &mut task_list, &self.tag, &args, self.no_cache).await?;
 
@@ -1037,14 +1065,22 @@ impl Run {
                     // Get usage spec to check if task has defined args/flags
                     let spec = task.parse_usage_spec_for_display(&config).await?;
 
-                    if has_any_usage_spec(&spec) {
-                        // Task has usage spec defined, render help using usage library
-                        miseprintln!("{}", render_usage_help(&spec, &self.args));
+                    // A spec that only turns help off still controls what `-h` means.
+                    let opts_out_of_help =
+                        spec.disable_help == Some(true) || spec.cmd.disable_help_flag;
+                    if has_any_usage_spec(&spec) || opts_out_of_help {
+                        // Whether `-h`/`--help` asks for help is the spec's to say: it may
+                        // disable help, declare a flag of its own named `-h`, or take the word
+                        // as a flag's value. Otherwise the task runs and gets it as an argument.
+                        if asks_for_help(&spec, &task.name, &self.args) {
+                            miseprintln!("{}", render_usage_help(&spec, &self.args));
+                            return Ok(());
+                        }
                     } else {
                         // Task has no usage defined, show basic task info
                         display_task_help(task)?;
+                        return Ok(());
                     }
-                    return Ok(());
                 }
             } else {
                 // No task found, show run command help
@@ -1091,7 +1127,7 @@ impl Run {
             )
             .await?
         } else {
-            get_task_lists(&config, &args, true, self.skip_deps, self.all).await?
+            get_task_lists(&config, &args, true, self.skip_deps, self.all, self.multi).await?
         };
         if !self.affected {
             retain_tagged(&config, &mut task_list, &self.tag, &args, self.no_cache).await?;
@@ -1336,6 +1372,9 @@ impl Run {
                     &resolved_tasks,
                     self.dry_run,
                     !self.skip_tools,
+                    self.silent
+                        || self.quiet
+                        || self.output.is_some_and(|o| o.is_quiet() || o.is_silent()),
                 ),
             )
             .await?;
@@ -2049,12 +2088,14 @@ impl Run {
                     deny_read: self.deny_read,
                     deny_write: self.deny_write,
                     deny_net: self.deny_net,
+                    deny_unix: self.deny_unix,
                     deny_env: self.deny_env,
                     deny_process: false,
                     deny_temp_write: false,
                     allow_read: self.allow_read.clone(),
                     allow_write: self.allow_write.clone(),
                     allow_net: self.allow_net.clone(),
+                    allow_unix: self.allow_unix.clone(),
                     allow_env: self.allow_env.clone(),
                     pass_through_env: vec![],
                     cache_env: vec![],
@@ -2362,6 +2403,29 @@ fn display_task_help(task: &Task) -> Result<()> {
     miseprintln!("{hint}");
     miseprintln!("See https://mise.jdx.dev/tasks/task-configuration.html for more information.");
     Ok(())
+}
+
+/// Whether the task's usage spec takes `-h`/`--help` in `args` as a request for help.
+///
+/// Asks usage's parser rather than scanning the words, so a spec that disables help, a declared
+/// flag named `-h`, and a flag's value are all kept as the arguments they are. Only the words are
+/// read: no `choices run=` command runs, and environment values and defaults are not checked.
+fn asks_for_help(spec: &usage::Spec, task_name: &str, args: &[String]) -> bool {
+    use usage::parse::{Parser, TokenRole};
+    let argv = once(task_name.to_string())
+        .chain(args.iter().cloned())
+        .collect_vec();
+    let tokens = match Parser::new(spec)
+        .without_running_commands()
+        .explain_refused(&argv)
+    {
+        Ok(out) => out.tokens,
+        Err(tokens) => tokens,
+    };
+    tokens
+        .iter()
+        .flat_map(|token| &token.roles)
+        .any(|role| matches!(role, TokenRole::Builtin { spelling } if spelling == "-h" || spelling == "--help"))
 }
 
 fn render_usage_help(spec: &usage::Spec, args: &[String]) -> String {

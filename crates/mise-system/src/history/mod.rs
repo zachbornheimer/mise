@@ -42,10 +42,18 @@ use tracked::TrackedSet;
 /// changes the store: an operation that died is closed by the next one
 /// that takes the operation lock (a save, a bootstrap, the watcher).
 pub async fn open() -> Result<(Store, TrackedSet, Vec<Entry>)> {
-    let store = Store::open()?;
-    let tracked = TrackedSet::effective().await?;
+    let (store, tracked) = open_store().await?;
     let entries = store.list()?;
     Ok((store, tracked, entries))
+}
+
+/// [`open`] without listing the checkpoints. Listing reads one record per
+/// checkpoint, so it costs more as the history grows; a command that needs
+/// none of them, or only the newest ([`Store::latest`]), opens this way.
+pub async fn open_store() -> Result<(Store, TrackedSet)> {
+    let store = Store::open()?;
+    let tracked = TrackedSet::effective().await?;
+    Ok((store, tracked))
 }
 
 /// Resolves a checkpoint reference. With a path scope, `latest[~N]` counts

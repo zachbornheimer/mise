@@ -50,7 +50,7 @@ impl DotfilesConflicts {
         if !crate::config::Settings::get().history.enabled {
             bail!("history is disabled (history.enabled = false)");
         }
-        let (store, tracked, _) = super::history::open().await?;
+        let (store, tracked) = super::history::open_store().await?;
         let Some(repo) = store.repo() else {
             bail!("inspecting conflicts requires git");
         };
