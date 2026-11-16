@@ -1347,7 +1347,11 @@ mod capture_tests {
         let repo = store.repo().ok_or_else(|| eyre::eyre!("git required"))?;
         let tree = repo.empty_object("tree")?;
         let first = repo.commit_tree(&tree, vec![], "first")?;
-        repo.update_ref(crate::history::shadow::HistoryRepo::HISTORY_REF, &first, None)?;
+        repo.update_ref(
+            crate::history::shadow::HistoryRepo::HISTORY_REF,
+            &first,
+            None,
+        )?;
         let snapshot = share::current(repo, &TrackedSet::default())?;
         assert!(
             !head_moved(repo, &snapshot)?,
