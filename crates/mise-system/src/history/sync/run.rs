@@ -26,6 +26,11 @@ use mise_util::file::display_path;
 
 const PUSH_RETRIES: usize = 5;
 
+/// How many times one sync re-plans because the local saved history moved
+/// while it planned. The watcher saves every edit, so a busy machine moves it
+/// often; a bound keeps a machine that never settles from looping forever.
+const REPLAN_LIMIT: usize = 20;
+
 /// An incoming change waiting for `mise dot pull` (or automatic
 /// application in `sync` mode).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -255,6 +260,17 @@ pub fn origin() -> Result<OriginTomlConfig> {
     bail!("no setup repository is connected; `mise dot origin set <url>` connects one")
 }
 
+/// Whether the saved history has moved since `shared` was read from it. The
+/// watcher saves a checkpoint on every edit, so this is how a sync finds out
+/// that the plans built from `shared` no longer describe what would be
+/// published.
+fn head_moved(
+    repo: &crate::history::shadow::HistoryRepo,
+    shared: &share::ShareReport,
+) -> Result<bool> {
+    Ok(repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)? != shared.checkpoint)
+}
+
 /// Runs one synchronization.
 pub fn sync(store: &Store, tracked: &TrackedSet, request: &SyncRequest) -> Result<SyncOutcome> {
     let _sync_lock = lock(store)?;
@@ -340,7 +356,7 @@ pub(crate) fn sync_locked(
             super::origin::discard_contentless_history(repo)?;
         }
         let mut shared = share::current(repo, tracked)?;
-        let unsaved = unsaved_paths(repo, tracked, &shared)?;
+        let mut unsaved = unsaved_paths(repo, tracked, &shared)?;
         let publish = mode.publishes() && !request.fetch_only && !request.offline;
         if publish
             && !allow_plaintext_history
@@ -350,8 +366,35 @@ pub(crate) fn sync_locked(
         }
         let mut plans;
         let mut attempts = 0;
+        let mut replans = 0;
         loop {
             attempts += 1;
+            // The plans below are built from `shared`, the saved history as it
+            // was when it was read. A checkpoint saved since then (autosave
+            // keeps saving while a sync runs) was never examined by them, so
+            // publishing past it is unsafe and failing wastes the whole sync.
+            // Read the history again and plan again instead. Re-planning is not
+            // a rejected push, so it does not spend the push retries.
+            if head_moved(repo, &shared)? {
+                replans += 1;
+                if replans > REPLAN_LIMIT {
+                    bail!(
+                        "local saved history kept changing while planning ({REPLAN_LIMIT} re-plans); retry shortly"
+                    );
+                }
+                debug!("history sync: saved history moved while planning, planning again");
+                attempts -= 1;
+                shared = share::current(repo, tracked)?;
+                unsaved = unsaved_paths(repo, tracked, &shared)?;
+                if publish
+                    && !allow_plaintext_history
+                    && let Some(head) =
+                        repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)?
+                {
+                    audit_publication(repo, &head, tracked)?;
+                }
+                continue;
+            }
             let upstream = reconcile::upstream_with_interaction(
                 repo,
                 upstream_commit.as_deref(),
@@ -1290,6 +1333,43 @@ mod capture_tests {
             ..Default::default()
         };
         assert!(audit_publication(repo, &head, &tracked).is_err());
+        Ok(())
+    }
+
+    /// The decision a sync makes before it publishes: has a checkpoint been
+    /// saved since the plans were built? A sync that publishes past one would
+    /// publish history its plans never examined; a sync that fails on it
+    /// never finishes while the watcher keeps saving.
+    #[test]
+    fn a_checkpoint_saved_after_the_snapshot_moves_the_head() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open_in(temp.path())?;
+        let repo = store.repo().ok_or_else(|| eyre::eyre!("git required"))?;
+        let tree = repo.empty_object("tree")?;
+        let first = repo.commit_tree(&tree, vec![], "first")?;
+        repo.update_ref(crate::history::shadow::HistoryRepo::HISTORY_REF, &first, None)?;
+        let snapshot = share::current(repo, &TrackedSet::default())?;
+        assert!(
+            !head_moved(repo, &snapshot)?,
+            "nothing was saved since the snapshot"
+        );
+
+        let second = repo.commit_tree(&tree, vec![first.as_str()], "second")?;
+        repo.update_ref(
+            crate::history::shadow::HistoryRepo::HISTORY_REF,
+            &second,
+            Some(&first),
+        )?;
+        assert!(
+            head_moved(repo, &snapshot)?,
+            "a checkpoint saved after the snapshot must be noticed"
+        );
+
+        let fresh = share::current(repo, &TrackedSet::default())?;
+        assert!(
+            !head_moved(repo, &fresh)?,
+            "planning again from the new head settles it"
+        );
         Ok(())
     }
 

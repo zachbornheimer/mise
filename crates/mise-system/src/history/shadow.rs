@@ -484,6 +484,9 @@ impl HistoryRepo {
             }
             None => BTreeMap::new(),
         };
+        // opened once: every cached entry below asks whether its blob is an
+        // encrypted envelope, and opening a repository scans every pack index
+        let gix = self.gix()?;
         for (root, encrypted) in roots.iter_mut().zip(encrypted_by_root) {
             root.files.retain(|rel| !encrypted.contains(rel));
             for rel in encrypted {
@@ -520,7 +523,7 @@ impl HistoryRepo {
                             && entry.scheme == scheme
                     })
                     .filter(|entry| {
-                        self.blob_starts_with(&entry.oid, b"mise-encrypted-file-v1\n")
+                        self.blob_starts_with_in(&gix, &entry.oid, b"mise-encrypted-file-v1\n")
                             .unwrap_or(false)
                     });
                 let previous = in_history.remove(&path);
@@ -1305,13 +1308,24 @@ impl HistoryRepo {
     }
 
     pub(crate) fn blob_starts_with(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
-        if let Some(bytes) = self.transient_blob(oid) {
-            return Ok(bytes.starts_with(prefix));
+        if self.transient_blob(oid).is_none() && Self::object_id(oid).is_some() {
+            return self.blob_starts_with_in(&self.gix()?, oid, prefix);
         }
-        if let Some(id) = Self::object_id(oid) {
+        self.blob_starts_with_in_git(oid, prefix)
+    }
+
+    /// [`Self::blob_starts_with`] through an already open repository. Opening
+    /// one scans every pack index, so a walk that asks about many blobs opens
+    /// it once and passes it here, not once per blob.
+    pub(crate) fn blob_starts_with_in(
+        &self,
+        repo: &gix::Repository,
+        oid: &str,
+        prefix: &[u8],
+    ) -> Result<bool> {
+        if let (None, Some(id)) = (self.transient_blob(oid), Self::object_id(oid)) {
             // gix reads a full object id without starting Git; a blob
             // shorter than the prefix cannot match, so it is never read
-            let repo = self.gix()?;
             let header = repo
                 .find_header(id)
                 .wrap_err_with(|| format!("reading {id}"))?;
@@ -1325,6 +1339,14 @@ impl HistoryRepo {
                 .find_object(id)
                 .wrap_err_with(|| format!("reading {id}"))?;
             return Ok(object.data.starts_with(prefix));
+        }
+        self.blob_starts_with_in_git(oid, prefix)
+    }
+
+    /// A transient (not yet written) blob, or a revision only Git resolves.
+    fn blob_starts_with_in_git(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
+        if let Some(bytes) = self.transient_blob(oid) {
+            return Ok(bytes.starts_with(prefix));
         }
         self.git.blob_starts_with(oid, prefix)
     }
