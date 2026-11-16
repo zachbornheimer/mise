@@ -73,30 +73,30 @@ directory, or pass `--skip task`.
 Each section has its own page, and most have their own `status` and `apply`
 subcommands.
 
-| Config                                                                    | Use for                                                                                     |
-| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| [`[bootstrap.packages]`](/bootstrap/packages/)                            | Host packages from apt, dnf, pacman, Homebrew, WinGet, and other package managers           |
-| [`[bootstrap.apt.sources]`](/bootstrap/packages/apt.html#sources)         | apt repositories and PPAs that `apt:` packages install from                                 |
-| [`[bootstrap.plugins]`](/bootstrap/packages/plugins.html)                 | Package manager plugins that add more package sources                                       |
-| [`[bootstrap.users]`, `[bootstrap.groups]`](/bootstrap/accounts.html)     | Linux users and groups                                                                      |
-| [`[bootstrap.files]`, `[bootstrap.directories]`](/bootstrap/files.html)   | System files and directories, with their content, owner, and permissions                    |
-| [`[bootstrap.secrets]`](/bootstrap/secrets.html)                          | Secret values that `[bootstrap.files]` and `[dotfiles]` templates read from the environment |
-| [`[bootstrap.services]`](/bootstrap/services.html)                        | User services on Linux, macOS, and Windows, and existing Linux system services              |
-| [`[bootstrap.linux.firewall]`](/bootstrap/firewall.html)                  | Linux host firewall policy and rules                                                        |
-| [`[bootstrap.compose]`](/bootstrap/compose.html)                          | Docker Compose projects                                                                     |
-| [`[bootstrap.repos]`](/bootstrap/repos.html)                              | Git repositories, cloned before dotfiles are applied                                        |
-| [`[dotfiles]`](/dotfiles.html)                                            | Dotfiles: tracking files in place, creating files from sources, and editing blocks or lines |
-| [`[dotfile_groups]`, `[bootstrap] dotfile_groups`](/dotfiles/groups.html) | Directory trees of dotfiles, and which of them a machine applies                            |
-| [`[bootstrap.mise_shell_activate]`](/bootstrap/shell.html)                | mise activation in shell startup files                                                      |
-| [`[bootstrap.user]`](/bootstrap/shell.html#set-your-login-shell)          | Your login shell                                                                            |
-| [`[bootstrap.macos.defaults]`](/bootstrap/macos-defaults.html)            | macOS user preferences, written with `defaults write`                                       |
-| [`[bootstrap.macos.*]`](/bootstrap/macos-defaults.html)                   | Common macOS preferences for the Dock, Finder, keyboard, and trackpad                       |
-| [`[bootstrap.macos.launchd.agents]`](/bootstrap/launchd.html)             | macOS LaunchAgents, written and loaded with `launchctl`                                     |
-| [`[bootstrap.linux.systemd.units]`](/bootstrap/systemd.html)              | systemd user units, managed with `systemctl --user`                                         |
-| [`[tools]`](/dev-tools/)                                                  | Tools that mise installs and manages                                                        |
-| [`[bootstrap.hooks]`](#hooks)                                             | Commands that run at named points in the run                                                |
-| [`[tasks.bootstrap]`](#the-bootstrap-task)                                | Setup that the sections above do not cover                                                  |
-| [`[bootstrap.remote]`](/bootstrap/remote.html)                            | SSH hosts for `mise bootstrap remote`                                                       |
+| Config                                                                    | Use for                                                                                                       |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| [`[bootstrap.packages]`](/bootstrap/packages/)                            | Host packages from apt, dnf, pacman, Homebrew, WinGet, and other package managers                             |
+| [`[bootstrap.apt.sources]`](/bootstrap/packages/apt.html#sources)         | apt repositories and PPAs that `apt:` packages install from                                                   |
+| [`[bootstrap.plugins]`](/bootstrap/packages/plugins.html)                 | Package manager plugins that add more package sources                                                         |
+| [`[bootstrap.users]`, `[bootstrap.groups]`](/bootstrap/accounts.html)     | Linux users and groups                                                                                        |
+| [`[bootstrap.files]`, `[bootstrap.directories]`](/bootstrap/files.html)   | System files and directories, with their content, owner, and permissions                                      |
+| [`[bootstrap.secrets]`](/bootstrap/secrets.html)                          | Secret values that `[bootstrap.files]` and `[dotfiles]` templates read from the environment                   |
+| [`[bootstrap.services]`](/bootstrap/services.html)                        | User services on Linux, macOS, and Windows, and existing Linux system services                                |
+| [`[bootstrap.linux.firewall]`](/bootstrap/firewall.html)                  | Linux host firewall policy and rules                                                                          |
+| [`[bootstrap.compose]`](/bootstrap/compose.html)                          | Docker Compose projects                                                                                       |
+| [`[bootstrap.repos]`](/bootstrap/repos.html)                              | Git repositories, cloned before dotfiles are applied                                                          |
+| [`[dotfiles]`](/dotfiles.html)                                            | Dotfiles: tracking files in place, creating files from sources, and editing blocks or lines                   |
+| [`[dotfile_groups]`, `[bootstrap] dotfile_groups`](/dotfiles/groups.html) | Directory trees of dotfiles, and which of them a machine applies                                              |
+| [`[bootstrap.mise_shell_activate]`](/bootstrap/shell.html)                | mise activation in shell startup files                                                                        |
+| [`[bootstrap.user]`](/bootstrap/shell.html#set-your-login-shell)          | Your login shell                                                                                              |
+| [`[bootstrap.settings.macos]`](/bootstrap/macos-defaults.html)            | macOS user preferences for the Dock, Finder, keyboard, trackpad, login items, and any `defaults write` domain |
+| [`[bootstrap.settings]`](/bootstrap/settings-plugins.html)                | Settings that bootstrap settings plugins apply, such as a Linux desktop's appearance                          |
+| [`[bootstrap.macos.launchd.agents]`](/bootstrap/launchd.html)             | macOS LaunchAgents, written and loaded with `launchctl`                                                       |
+| [`[bootstrap.linux.systemd.units]`](/bootstrap/systemd.html)              | systemd user units, managed with `systemctl --user`                                                           |
+| [`[tools]`](/dev-tools/)                                                  | Tools that mise installs and manages                                                                          |
+| [`[bootstrap.hooks]`](#hooks)                                             | Commands that run at named points in the run                                                                  |
+| [`[tasks.bootstrap]`](#the-bootstrap-task)                                | Setup that the sections above do not cover                                                                    |
+| [`[bootstrap.remote]`](/bootstrap/remote.html)                            | SSH hosts for `mise bootstrap remote`                                                                         |
 
 ## Start from a repository {#starting-from-a-repository}
 
@@ -145,21 +145,22 @@ warning. They will be removed in mise 2027.10.4.
 | 9    | `repos`                            | [`[bootstrap.repos]`](/bootstrap/repos.html)                                                                                                          | `pre-repos`, `post-repos`       |
 | 10   | `dotfiles`                         | [`[dotfiles]`](/dotfiles.html)                                                                                                                        | `pre-dotfiles`, `post-dotfiles` |
 | 11   | `mise-shell-activate` (`shell`)    | [`[bootstrap.mise_shell_activate]`](/bootstrap/shell.html)                                                                                            |                                 |
-| 12   | `macos-defaults` (`defaults`)      | [`[bootstrap.macos.defaults]`](/bootstrap/macos-defaults.html) and the other `[bootstrap.macos.*]` keys                                               | `pre-defaults`, `post-defaults` |
+| 12   | `macos-defaults` (`defaults`)      | [`[bootstrap.settings.macos]`](/bootstrap/macos-defaults.html)                                                                                        | `pre-defaults`, `post-defaults` |
 | 13   | `macos-launchd-agents` (`launchd`) | [`[bootstrap.macos.launchd.agents]`](/bootstrap/launchd.html)                                                                                         |                                 |
 | 14   | `linux-systemd-units` (`systemd`)  | [`[bootstrap.linux.systemd.units]`](/bootstrap/systemd.html)                                                                                          |                                 |
 | 15   | `user`                             | [`[bootstrap.user]`](/bootstrap/shell.html#set-your-login-shell)                                                                                      | `pre-user`, `post-user`         |
 | 16   | `tools`                            | `[tools]`, as `mise install` would                                                                                                                    | `pre-tools`, `post-tools`       |
 | 17   | `packages`                         | Packages from [package manager plugins](/bootstrap/packages/plugins.html)                                                                             |                                 |
-| 18   | `services`                         | User services with `requires_tools = true`                                                                                                            |                                 |
-| 19   | `task`                             | The [`bootstrap` task](#the-bootstrap-task), if one exists                                                                                            |                                 |
-| 20   | `final-hook`                       |                                                                                                                                                       | `final`                         |
+| 18   | `settings`                         | [`[bootstrap.settings]`](/bootstrap/settings-plugins.html) through [bootstrap settings plugins](/bootstrap/settings-plugins.html)                     |                                 |
+| 19   | `services`                         | User services with `requires_tools = true`                                                                                                            |                                 |
+| 20   | `task`                             | The [`bootstrap` task](#the-bootstrap-task), if one exists                                                                                            |                                 |
+| 21   | `final-hook`                       |                                                                                                                                                       | `final`                         |
 
 In step 4, the `pre-packages` hook runs before mise adds apt sources.
 
 The `post-packages` hook runs right after step 4, unless a package in
 `[bootstrap.packages]` comes from a package manager plugin. Then it runs after
-step 17 instead, once those packages are installed. Step 18 runs even with
+step 17 instead, once those packages are installed. Step 19 runs even with
 `--skip tools`.
 
 The declarative parts compare the configuration with the machine and change only
@@ -228,9 +229,12 @@ as it does for `mise bootstrap plan` and `mise bootstrap status`. See
 `mise bootstrap plan` lists the changes to declarative resources in dependency
 order: accounts, packages (including packages from plugins), system files and
 directories, system and user services, firewall policy and rules, and Compose
-projects. It does not cover dotfiles, repositories, shell activation, macOS
-defaults, LaunchAgents, systemd user units, the login shell, tools, hooks, or
-the `bootstrap` task. Use `mise bootstrap --dry-run` for those.
+projects, and Git repositories (`create` to clone, `update` to pull). Commands
+in `[bootstrap.hooks]` are listed with the action `run` and a `hook_phase`,
+since a command cannot be diffed; they run on every bootstrap, so they do not
+count as changes. The plan does not cover dotfiles, shell activation, macOS
+defaults, LaunchAgents, systemd user units, the login shell, tools, or the
+`bootstrap` task. Use `mise bootstrap --dry-run` for those.
 
 ```sh
 mise bootstrap plan
@@ -248,8 +252,9 @@ With `--detailed-exitcode`, the exit code reports what the plan found:
 
 A resource is `unknown` when mise cannot reach its declared state on its own,
 for example a package whose manager is unavailable on this platform or cannot
-install the requested version. mise reports it instead of skipping it, so you
-can resolve it by hand.
+install the requested version, or a repository with local changes, which
+bootstrap refuses to touch (`--skip-dirty` leaves it unchanged and moves on). mise reports it
+instead of skipping it, so you can resolve it by hand.
 
 ### Check state {#inspecting-state}
 

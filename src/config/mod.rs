@@ -159,7 +159,11 @@ pub struct Config {
     pub repo_urls: HashMap<String, String>,
     pub vars: IndexMap<String, String>,
     pub tera_ctx: tera::Context,
-    pub shorthands: Shorthands,
+    /// Built on first use by [`Self::shorthands`]: most configs never read it.
+    shorthands: std::sync::OnceLock<Shorthands>,
+    /// The settings in effect at load, so a lazily built map matches them even
+    /// if settings are rebuilt later.
+    shorthands_settings: Arc<Settings>,
     pub shell_aliases: EnvWithSources,
     /// Files accessed by tera template functions (read_file, hash_file, etc.)
     /// during shell alias template rendering, used to watch for changes in hook-env.
@@ -319,6 +323,7 @@ impl Config {
             env: OnceCell::new(),
             env_with_sources: OnceCell::new(),
             shorthands: self.shorthands.clone(),
+            shorthands_settings: self.shorthands_settings.clone(),
             hooks: OnceCell::new(),
             tasks_cache: Arc::new(DashMap::new()),
             workspace_project_graph_cache: Mutex::new(None),
@@ -389,7 +394,8 @@ impl Config {
             bootstrap_dry_run_unresolved_vars: Default::default(),
             env: OnceCell::new(),
             env_with_sources: OnceCell::new(),
-            shorthands: get_shorthands(&Settings::get()),
+            shorthands: Default::default(),
+            shorthands_settings: Settings::get(),
             hooks: OnceCell::new(),
             tasks_cache: Arc::new(DashMap::new()),
             workspace_project_graph_cache: Mutex::new(None),
@@ -414,6 +420,7 @@ impl Config {
             env: OnceCell::new(),
             env_with_sources: OnceCell::new(),
             shorthands: config.shorthands.clone(),
+            shorthands_settings: config.shorthands_settings.clone(),
             hooks: OnceCell::new(),
             tasks_cache: Arc::new(DashMap::new()),
             workspace_project_graph_cache: Mutex::new(None),
@@ -852,6 +859,12 @@ impl Config {
         )
     }
 
+    /// The asdf and vfox shorthands, built on first use.
+    pub fn shorthands(&self) -> &Shorthands {
+        self.shorthands
+            .get_or_init(|| get_shorthands(&self.shorthands_settings))
+    }
+
     pub fn get_repo_url(&self, plugin_name: &str) -> Option<String> {
         if let Some(url) = self.repo_urls.get(plugin_name)
             && (Path::new(url).is_absolute()
@@ -888,7 +901,7 @@ impl Config {
             );
         }
 
-        self.shorthands
+        self.shorthands()
             .get(plugin_name)
             .map(|full| registry::full_to_url(&full[0]))
             .or_else(|| {
@@ -1560,12 +1573,7 @@ impl Config {
                 Ok(cf) => {
                     config_files.insert(path, cf);
                 }
-                Err(err) => {
-                    warn!(
-                        "error loading tracked config file {}: {err:#}",
-                        display_path(&path)
-                    );
-                }
+                Err(err) => report_tracked_config_error(&path, &err),
             }
         }
         Ok(config_files)
@@ -4441,7 +4449,8 @@ fn load_aliases(config_files: &ConfigMap) -> Result<AliasMap> {
     let global_tools = declared_tools(true);
     let mut project_tools = declared_tools(false);
 
-    for config_file in config_files.values() {
+    // Iterate in reverse order (global -> local) so the closest config wins.
+    for config_file in config_files.values().rev() {
         let project = safe_mode && !is_global_config(config_file.get_path());
         let ignore_path_versions = project;
         for (plugin, plugin_aliases) in config_file.aliases()? {
@@ -5928,6 +5937,12 @@ async fn load_local_tasks_with_context(
                     let configs = configs_at_root(&subdir, &hierarchy_configs);
                     let cascaded_task_config =
                         cascaded_task_config_for_dir(&subdir, &hierarchy_configs)?;
+                    let templates = with_project_templates(
+                        &templates,
+                        &subdir,
+                        &hierarchy_configs,
+                        &config.config_files,
+                    );
 
                     if found_config {
                         if configs.is_empty() {
@@ -5976,6 +5991,43 @@ async fn load_local_tasks_with_context(
     }
 
     Ok(tasks)
+}
+
+/// Layer the templates a monorepo project's own config files define over `base`.
+///
+/// `base` holds the templates of the configs loaded for the current directory, which may
+/// not include a sibling project's. Without this, a task in `/foo` that extends a template
+/// defined in `/foo/mise.toml` fails to resolve when mise runs from `/bar`.
+fn with_project_templates(
+    base: &TaskDefinitions,
+    project_dir: &Path,
+    project_configs: &ConfigMap,
+    loaded_configs: &ConfigMap,
+) -> TaskDefinitions {
+    // Highest precedence first, as `collect_task_definitions` expects: the project's own
+    // directory, then each ancestor up to the monorepo root.
+    let mut ordered = ConfigMap::new();
+    for dir in project_dir.ancestors() {
+        for cf in configs_at_root(dir, project_configs) {
+            ordered
+                .entry(cf.get_path().to_path_buf())
+                .or_insert_with(|| cf.clone());
+        }
+    }
+    let mut definitions = base.clone();
+    definitions
+        .templates
+        .extend(collect_task_definitions(&ordered, None).templates);
+    // Global override files outrank all project config, so they keep the final say.
+    let overrides = loaded_configs
+        .iter()
+        .filter(|(path, _)| is_override_config(path))
+        .map(|(path, cf)| (path.clone(), cf.clone()))
+        .collect::<ConfigMap>();
+    definitions
+        .templates
+        .extend(collect_task_definitions(&overrides, None).templates);
+    definitions
 }
 
 /// Expand [monorepo].config_roots patterns to actual directories.
@@ -7558,11 +7610,24 @@ fn cascaded_task_config_for_dir(
     dir: &Path,
     config_files: &ConfigMap,
 ) -> Result<Option<CascadedTaskConfig>> {
+    // This runs once per directory and checks every config file's root, so with many
+    // configs (e.g. `mise prune`/`upgrade` scanning every tracked project) it is
+    // quadratic in `realpath` calls unless the resolutions are cached.
+    let dir_resolved = file::desymlink_path_cached(dir);
     let mut roots = config_files
         .values()
-        .filter(|cf| !is_global_config(cf.get_path()))
-        .map(|cf| cf.config_root())
-        .filter(|root| !file::same_file(root, dir) && file::path_starts_with_resolved(dir, root))
+        .map(|cf| (cf, cf.config_root()))
+        .filter(|(_, root)| {
+            if root == dir {
+                return false;
+            }
+            let root_resolved = file::desymlink_path_cached(root);
+            root_resolved != dir_resolved
+                && (dir.starts_with(root) || dir_resolved.starts_with(&root_resolved))
+        })
+        // Last, because it is the costliest check and few roots get this far.
+        .filter(|(cf, _)| !is_global_config(cf.get_path()))
+        .map(|(_, root)| root)
         .unique()
         .collect::<Vec<_>>();
     roots.sort_by_key(|root| root.components().count());
@@ -8837,4 +8902,43 @@ fn included_task_definitions(
         }
     }
     tasks
+}
+
+tokio::task_local! {
+    /// Set while work nobody asked for (the deferred tool-purgatory cleanup) loads
+    /// tracked configs: failures are counted instead of warned about one by one.
+    static TRACKED_ERRORS_QUIET: std::sync::atomic::AtomicUsize;
+}
+
+/// Runs `future` with tracked-config load failures demoted to debug output.
+/// Returns its result and how many tracked configs failed to load.
+pub(crate) async fn with_quiet_tracked_config_errors<T>(
+    future: impl std::future::Future<Output = T>,
+) -> (T, usize) {
+    TRACKED_ERRORS_QUIET
+        .scope(std::sync::atomic::AtomicUsize::new(0), async {
+            let out = future.await;
+            let skipped =
+                TRACKED_ERRORS_QUIET.with(|count| count.load(std::sync::atomic::Ordering::Relaxed));
+            (out, skipped)
+        })
+        .await
+}
+
+/// Reports a tracked config that could not be loaded.
+pub(crate) fn report_tracked_config_error(path: &Path, err: &eyre::Report) {
+    let counted = TRACKED_ERRORS_QUIET
+        .try_with(|count| count.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+        .is_ok();
+    if counted {
+        debug!(
+            "error loading tracked config file {}: {err:#}",
+            display_path(path)
+        );
+    } else {
+        warn!(
+            "error loading tracked config file {}: {err:#}",
+            display_path(path)
+        );
+    }
 }

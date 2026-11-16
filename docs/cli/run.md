@@ -56,6 +56,9 @@ To create a script task, run `mise tasks add --file hello -- echo hello`, then `
 
   It runs in the worktree's copy of the directory mise was started from (not a task's `dir`), outside mise's environment, with `MISE_RUN_AT_SOURCE` set to the repository the worktree came from. `--timeout` does not limit it, only the tasks after it.
 - **`--all`** — Open the task picker with tasks from every project in the monorepo
+- **`--multi`** — Open the task picker as a checklist and run every task you check
+
+  Space checks a task, `/` filters, and Enter runs the checked tasks as if they were named with `:::`. Needs an interactive terminal. Combine with `--all` to list the tasks from every project in the monorepo.
 - **`-c --continue-on-error`** — Continue running tasks even if one fails
 - **`-C --cd <DIR>`** — Change to this directory before running the tasks
 - **`-f --force`** — Run the tasks even if their outputs are up to date
@@ -109,6 +112,7 @@ To create a script task, run `mise tasks add --file hello -- echo hello`, then `
   Per-host filtering does not work: Linux and macOS exit with an error, and Windows runs the task without network restrictions. See <https://mise.jdx.dev/sandboxing.html#access-to-particular-hosts>
 - **`--allow-read <PATH>`** — Allow reads from a specific path (implies `--deny-read` for everything else)
 - **`--allow-write <PATH>`** — Allow writes to a specific path (implies `--deny-write` for everything else)
+- **`--allow-unix <PATH>`** — Allow connections to the Unix socket at a specific path, or to every socket under it if PATH is a directory (implies `--deny-unix` for every other socket). Abstract sockets created inside the sandbox stay reachable. Linux 7.1 or later only.
 - **`--deny-all`** — Block reads, writes, network, and env vars
 - **`--deny-env`** — Block env var inheritance except PATH, HOME, USER, SHELL, TERM, COLORTERM, and LANG
 
@@ -116,6 +120,7 @@ To create a script task, run `mise tasks add --file hello -- echo hello`, then `
 - **`--deny-net`** — Block all network access
 - **`--deny-read`** — Block filesystem reads (system libraries and tool directories stay readable)
 - **`--deny-write`** — Block filesystem writes except temporary and device paths (/tmp, /dev)
+- **`--deny-unix`** — Block connections to Unix sockets outside the sandbox (Linux 7.1 or later only)
 - **`--fresh-env`** — Bypass the environment cache and recompute the environment
 - **`--no-cache`** — Do not use the cache for remote tasks
 

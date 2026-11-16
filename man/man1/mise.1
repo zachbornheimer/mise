@@ -225,7 +225,7 @@ Install and start the configured systemd user units
 Show the state of the configured systemd user units
 .TP
 \fBbootstrap macos\fR
-Manage macOS preferences and LaunchAgents from `[bootstrap.macos]`
+Manage macOS preferences and LaunchAgents from `[bootstrap.settings.macos]` and `[bootstrap.macos.launchd]`
 .TP
 \fBbootstrap macos defaults\fR
 Manage macOS preferences such as Dock, Finder, and keyboard settings
@@ -358,6 +358,15 @@ Uninstall a user\-scope service
 .TP
 \fBbootstrap services status\fR
 Show the state of services from `[bootstrap.services]`
+.TP
+\fBbootstrap settings\fR
+[experimental] Apply `[bootstrap.settings]` through bootstrap settings plugins
+.TP
+\fBbootstrap settings apply\fR
+Write the settings that differ from `[bootstrap.settings]`
+.TP
+\fBbootstrap settings status\fR
+Show each setting in `[bootstrap.settings]` and its current value
 .TP
 \fBbootstrap status\fR
 Show the state of every configured bootstrap part
@@ -1926,7 +1935,7 @@ Exit with status 1 if any unit differs from the config (all are still listed)
 \fB\-h, \-\-help\fR
 Print help
 .SH "MISE BOOTSTRAP MACOS"
-Manage macOS preferences and LaunchAgents from `[bootstrap.macos]`
+Manage macOS preferences and LaunchAgents from `[bootstrap.settings.macos]` and `[bootstrap.macos.launchd]`
 .PP
 \fBUsage:\fR mise bootstrap macos [OPTIONS] <COMMAND>
 .PP
@@ -1938,11 +1947,13 @@ Print help
 .SH "MISE BOOTSTRAP MACOS DEFAULTS"
 Manage macOS preferences such as Dock, Finder, and keyboard settings
 
-Applies `[bootstrap.macos.defaults]`, `[[bootstrap.macos.defaults_entries]]`,
-and the `[bootstrap.macos.dock]`, `finder`, `keyboard`, and `trackpad`
-sections. Preferences are written the way `defaults write` writes them.
-mise does not restart apps: Dock, Finder, and some others show a change
-only after they relaunch.
+Applies `[bootstrap.settings.macos]`: its `defaults`, `dock`, `finder`,
+`keyboard`, `trackpad`, and `login_items` tables, and its
+`[[bootstrap.settings.macos.defaults_entries]]` array of tables.
+Preferences are written the way `defaults write` writes them. mise does not
+restart apps: Dock, Finder, and some others show a change only after they
+relaunch. Other `[bootstrap.settings.<plugin>]` sections are applied by
+bootstrap settings plugins through `mise bootstrap settings`.
 .PP
 \fBUsage:\fR mise bootstrap macos defaults [OPTIONS] <COMMAND>
 .PP
@@ -2616,10 +2627,12 @@ fi
 Show what applying bootstrap resources would change
 
 Covers accounts, packages, files and directories, system and user services,
-the firewall, and Compose projects, in dependency order. Repositories,
-dotfiles, shell activation, macOS defaults, LaunchAgents, systemd user
-units, the login shell, tools, hooks, and the `bootstrap` task are not
-planned; preview the whole run with `mise bootstrap \-\-dry\-run`.
+the firewall, Compose projects, and Git repositories, in dependency order.
+Hooks are listed with the action `run`, since a command cannot be diffed;
+they do not count as changes for `\-\-detailed\-exitcode`. Dotfiles, shell
+activation, macOS defaults, LaunchAgents, systemd user units, the login
+shell, tools, and the `bootstrap` task are not planned; preview the whole
+run with `mise bootstrap \-\-dry\-run`.
 .PP
 \fBUsage:\fR mise bootstrap plan [OPTIONS]
 .PP
@@ -3159,6 +3172,63 @@ Exit with status 1 if any service differs from the config (all are still listed)
 .TP
 \fB\-h, \-\-help\fR
 Print help
+.SH "MISE BOOTSTRAP SETTINGS"
+[experimental] Apply `[bootstrap.settings]` through bootstrap settings plugins
+
+A bootstrap settings plugin reads and writes the settings of one program or
+desktop, such as a Linux distro's appearance settings. mise compares the
+values in `[bootstrap.settings.<plugin>]` with the values the plugin reports
+and asks it to write only the ones that differ.
+See https://mise.jdx.dev/bootstrap/settings\-plugins.html
+.PP
+\fBUsage:\fR mise bootstrap settings [OPTIONS] <COMMAND>
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-h, \-\-help\fR
+Print help
+.SH "MISE BOOTSTRAP SETTINGS APPLY"
+Write the settings that differ from `[bootstrap.settings]`
+
+It does not ask for confirmation.
+.PP
+\fBUsage:\fR mise bootstrap settings apply [OPTIONS] [<PLUGIN>] ...
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-n, \-\-dry\-run\fR
+Show which settings would change without changing them
+.TP
+\fB\-h, \-\-help\fR
+Print help
+\fBArguments:\fR
+.PP
+.TP
+\fB<PLUGIN>\fR
+Plugins whose sections to apply; all of them by default
+.SH "MISE BOOTSTRAP SETTINGS STATUS"
+Show each setting in `[bootstrap.settings]` and its current value
+.PP
+\fBUsage:\fR mise bootstrap settings status [OPTIONS] [<PLUGIN>] ...
+.PP
+\fBOptions:\fR
+.PP
+.TP
+\fB\-\-missing\fR
+Exit with status 1 if a setting differs from the config or its plugin cannot run
+.TP
+\fB\-J, \-\-json\fR
+Output in JSON format
+.TP
+\fB\-h, \-\-help\fR
+Print help
+\fBArguments:\fR
+.PP
+.TP
+\fB<PLUGIN>\fR
+Plugins whose sections to show; all of them by default
 .SH "MISE BOOTSTRAP STATUS"
 Show the state of every configured bootstrap part
 
@@ -3167,6 +3237,7 @@ the firewall, Compose projects, repositories, dotfiles, shell activation,
 macOS defaults, LaunchAgents, systemd user units, the login shell, `[tools]`,
 and the system dependencies of those tools, without changing anything.
 Checking dotfiles can render trusted templates, which may run `exec()`.
+`[bootstrap.settings]` is not checked yet: use `mise bootstrap settings status`.
 
 `\-\-missing` exits with status 1 if anything differs from the config; it
 still lists every entry.
@@ -5868,6 +5939,8 @@ missing tools from the config are reported, not installed.
 .TP
 \fB\-D, \-\-dotenv\fR
 Output in dotenv format
+
+Values are quoted and escaped where needed so mise reads them back unchanged. Tools that do not interpret quotes, such as Docker `\-\-env\-file`, receive them literally.
 .TP
 \fB\-J, \-\-json\fR
 Output in JSON format
@@ -5987,6 +6060,11 @@ Allow reads from PATH (implies \-\-deny\-read for everything else)
 \fB\-\-allow\-write\fR \fI<PATH>\fR
 Allow writes to PATH (implies \-\-deny\-write for everything else)
 .TP
+\fB\-\-allow\-unix\fR \fI<PATH>\fR
+Allow connections to the Unix socket at PATH, or to every socket under it if PATH is a directory (implies \-\-deny\-unix for every other socket)
+
+Abstract sockets created inside the sandbox stay reachable. Linux 7.1 or later only.
+.TP
 \fB\-\-deny\-all\fR
 Block reads, writes, network, and env vars
 .TP
@@ -6004,6 +6082,9 @@ Block filesystem reads (system libs and tool dirs still accessible)
 .TP
 \fB\-\-deny\-write\fR
 Block filesystem writes except temporary and device paths (/tmp, /dev)
+.TP
+\fB\-\-deny\-unix\fR
+Block connections to Unix sockets outside the sandbox (Linux 7.1 or later)
 .TP
 \fB\-\-fresh\-env\fR
 Bypass the environment cache and recompute the environment
@@ -8313,6 +8394,12 @@ mise ls\-remote my\-tool
 .SH "MISE PLUGINS LS"
 List installed plugins
 
+Plugins installed for every user in a system plugins directory, such as
+`/usr/share/mise/plugins`, are listed after your own and marked `(system)`.
+A package manager or the machine's admin owns them, so `\-\-outdated` skips
+them and `mise plugins update`/`uninstall` leave them alone. A system plugin
+that one of your plugins overrides is marked as overridden.
+
 Use `\-\-core` to list the core tools built into mise instead, or
 `\-\-core \-\-user` for both. `\-\-outdated` checks each plugin's Git remote for
 newer plugin code; it does not compare tool versions. Use `mise ls` for
@@ -8444,7 +8531,9 @@ Update installed plugins
 
 With no names, updates every installed plugin. This updates the plugin code,
 not the tool versions it manages. Linked local plugins are skipped; plugins
-installed from an archive cannot be updated with Git.
+installed from an archive cannot be updated with Git. A system plugin, such
+as one in `/usr/share/mise/plugins`, is skipped with a warning: update it
+with the package or admin that installed it.
 .PP
 \fBUsage:\fR mise plugins update [OPTIONS] [<PLUGIN>] ...
 .PP
@@ -8916,6 +9005,11 @@ It runs in the worktree's copy of the directory mise was started from (not a tas
 \fB\-\-all\fR
 Open the task picker with tasks from every project in the monorepo
 .TP
+\fB\-\-multi\fR
+Open the task picker as a checklist and run every task you check
+
+Space checks a task, `/` filters, and Enter runs the checked tasks as if they were named with `:::`. Needs an interactive terminal. Combine with `\-\-all` to list the tasks from every project in the monorepo.
+.TP
 \fB\-c, \-\-continue\-on\-error\fR
 Continue running tasks even if one fails
 .TP
@@ -9010,6 +9104,9 @@ Allow reads from a specific path (implies `\-\-deny\-read` for everything else)
 \fB\-\-allow\-write\fR \fI<PATH>\fR
 Allow writes to a specific path (implies `\-\-deny\-write` for everything else)
 .TP
+\fB\-\-allow\-unix\fR \fI<PATH>\fR
+Allow connections to the Unix socket at a specific path, or to every socket under it if PATH is a directory (implies `\-\-deny\-unix` for every other socket). Abstract sockets created inside the sandbox stay reachable. Linux 7.1 or later only.
+.TP
 \fB\-\-deny\-all\fR
 Block reads, writes, network, and env vars
 .TP
@@ -9026,6 +9123,9 @@ Block filesystem reads (system libraries and tool directories stay readable)
 .TP
 \fB\-\-deny\-write\fR
 Block filesystem writes except temporary and device paths (/tmp, /dev)
+.TP
+\fB\-\-deny\-unix\fR
+Block connections to Unix sockets outside the sandbox (Linux 7.1 or later only)
 .TP
 \fB\-\-fresh\-env\fR
 Bypass the environment cache and recompute the environment

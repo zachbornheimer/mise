@@ -600,6 +600,13 @@ variants = [{ profile = "work" }]
 ```
 
 `MISE_ENV=ssh` skips `~/.ssh/work_key`, and `MISE_ENV=ssh,work` links it.
+`profile` names one entry of the `MISE_ENV` list, in any position.
+
+Block, line, and merge edits take no `variants`, and dotfile entries take no
+`env` key; mise warns about a key it does not read. To apply edits, hooks, or
+anything else only for a combination of environments, give the combination
+its own config file, such as `mise.ssh-work.toml`, and select it with the
+rest: `MISE_ENV=ssh,work,ssh-work`.
 
 To give a whole set of entries to one operating system, put them in a
 platform config file such as `config.macos.toml` instead, with the
@@ -709,9 +716,20 @@ A `copy`, `template`, or inline `content` entry overwrites the target's
 content without `--force`, and replaces a symlink at the target with a file.
 A directory where a copied, templated, or inline file should go, or a file
 where a directory copy should go, is still a conflict and needs `--force`.
-When `apply` is about to overwrite a `template` target that you edited since mise
-last wrote it, it warns first, so you can move the edit into the source.
+When `apply` is about to overwrite a `template` or `copy` target that you edited
+since mise last wrote it, it warns first, so you can move the edit into the
+source. For a `copy` target, `--dry-run` and the confirmation list mark it too. A file
+mise has no record of, such as one that predates the entry, is not warned about.
+A directory `copy` outside a [dotfile group](/dotfiles/groups.html) has no
+per-file record, so its files are not checked.
 Check `mise dot diff` before you change which source a target uses.
+
+Without a terminal (a script, `ssh` without `-t`, an agent shell), `apply` cannot
+ask before replacing a `copy` target whose content differs from the source,
+unless the file is [tracked](/dotfiles/history.html), because `mise dot undo`
+cannot bring an untracked edit back. It stops with an error that names `--yes`;
+pass `--yes` to replace the content. Copies that already match the source, and
+tracked files, apply without asking.
 
 [Edit entries](/dotfiles/edits.html#conflicts) apply without `--force`.
 
