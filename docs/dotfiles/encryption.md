@@ -249,6 +249,18 @@ file's encryption setting. mise ignores
 [`history.allow_plaintext_history`](/configuration/settings.html#history.allow_plaintext_history)
 in project config.
 
+### Preserved encrypted merge conflicts
+
+Older histories may contain Git conflict markers around two complete encrypted
+file versions. Those records do not expose plaintext. The publication audit
+checks both envelopes and their exact framing, so resolving the current file
+does not require rewriting those earlier checkpoints. Plaintext alternatives,
+wrong paths, damaged framing, and extra bytes still stop publication.
+
+An unresolved encrypted conflict is never decrypted by choosing one side.
+Compare the original versions and resolve the live file explicitly before
+saving and pulling again.
+
 ### Remove plaintext from history {#remove-plaintext-from-history}
 
 If you saved credentials before you turned on encryption, rotate them first.
