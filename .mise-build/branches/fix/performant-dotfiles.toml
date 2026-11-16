@@ -1,0 +1,3 @@
+reason = "mise dot sync and pull queue behind a running sync, and status/save read only the newest checkpoint instead of every record, so many agents editing tracked dotfiles stop failing on the sync lock and each command stops paying for the whole history."
+upstream = "no"
+layer = 50
