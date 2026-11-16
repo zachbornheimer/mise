@@ -618,6 +618,7 @@ impl TaskExecutor {
             deny_write: task.deny_all || task.deny_write || self.sandbox.deny_write,
             deny_net: task.deny_all || task.deny_net || self.sandbox.deny_net,
             deny_env: task.deny_all || task.deny_env || self.sandbox.deny_env,
+            deny_unix: task.deny_unix || self.sandbox.deny_unix,
             deny_process: false,
             deny_temp_write: false,
             allow_read: task
@@ -637,6 +638,12 @@ impl TaskExecutor {
                 .iter()
                 .chain(self.sandbox.allow_net.iter())
                 .cloned()
+                .collect(),
+            allow_unix: task
+                .allow_unix
+                .iter()
+                .map(&resolve_task_path)
+                .chain(self.sandbox.allow_unix.iter().cloned())
                 .collect(),
             allow_env: task
                 .allow_env
@@ -1089,7 +1096,7 @@ impl TaskExecutor {
         // command, so a skipped or restored task never waits, and held until every run entry
         // ends.
         let mut task_env = task_env;
-        let lock_keys = task_lock::requested(task);
+        let lock_keys = task_lock::requested(task)?;
         let task_locks = if lock_keys.is_empty() || (task.run().is_empty() && task_file.is_none()) {
             None
         } else if self.dry_run {
@@ -1103,11 +1110,7 @@ impl TaskExecutor {
             None
         } else {
             let inherited = task_lock::inherited(&env);
-            let to_take: Vec<_> = lock_keys
-                .iter()
-                .filter(|key| !inherited.contains(key.id()))
-                .cloned()
-                .collect();
+            let to_take = task_lock::still_needed(&lock_keys, &inherited);
             task_lock::check_nested_order(task, &inherited, &to_take)?;
             // A task that takes locks takes its `--jobs` permit and its hold on the terminal
             // (write for an interactive task, read otherwise) with them, all or nothing, and
@@ -1186,7 +1189,7 @@ impl TaskExecutor {
                     confirm_guard = Some(acquire_runtime_lock(task.interactive).await);
                 }
             };
-            let locks = task_lock::exported(&inherited, &lock_keys);
+            let locks = task_lock::exported(&inherited, &held);
             env.insert(task_lock::LOCKS_ENV.to_string(), locks.clone());
             // Tasks a run entry injects inherit `task_env`, so they see the locks this task holds.
             task_env.push((task_lock::LOCKS_ENV.to_string(), locks));
@@ -1293,27 +1296,20 @@ impl TaskExecutor {
         save_checksum(task, config).await?;
         // A raw or interactive run stores no artifact, but its key still identifies the
         // outputs it produced, so dependents include it in their own keys.
-        let raw_cache_key = raw_cache_state.map(|cache| {
-            if self.task_cache.writes()
-                && let Err(err) = cache.mark_current()
-            {
-                warn!(
-                    "task {} artifact cache state update failed: {err}",
-                    task.name
-                );
-            }
-            cache.key().to_string()
-        });
-        let cache_key = if self.task_cache.writes()
-            && let Some(cache) = artifact_cache
-        {
-            let output = output_capture
-                .as_ref()
-                .map(|output| output.lock().unwrap().clone())
-                .unwrap_or_default();
-            match cache.store(task, &output, execution_duration).await {
-                Ok(()) => {
-                    if let Err(err) = cache.mark_current() {
+        let raw_cache_key = match raw_cache_state {
+            Some(cache) => {
+                if let Some(source) = cache.source_changed_since_key(task, config).await {
+                    // Dependents would build on a result of unknown inputs.
+                    warn!(
+                        "task {}: {} changed while the task ran; not caching",
+                        task.name,
+                        display_path(&source)
+                    );
+                    None
+                } else {
+                    if self.task_cache.writes()
+                        && let Err(err) = cache.mark_current()
+                    {
                         warn!(
                             "task {} artifact cache state update failed: {err}",
                             task.name
@@ -1321,9 +1317,38 @@ impl TaskExecutor {
                     }
                     Some(cache.key().to_string())
                 }
-                Err(err) => {
-                    warn!("task {} artifact cache write failed: {err}", task.name);
-                    None
+            }
+            None => None,
+        };
+        let cache_key = if self.task_cache.writes()
+            && let Some(cache) = artifact_cache
+        {
+            let output = output_capture
+                .as_ref()
+                .map(|output| output.lock().unwrap().clone())
+                .unwrap_or_default();
+            if let Some(source) = cache.source_changed_since_key(task, config).await {
+                warn!(
+                    "task {}: {} changed while the task ran; not caching",
+                    task.name,
+                    display_path(&source)
+                );
+                None
+            } else {
+                match cache.store(task, &output, execution_duration).await {
+                    Ok(()) => {
+                        if let Err(err) = cache.mark_current() {
+                            warn!(
+                                "task {} artifact cache state update failed: {err}",
+                                task.name
+                            );
+                        }
+                        Some(cache.key().to_string())
+                    }
+                    Err(err) => {
+                        warn!("task {} artifact cache write failed: {err}", task.name);
+                        None
+                    }
                 }
             }
         } else {
@@ -1394,7 +1419,13 @@ impl TaskExecutor {
 
         let needs_tera = task.run().iter().any(RunEntry::has_tera_template);
         let mut tera_state = if needs_tera {
-            let usage_values = crate::task::parse_usage_values_from_task(config, task).await?;
+            let usage_values = if task.should_bypass_usage_parser() {
+                // A bypassed task never uses its usage values, so a broken spec must not
+                // stop its templated entries from running.
+                crate::task::parse_usage_values_from_bypassed_task(config, task).await?
+            } else {
+                crate::task::parse_usage_values_from_task(config, task).await?
+            };
             let config_root = task.config_root.clone().unwrap_or_default();
             let tera = crate::tera::get_tera(Some(&config_root));
             let mut tera_ctx = task.tera_ctx_for_usage(config).await?;
@@ -3134,12 +3165,13 @@ impl TaskExecutor {
                 );
             }
         }
-        if let Some(cwd) = &*crate::dirs::CWD {
+        // The directory mise started in, before `--cd`/`MISE_CD` moved it.
+        if let Some(cwd) = crate::env::original_cwd() {
             Self::insert_env_excluded_from_nested_mise_diff(
                 &mut env,
                 &mut nested_mise_diff_exclude_keys,
                 "MISE_ORIGINAL_CWD",
-                task_env_path(cwd),
+                task_env_path(&cwd),
             );
         }
 
@@ -3309,13 +3341,20 @@ impl TaskExecutor {
             // so they must not influence spec discovery or parsing.
             crate::task::clear_usage_env(env);
         }
-        let (spec, _) = task
+        let parsed = task
             .parse_usage_spec_with_vars(config, self.cd.clone(), env, extra_vars)
-            .await?;
+            .await;
         if bypass_usage_parser {
+            // The spec is not used, so a broken one must not stop the task. Parsing still
+            // runs first so task-variable redactions get registered; rendering the scripts
+            // reports the broken spec.
+            if let Err(err) = &parsed {
+                trace!("Usage parser bypassed, spec failed to load: {err}");
+            }
             trace!("Usage parser bypassed");
             return Ok(());
         }
+        let (spec, _) = parsed?;
         let args = get_args();
         self.parse_usage_spec_and_init_env_from_spec(task, env, &args, &spec)
     }
