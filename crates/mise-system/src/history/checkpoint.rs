@@ -210,6 +210,22 @@ impl Store {
         store::list_in(&self.state_dir)
     }
 
+    /// How many checkpoints are indexed, without reading their records.
+    pub fn checkpoint_count(&self) -> Result<usize> {
+        store::count_in(&self.state_dir)
+    }
+
+    /// The newest checkpoint, without reading the older ones.
+    pub fn latest(&self) -> Result<Option<Entry>> {
+        store::latest_in(&self.state_dir)
+    }
+
+    /// The newest checkpoint holding a content snapshot, without reading the
+    /// older ones.
+    pub fn latest_with_snapshot(&self) -> Result<Option<Entry>> {
+        store::latest_snapshot_entry_in(&self.state_dir)
+    }
+
     /// The id and uuid of the newest checkpoint holding a content snapshot:
     /// the one an unchanged capture compares against.
     pub(crate) fn latest_snapshot(&self) -> Result<Option<(u64, String)>> {
