@@ -563,7 +563,7 @@ impl HistoryRepo {
                                 let encoded = super::sync::files::encode(
                                     &path, mode, &bytes, &scheme, recipients,
                                 )?;
-                                self.hash_blob(&encoded)?
+                                self.hash_blob_in(&gix, &encoded)?
                             }
                         };
                         cache.insert(
@@ -653,6 +653,9 @@ impl HistoryRepo {
         root: &CaptureRoot,
         omitted: &mut Vec<super::store::PathReason>,
     ) -> Result<String> {
+        // opening a repository scans every pack index: one open serves every
+        // file of the root, not one per file
+        let gix = self.gix()?;
         let mut overlays = vec![];
         for rel in &root.files {
             let live = root.path.join(rel);
@@ -661,7 +664,7 @@ impl HistoryRepo {
                 let (mode, oid) = if meta.file_type().is_symlink() {
                     (
                         "120000",
-                        self.hash_blob(path_bytes(&std::fs::read_link(&live)?).as_ref())?,
+                        self.hash_blob_in(&gix, path_bytes(&std::fs::read_link(&live)?).as_ref())?,
                     )
                 } else if meta.is_dir() {
                     ("160000", mise_util::git::Git::new(&live).current_sha()?)
@@ -679,7 +682,7 @@ impl HistoryRepo {
                     )?;
                     (
                         if executable { "100755" } else { "100644" },
-                        self.hash_blob(&bytes)?,
+                        self.hash_blob_in(&gix, &bytes)?,
                     )
                 } else {
                     bail!("cannot capture non-file {}", display_path(&live));
@@ -1374,8 +1377,13 @@ impl HistoryRepo {
     /// Writes `bytes` as a blob, as `hash-object -w --stdin` does (no
     /// filters), without starting Git once per file of a snapshot.
     pub(crate) fn hash_blob(&self, bytes: &[u8]) -> Result<String> {
-        Ok(self
-            .gix()?
+        self.hash_blob_in(&self.gix()?, bytes)
+    }
+
+    /// [`Self::hash_blob`] through an already open repository, for a walk that
+    /// writes many blobs (opening one scans every pack index).
+    pub(crate) fn hash_blob_in(&self, repo: &gix::Repository, bytes: &[u8]) -> Result<String> {
+        Ok(repo
             .write_blob(bytes)
             .wrap_err("writing a blob")?
             .to_string())
