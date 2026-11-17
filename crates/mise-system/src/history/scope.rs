@@ -1054,7 +1054,9 @@ pub(crate) fn operation_lock_wait() -> std::time::Duration {
     }
 }
 
-fn parse_lock_wait(value: &str) -> Result<std::time::Duration> {
+/// Parses a `history.lock_wait` value (`5m`, `45`, `0`), capped at an hour.
+/// Public so `--wait` takes the same spellings.
+pub fn parse_lock_wait(value: &str) -> Result<std::time::Duration> {
     const MAX: std::time::Duration = std::time::Duration::from_secs(60 * 60);
     Ok(mise_util::duration::parse_duration(value)?.min(MAX))
 }

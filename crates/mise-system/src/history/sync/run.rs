@@ -230,6 +230,10 @@ pub struct SyncRequest {
     /// instead of failing at once. Commands someone runs queue; the watcher
     /// does not, because it retries a contended sync on its own schedule.
     pub queue: bool,
+    /// How long a queued sync waits for the lock before giving up; `None`
+    /// uses `history.lock_wait`. This is `--wait`, so a caller can bound a
+    /// wait longer or shorter than the setting.
+    pub wait: Option<Duration>,
 }
 
 impl SyncRequest {
@@ -242,6 +246,7 @@ impl SyncRequest {
             offline: false,
             dry_run: false,
             queue: false,
+            wait: None,
         }
     }
 }
@@ -279,7 +284,7 @@ fn head_moved(
 /// Runs one synchronization.
 pub fn sync(store: &Store, tracked: &TrackedSet, request: &SyncRequest) -> Result<SyncOutcome> {
     let _sync_lock = if request.queue {
-        lock_queued(store)?
+        lock_queued(store, request.wait)?
     } else {
         lock(store)?
     };
@@ -566,6 +571,85 @@ fn lock_path(state_dir: &Path) -> PathBuf {
     hstore::store_dir_in(state_dir).join("sync.lock")
 }
 
+/// Who holds the sync lock, for a refusal to name: the pid the holder
+/// recorded, the command that pid runs, and how long it has held the lock.
+/// "Another sync is running" and "a watcher is parked on the lock" read the
+/// same without this, and only one of them is worth waiting for.
+fn describe_holder(state_dir: &Path) -> String {
+    let path = lock_path(state_dir);
+    let Some(pid) = mise_util::lock_file::read_holder_pid(&path) else {
+        return "the holder recorded no pid (a mise older than this one, or it released the lock as this was read)".to_string();
+    };
+    let command = process_command(pid)
+        .map(|command| format!(" running `{command}`"))
+        .unwrap_or_default();
+    let held = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|written| written.elapsed().ok())
+        .map(|held| format!(", holding the lock for {}", human_duration(held)))
+        .unwrap_or_default();
+    let liveness = if process_alive(pid) {
+        ""
+    } else {
+        ", and that process has exited (an older holder took the lock without recording a pid)"
+    };
+    format!("pid {pid}{command}{held}{liveness}")
+}
+
+/// The command line of `pid`, best effort. Another user's process, a process
+/// that exited, or a platform without the source of truth yields nothing and
+/// the refusal names the pid alone.
+#[cfg(target_os = "linux")]
+fn process_command(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let command = raw
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!command.is_empty()).then_some(command)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_command(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command.is_empty()).then_some(command)
+}
+
+/// Whether `pid` is still running. Unanswerable counts as running: a refusal
+/// that wrongly says the holder is gone would invite concurrent syncs.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
+/// A lock age in the units someone reads at a glance: seconds under a
+/// minute, then minutes, then hours and minutes.
+fn human_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m", seconds / 60),
+        _ => format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60),
+    }
+}
+
 /// The sync lock: every reader-then-writer of `sync.json` holds it. A sync
 /// or pull takes it for its whole duration and fails at once when another
 /// holds it.
@@ -578,17 +662,34 @@ pub fn lock(store: &Store) -> Result<fslock::LockFile> {
 /// running save, so syncs started together run one after another instead of
 /// all but one failing. The watcher keeps [`lock`]: waiting would stall its
 /// event loop, and it retries a contended sync on its own schedule.
-pub fn lock_queued(store: &Store) -> Result<fslock::LockFile> {
+pub fn lock_queued(store: &Store, wait: Option<Duration>) -> Result<fslock::LockFile> {
     lock_wait(
         store.state_dir(),
-        crate::history::scope::operation_lock_wait(),
+        wait.unwrap_or_else(crate::history::scope::operation_lock_wait),
     )
+}
+
+/// The refusal for a sync that could not take the lock: who holds it, and
+/// what to do instead of retrying into the same wall. A command someone ran
+/// can pick a wait; the watcher can only be stopped or waited out.
+pub(crate) fn contended(state_dir: &Path, waited: Option<Duration>) -> eyre::Report {
+    let holder = describe_holder(state_dir);
+    match waited {
+        None => eyre::eyre!(
+            "another setup sync or pull is running: {holder}; pass `--wait <duration>` to queue behind it, or stop the holder"
+        ),
+        Some(waited) => eyre::eyre!(
+            "another setup sync or pull is running: {holder}; waited {} and gave up, so raise `history.lock_wait`, pass a longer `--wait`, or stop the holder",
+            human_duration(waited)
+        ),
+    }
 }
 
 pub(crate) fn lock_in(state_dir: &Path) -> Result<fslock::LockFile> {
     mise_util::lock_file::LockFile::at(&lock_path(state_dir))
+        .with_pid()
         .try_lock()?
-        .ok_or_else(|| eyre::eyre!("another setup sync or pull is running; retry shortly"))
+        .ok_or_else(|| contended(state_dir, None))
 }
 
 /// Changes one thing in `sync.json` under the sync lock, reading the record
@@ -609,11 +710,14 @@ pub(crate) fn update_status(
 pub(crate) fn lock_wait(state_dir: &Path, wait: Duration) -> Result<fslock::LockFile> {
     let deadline = Instant::now() + wait;
     loop {
-        if let Some(lock) = mise_util::lock_file::LockFile::at(&lock_path(state_dir)).try_lock()? {
+        if let Some(lock) = mise_util::lock_file::LockFile::at(&lock_path(state_dir))
+            .with_pid()
+            .try_lock()?
+        {
             return Ok(lock);
         }
         if Instant::now() >= deadline {
-            bail!("another setup sync or pull is running; retry shortly");
+            return Err(contended(state_dir, Some(wait)));
         }
         std::thread::sleep(STATUS_LOCK_POLL);
     }
@@ -1658,6 +1762,80 @@ mod status_tests {
         std::thread::sleep(Duration::from_millis(300));
         drop(held);
         assert!(waiter.join().unwrap(), "the queued sync should take the lock once it is free");
+    }
+
+    /// A refusal names who holds the lock, so a permanent holder is visible
+    /// without `lsof`: waiting out `mise dot watch` is wasted time, and the
+    /// refusal is what an agent reads.
+    #[test]
+    fn a_refused_lock_names_the_holder_pid_and_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hstore::store_dir_in(&state_dir)).unwrap();
+        let held = lock_in(&state_dir).unwrap();
+        let err = lock_in(&state_dir).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("pid {}", std::process::id())),
+            "the refusal must name the holder: {err}"
+        );
+        assert!(
+            err.contains("holding the lock for"),
+            "the refusal must say how long it has been held: {err}"
+        );
+        assert!(
+            err.contains("--wait"),
+            "the refusal must point at the bounded wait: {err}"
+        );
+        drop(held);
+    }
+
+    /// A bounded wait that runs out says who it was waiting for and how long
+    /// it waited, rather than "retry shortly" about a process that may never
+    /// release the lock.
+    #[test]
+    fn an_expired_wait_names_the_holder_and_the_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hstore::store_dir_in(&state_dir)).unwrap();
+        let held = lock_in(&state_dir).unwrap();
+        let err = lock_wait(&state_dir, Duration::ZERO)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("pid {}", std::process::id())),
+            "the timeout must name the holder: {err}"
+        );
+        assert!(
+            err.contains("waited 0s and gave up"),
+            "the timeout must say how long it waited: {err}"
+        );
+        drop(held);
+    }
+
+    /// A holder from a mise that did not record a pid is a fact, not a panic:
+    /// the refusal says so instead of inventing a holder.
+    #[test]
+    fn a_holder_that_recorded_no_pid_is_reported_as_such() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hstore::store_dir_in(&state_dir)).unwrap();
+        let path = lock_path(&state_dir);
+        let mut older = fslock::LockFile::open(&path).unwrap();
+        assert!(older.try_lock().unwrap());
+        let err = lock_in(&state_dir).unwrap_err().to_string();
+        assert!(
+            err.contains("recorded no pid"),
+            "an unrecorded holder must be named as such: {err}"
+        );
+        drop(older);
+    }
+
+    #[test]
+    fn lock_ages_read_in_seconds_minutes_and_hours() {
+        assert_eq!(human_duration(Duration::ZERO), "0s");
+        assert_eq!(human_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(human_duration(Duration::from_secs(90)), "1m");
+        assert_eq!(human_duration(Duration::from_secs(3600 + 840)), "1h 14m");
     }
 }
 

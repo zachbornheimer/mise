@@ -29,6 +29,14 @@ pub(crate) struct DotfilesSync {
     /// Warn instead of failing when the origin is unreachable
     #[usage(long)]
     best_effort: bool,
+
+    /// Wait this long for a running sync or pull instead of failing
+    ///
+    /// Accepts a duration such as `90s`, `5m` or `1h` (at most one hour).
+    /// Without it the wait is `history.lock_wait`, 30 seconds by default;
+    /// `0` fails at once. The refusal names the holder either way.
+    #[usage(long, value_name = "DURATION")]
+    wait: Option<String>,
 }
 
 impl DotfilesSync {
@@ -54,6 +62,11 @@ impl DotfilesSync {
         let mut request = SyncRequest::new(self.fetch_only);
         request.allow_plaintext_history = self.allow_plaintext_history;
         request.queue = true;
+        request.wait = self
+            .wait
+            .as_deref()
+            .map(crate::system::history::scope::parse_lock_wait)
+            .transpose()?;
         let outcome = run::sync(&store, &tracked, &request)?;
         crate::system::history::sync::origin::report(&outcome);
         Ok(())
