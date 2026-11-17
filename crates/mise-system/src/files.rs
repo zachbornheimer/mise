@@ -206,6 +206,14 @@ pub struct ExplicitFields {
 }
 
 impl FilePolicy {
+    /// Shared tracking defaults to encryption once recipients are configured.
+    /// Only an explicit `encrypt = false` opts out; local history is unchanged.
+    pub fn default_history_encryption(&mut self, has_recipients: bool) {
+        if has_recipients && !self.local && !self.explicit.encrypt {
+            self.encrypt = true;
+        }
+    }
+
     /// Policy defaults do not enroll a deployment. Only explicit Track
     /// declarations observe files, regardless of how those files are deployed.
     pub fn for_mode(_mode: FileMode) -> Self {
@@ -809,6 +817,12 @@ pub fn composed_files_from_config(config: &Config) -> Result<Vec<FileRequest>> {
         crate::dotfile_groups::warn_unknown_selection(selection, &declared);
     }
     requests.extend(deselected);
+    let has_recipients = !crate::history::config::file_recipients()?.is_empty();
+    for request in &mut requests {
+        if request.mode == FileMode::Track {
+            request.policy.default_history_encryption(has_recipients);
+        }
+    }
     Ok(requests)
 }
 
@@ -8350,6 +8364,23 @@ variants = [{{ {field} = "linux" }}]"#
                 .iter()
                 .any(|item| item.target == target)
         );
+    }
+
+    #[test]
+    fn plaintext_guard_tracking_defaults_to_encryption_unless_explicitly_disabled() {
+        let mut policy = FilePolicy::for_mode(FileMode::Track);
+        policy.default_history_encryption(false);
+        assert!(!policy.encrypt);
+        policy.default_history_encryption(true);
+        assert!(policy.encrypt);
+        let mut explicit = FilePolicy::for_mode(FileMode::Track);
+        explicit.explicit.encrypt = true;
+        explicit.default_history_encryption(true);
+        assert!(!explicit.encrypt);
+        let mut local = FilePolicy::for_mode(FileMode::Track);
+        local.local = true;
+        local.default_history_encryption(true);
+        assert!(!local.encrypt);
     }
 
     #[test]

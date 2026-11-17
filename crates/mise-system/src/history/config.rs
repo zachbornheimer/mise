@@ -55,7 +55,7 @@ fn render_git_email(template: &str, hostname: &str) -> Result<String> {
     Ok(email)
 }
 
-pub(crate) fn file_recipients() -> Result<Vec<String>> {
+pub fn file_recipients() -> Result<Vec<String>> {
     let mut recipients = Vec::new();
     for (path, layer) in layers()? {
         if let Some(encryption) = layer.encryption {

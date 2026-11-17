@@ -10,6 +10,19 @@ the history and your origin hold only ciphertext while the file you edit stays
 readable. Set it up before a file's first save: encrypting a file later does
 not remove the plaintext versions already in history.
 
+When `[history.encryption]` recipients are configured, shared `mode = "track"`
+entries default to encrypted storage, including new `mise dot track` entries.
+An intentional plaintext entry must declare `encrypt = false`; local-only
+history is unchanged. mise's own control configuration cannot be encrypted,
+so a tracked mise config must explicitly use `encrypt = false` and must not
+contain secrets.
+
+Before saving, mise validates the final checkpoint against the current
+configuration, including manual-save and carried files. Enabling encryption
+cannot carry an older plaintext version into a new checkpoint: explicitly save
+that path encrypted first. Every outgoing checkpoint is audited again at the
+Git transport boundary; earlier plaintext ancestry still requires repair.
+
 ## Encrypt a file {#encrypt-a-file}
 
 List public recipients in your global config and mark the file or directory

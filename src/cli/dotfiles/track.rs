@@ -278,6 +278,7 @@ impl DotfilesTrack {
                 && !target.is_dir()
                 && (target.exists() || target.is_symlink())
                 && !self.encrypt
+                && !self.policy(existing, false).encrypt
                 && !existing
                     .is_some_and(|request| request.policy.encrypt || request.policy.allow_plaintext)
                 && !self.allow_plaintext
@@ -300,6 +301,16 @@ impl DotfilesTrack {
                 approved_plaintext.insert(normalized.clone());
             }
             let allow_plaintext = self.allow_plaintext || approved_plaintext.contains(&normalized);
+            if self.policy(existing, allow_plaintext).encrypt {
+                if !Settings::get().history.enabled {
+                    bail!("dotfiles: cannot enroll encrypted paths while history is disabled");
+                }
+                if inside_capture()? {
+                    bail!(
+                        "dotfiles: enroll encrypted paths separately so their baseline can be verified"
+                    );
+                }
+            }
             let mut entry = TrackedEntry::new(
                 normalized.clone(),
                 "track",
@@ -631,6 +642,14 @@ impl DotfilesTrack {
         let mut policy = existing
             .map(|req| req.policy)
             .unwrap_or_else(|| crate::system::files::FilePolicy::for_mode(FileMode::Track));
+        // Recipient errors must not turn the default into plaintext; the
+        // baseline reports the error and rolls back the declaration.
+        policy.default_history_encryption(
+            !self.local
+                && crate::system::history::config::file_recipients()
+                    .map(|recipients| !recipients.is_empty())
+                    .unwrap_or(true),
+        );
         if self.no_autosave {
             policy.autosave = false;
         }
@@ -640,6 +659,7 @@ impl DotfilesTrack {
         } else if allow_plaintext {
             policy.encrypt = false;
             policy.allow_plaintext = true;
+            policy.explicit.encrypt = true;
         }
         policy
     }
@@ -672,7 +692,11 @@ impl DotfilesTrack {
         // it before; one inherited from another layer stays unwritten so
         // that layer keeps deciding it
         let written = |key: &str| previous.iter().any(|written| written == key);
-        if self.encrypt || allow_plaintext || written("encrypt") {
+        if (existing.is_none() && policy.encrypt)
+            || self.encrypt
+            || allow_plaintext
+            || written("encrypt")
+        {
             table.insert(
                 "encrypt",
                 Value::Boolean(toml_edit::Formatted::new(policy.encrypt)),
