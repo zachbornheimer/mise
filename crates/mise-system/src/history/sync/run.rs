@@ -861,8 +861,7 @@ fn prepare(
                         local: shared.get(&plan.branch_path).cloned(),
                         remote: upstream.files.get(&plan.branch_path).cloned(),
                         base: plan.next.acknowledged.clone(),
-                detail: None,
-            });
+                    });
                     plan.publish = None;
                 }
             }
@@ -894,8 +893,7 @@ fn repository_conflict(status: &mut SyncStatus, error: &eyre::Report) {
         local: None,
         remote: None,
         base: None,
-                detail: None,
-            }];
+    }];
 }
 
 fn apply_resolutions(
@@ -1067,7 +1065,6 @@ fn apply_resolutions(
                 local: shared.get(&plan.branch_path).cloned(),
                 remote: upstream.files.get(&plan.branch_path).cloned(),
                 base: plan.next.acknowledged.clone(),
-                detail: None,
             });
             plan.publish = None;
         }
@@ -1422,8 +1419,7 @@ mod notification_tests {
             local: None,
             remote: None,
             base: None,
-                detail: None,
-            }
+        }
     }
 
     #[test]
@@ -1491,8 +1487,7 @@ mod status_tests {
             local: None,
             remote: None,
             base: None,
-                detail: None,
-            }
+        }
     }
 
     #[test]
