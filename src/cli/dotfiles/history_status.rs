@@ -155,7 +155,7 @@ pub(crate) async fn report() -> Result<HistoryReport> {
             history_repo: None,
         });
     }
-    let (store, tracked, entries) = super::history::open().await?;
+    let (store, tracked) = super::history::open_store().await?;
     let walk = tracked.walk()?;
     walk.report_warnings();
     let tracked_files = walk.roots.iter().map(|root| root.files.len() as u64).sum();
@@ -163,7 +163,7 @@ pub(crate) async fn report() -> Result<HistoryReport> {
     // the index only once it is closed
     let pending_operations =
         crate::system::history::store::peek_pending_in(store.state_dir())?.len();
-    let latest = entries.last().map(|entry| LatestReport {
+    let latest = store.latest()?.map(|entry| LatestReport {
         id: entry.id,
         created_at: entry.checkpoint.created_at.clone(),
         trigger: entry.checkpoint.trigger.as_str().to_string(),
@@ -171,10 +171,10 @@ pub(crate) async fn report() -> Result<HistoryReport> {
     });
     // edits nothing has saved yet, which a stopped watcher or a manual-save
     // entry leaves behind; worked out like `mise dot history diff`
-    let snapshot = entries
-        .iter()
-        .rev()
-        .find_map(|entry| entry.checkpoint.tree.snapshot.as_deref());
+    let snapshot_entry = store.latest_with_snapshot()?;
+    let snapshot = snapshot_entry
+        .as_ref()
+        .and_then(|entry| entry.checkpoint.tree.snapshot.as_deref());
     let not_applied = match (store.repo(), snapshot) {
         (Some(repo), Some(snapshot)) => {
             match crate::system::history::held::unheld_entries(repo, snapshot, &walk) {
@@ -206,7 +206,7 @@ pub(crate) async fn report() -> Result<HistoryReport> {
         local_entries: tracked.local.len(),
         omitted: walk.omitted,
         nested: walk.nested,
-        checkpoints: entries.len(),
+        checkpoints: store.checkpoint_count()?,
         latest,
         unsaved,
         not_applied,

@@ -484,6 +484,9 @@ impl HistoryRepo {
             }
             None => BTreeMap::new(),
         };
+        // opened once: every cached entry below asks whether its blob is an
+        // encrypted envelope, and opening a repository scans every pack index
+        let gix = self.gix()?;
         for (root, encrypted) in roots.iter_mut().zip(encrypted_by_root) {
             root.files.retain(|rel| !encrypted.contains(rel));
             for rel in encrypted {
@@ -520,7 +523,7 @@ impl HistoryRepo {
                             && entry.scheme == scheme
                     })
                     .filter(|entry| {
-                        self.blob_starts_with(&entry.oid, b"mise-encrypted-file-v1\n")
+                        self.blob_starts_with_in(&gix, &entry.oid, b"mise-encrypted-file-v1\n")
                             .unwrap_or(false)
                     });
                 let previous = in_history.remove(&path);
@@ -560,7 +563,7 @@ impl HistoryRepo {
                                 let encoded = super::sync::files::encode(
                                     &path, mode, &bytes, &scheme, recipients,
                                 )?;
-                                self.hash_blob(&encoded)?
+                                self.hash_blob_in(&gix, &encoded)?
                             }
                         };
                         cache.insert(
@@ -650,6 +653,9 @@ impl HistoryRepo {
         root: &CaptureRoot,
         omitted: &mut Vec<super::store::PathReason>,
     ) -> Result<String> {
+        // opening a repository scans every pack index: one open serves every
+        // file of the root, not one per file
+        let gix = self.gix()?;
         let mut overlays = vec![];
         for rel in &root.files {
             let live = root.path.join(rel);
@@ -658,7 +664,7 @@ impl HistoryRepo {
                 let (mode, oid) = if meta.file_type().is_symlink() {
                     (
                         "120000",
-                        self.hash_blob(path_bytes(&std::fs::read_link(&live)?).as_ref())?,
+                        self.hash_blob_in(&gix, path_bytes(&std::fs::read_link(&live)?).as_ref())?,
                     )
                 } else if meta.is_dir() {
                     ("160000", mise_util::git::Git::new(&live).current_sha()?)
@@ -676,7 +682,7 @@ impl HistoryRepo {
                     )?;
                     (
                         if executable { "100755" } else { "100644" },
-                        self.hash_blob(&bytes)?,
+                        self.hash_blob_in(&gix, &bytes)?,
                     )
                 } else {
                     bail!("cannot capture non-file {}", display_path(&live));
@@ -1171,32 +1177,74 @@ impl HistoryRepo {
         from: Option<&gix::Tree<'_>>,
         to: &gix::Tree<'_>,
     ) -> Result<Vec<Change>> {
-        let from = if let Some(tree) = from {
-            Self::gix_tree_entries(repo, tree)?
-        } else {
-            vec![]
-        }
-        .into_iter()
-        .map(|entry| (entry.path, (entry.mode, entry.oid)))
-        .collect::<BTreeMap<_, _>>();
-        let to = Self::gix_tree_entries(repo, to)?
-            .into_iter()
-            .map(|entry| (entry.path, (entry.mode, entry.oid)))
-            .collect::<BTreeMap<_, _>>();
         let mut changes = vec![];
-        for path in from.keys().chain(to.keys()).collect::<BTreeSet<_>>() {
-            let status = match (from.get(path), to.get(path)) {
+        Self::gix_diff_level(
+            repo,
+            from.map(|tree| tree.id),
+            Some(to.id),
+            "",
+            &mut changes,
+        )?;
+        changes.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(changes)
+    }
+
+    /// One level of [`Self::gix_changes`]. A subtree whose id is the same on
+    /// both sides holds the same files, so it is not opened: a checkpoint
+    /// that changed one file reads the directories on that file's path, not
+    /// every saved file twice.
+    fn gix_diff_level(
+        repo: &gix::Repository,
+        from: Option<gix::ObjectId>,
+        to: Option<gix::ObjectId>,
+        prefix: &str,
+        changes: &mut Vec<Change>,
+    ) -> Result<()> {
+        // name -> (is a tree, mode, id)
+        type Level = BTreeMap<String, (bool, gix::object::tree::EntryMode, gix::ObjectId)>;
+        let read = |id: Option<gix::ObjectId>| -> Result<Level> {
+            let Some(id) = id else {
+                return Ok(Level::new());
+            };
+            let tree = repo.find_tree(id)?;
+            let mut level = Level::new();
+            for entry in tree.decode()?.entries.iter() {
+                let name = std::str::from_utf8(entry.filename.as_ref()).wrap_err(
+                    "history cannot represent a non-UTF-8 filename; refusing to change its bytes",
+                )?;
+                level.insert(
+                    name.to_string(),
+                    (entry.mode.is_tree(), entry.mode, entry.oid.to_owned()),
+                );
+            }
+            Ok(level)
+        };
+        let (from, to) = (read(from)?, read(to)?);
+        for name in from.keys().chain(to.keys()).collect::<BTreeSet<_>>() {
+            let path = format!("{prefix}{name}");
+            let (left, right) = (from.get(name), to.get(name));
+            if left == right {
+                continue;
+            }
+            let tree_of = |side: Option<&(bool, _, gix::ObjectId)>| {
+                side.and_then(|(is_tree, _, id)| is_tree.then_some(*id))
+            };
+            let file_of = |side: Option<&(bool, gix::object::tree::EntryMode, gix::ObjectId)>| {
+                side.and_then(|(is_tree, mode, id)| (!is_tree).then_some((*mode, *id)))
+            };
+            let (left_tree, right_tree) = (tree_of(left), tree_of(right));
+            if left_tree.is_some() || right_tree.is_some() {
+                Self::gix_diff_level(repo, left_tree, right_tree, &format!("{path}/"), changes)?;
+            }
+            let status = match (file_of(left), file_of(right)) {
                 (None, Some(_)) => 'A',
                 (Some(_), None) => 'D',
                 (Some(left), Some(right)) if left != right => 'M',
                 _ => continue,
             };
-            changes.push(Change {
-                status,
-                path: path.clone(),
-            });
+            changes.push(Change { status, path });
         }
-        Ok(changes)
+        Ok(())
     }
 
     /// Recursive listing of a tree (or a path inside it).
@@ -1305,13 +1353,24 @@ impl HistoryRepo {
     }
 
     pub(crate) fn blob_starts_with(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
-        if let Some(bytes) = self.transient_blob(oid) {
-            return Ok(bytes.starts_with(prefix));
+        if self.transient_blob(oid).is_none() && Self::object_id(oid).is_some() {
+            return self.blob_starts_with_in(&self.gix()?, oid, prefix);
         }
-        if let Some(id) = Self::object_id(oid) {
+        self.blob_starts_with_in_git(oid, prefix)
+    }
+
+    /// [`Self::blob_starts_with`] through an already open repository. Opening
+    /// one scans every pack index, so a walk that asks about many blobs opens
+    /// it once and passes it here, not once per blob.
+    pub(crate) fn blob_starts_with_in(
+        &self,
+        repo: &gix::Repository,
+        oid: &str,
+        prefix: &[u8],
+    ) -> Result<bool> {
+        if let (None, Some(id)) = (self.transient_blob(oid), Self::object_id(oid)) {
             // gix reads a full object id without starting Git; a blob
             // shorter than the prefix cannot match, so it is never read
-            let repo = self.gix()?;
             let header = repo
                 .find_header(id)
                 .wrap_err_with(|| format!("reading {id}"))?;
@@ -1325,6 +1384,14 @@ impl HistoryRepo {
                 .find_object(id)
                 .wrap_err_with(|| format!("reading {id}"))?;
             return Ok(object.data.starts_with(prefix));
+        }
+        self.blob_starts_with_in_git(oid, prefix)
+    }
+
+    /// A transient (not yet written) blob, or a revision only Git resolves.
+    fn blob_starts_with_in_git(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
+        if let Some(bytes) = self.transient_blob(oid) {
+            return Ok(bytes.starts_with(prefix));
         }
         self.git.blob_starts_with(oid, prefix)
     }
@@ -1352,8 +1419,13 @@ impl HistoryRepo {
     /// Writes `bytes` as a blob, as `hash-object -w --stdin` does (no
     /// filters), without starting Git once per file of a snapshot.
     pub(crate) fn hash_blob(&self, bytes: &[u8]) -> Result<String> {
-        Ok(self
-            .gix()?
+        self.hash_blob_in(&self.gix()?, bytes)
+    }
+
+    /// [`Self::hash_blob`] through an already open repository, for a walk that
+    /// writes many blobs (opening one scans every pack index).
+    pub(crate) fn hash_blob_in(&self, repo: &gix::Repository, bytes: &[u8]) -> Result<String> {
+        Ok(repo
             .write_blob(bytes)
             .wrap_err("writing a blob")?
             .to_string())
@@ -1721,16 +1793,35 @@ impl HistoryRepo {
         let Some(object) = self.object_at(tree, path)? else {
             return Ok(None);
         };
+        self.restored(&self.encrypted_paths_of(tree)?, path, object)
+            .map(Some)
+    }
+
+    /// The encrypted streams `tree` declares, read once for a walk over its
+    /// files ([`Self::restored`]) instead of once per file.
+    pub(crate) fn encrypted_paths_of(&self, tree: &str) -> Result<BTreeSet<String>> {
+        Ok(super::manifest::Manifest::read(self, tree)?
+            .map(|manifest| manifest.encrypted_paths())
+            .unwrap_or_default())
+    }
+
+    /// [`Self::restored_object_at`] for an object already listed from the
+    /// tree, with the tree's encrypted streams read beforehand: a walk over
+    /// every saved file then reads the manifest once, not once per file.
+    pub(crate) fn restored(
+        &self,
+        encrypted_paths: &BTreeSet<String>,
+        path: &str,
+        object: (String, String),
+    ) -> Result<(String, String)> {
         if matches!(object.0.as_str(), "040000" | "160000") {
-            return Ok(Some(object));
+            return Ok(object);
         }
-        let encrypted = super::manifest::Manifest::read(self, tree)?.is_some_and(|manifest| {
-            manifest.encrypted_paths().iter().any(|prefix| {
-                path == prefix
-                    || path
-                        .strip_prefix(prefix)
-                        .is_some_and(|rest| rest.starts_with('/'))
-            })
+        let encrypted = encrypted_paths.iter().any(|prefix| {
+            path == prefix
+                || path
+                    .strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
         });
         if encrypted {
             return super::sync::files::decrypt(
@@ -1738,10 +1829,9 @@ impl HistoryRepo {
                 path,
                 &object,
                 console::user_attended_stderr(),
-            )
-            .map(Some);
+            );
         }
-        Ok(Some(object))
+        Ok(object)
     }
 
     /// Builds a tree from `base` with `overlays` applied: each path is

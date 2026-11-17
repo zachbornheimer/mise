@@ -112,7 +112,7 @@ chmod 700 ~/.managed-links/private
 ln -s "$PWD/dotfiles/links/one" ~/.managed-links/alias
 ln -s "$PWD/dotfiles/links/excluded" ~/.managed-links/excluded
 rm ~/.managed-links/one
-relative_one="$(realpath --relative-to="$HOME/.managed-links" "$PWD/dotfiles/links/one")"
+relative_one="$(perl -MFile::Spec -e 'print File::Spec->abs2rel(@ARGV)' "$PWD/dotfiles/links/one" "$HOME/.managed-links")"
 ln -s "$relative_one" ~/.managed-links/one
 rm dotfiles/links/stale
 assert_succeed "mise bootstrap dotfiles unapply ~/.managed-links --yes"

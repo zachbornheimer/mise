@@ -70,7 +70,7 @@ assert_fail "test -e $d/.manual"
 g="$(new_machine g)"
 head -c 17000000 /dev/zero >"$g/.big"
 assert_fail "machine $g bootstrap --adopt file://$origin --take-remote-all --yes --only dotfiles 2>&1" "could not save this machine's version of"
-assert "stat -c %s $g/.big" "17000000"
+assert "echo $(file_size "$g/.big")" "17000000"
 # nothing changed, so moving it aside and retrying sets the machine up
 assert_fail "git --git-dir=$g/.local/state/mise/history/repo.git rev-parse --verify -q main"
 mv "$g/.big" "$g/big.aside"
