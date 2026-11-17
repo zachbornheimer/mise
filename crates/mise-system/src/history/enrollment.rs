@@ -180,6 +180,15 @@ fn reconcile(
                 .iter()
                 .find(|old| old.path == entry.path)
         });
+        // Current encryption is a safety floor, not a cached declaration edit.
+        if entry.encrypt
+            && let Some(existing) = result
+                .enrollment
+                .iter_mut()
+                .find(|saved| saved.path == entry.path)
+        {
+            existing.encrypt = true;
+        }
         if old == Some(entry) {
             continue;
         }
@@ -298,6 +307,9 @@ fn reconcile(
             result.recipients = current.recipients.clone();
         }
     }
+    if result.recipients.is_empty() && result.enrollment.iter().any(|entry| entry.encrypt) {
+        result.recipients = current.recipients.clone();
+    }
     result.enrollment.sort_by(|a, b| a.path.cmp(&b.path));
     result
 }
@@ -343,6 +355,16 @@ mod tests {
         super::reconcile(saved, current, previous, historical, &BTreeSet::new())
     }
 
+    #[test]
+    fn plaintext_guard_current_encryption_overrides_cached_declarations() {
+        let saved = manifest("home/private");
+        let mut current = saved.clone();
+        current.enrollment[0].encrypt = true;
+        let resolved = reconcile(&saved, &current, Some(&current), &[]);
+        assert!(resolved.enrollment[0].encrypt);
+        let resolved = reconcile(&saved, &current, None, &[current.clone()]);
+        assert!(resolved.enrollment[0].encrypt);
+    }
     #[test]
     fn an_entry_moved_to_an_unselected_environment_stays_enrolled() {
         let saved = manifest("home/.yabairc");

@@ -28,7 +28,7 @@ pub(crate) fn machine_name() -> Result<Option<String>> {
     Ok(Some(name))
 }
 
-pub(crate) fn file_recipients() -> Result<Vec<String>> {
+pub fn file_recipients() -> Result<Vec<String>> {
     let mut recipients = Vec::new();
     for (path, layer) in layers()? {
         if let Some(encryption) = layer.encryption {
