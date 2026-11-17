@@ -1,0 +1,3 @@
+reason = "Dotfiles history stops fighting itself: a queued sync or pull waits in line for `--wait` or `history.lock_wait` and gives up naming the lock holder, readers report a running sync instead of queueing behind it, a sync stops waiting when a later one already published what it needed, each saved tree is read once per walk, and two machines that save identical encrypted content no longer merge their history as text (the repo carries `* -merge`, every Git-conflicted path is settled from the decrypted content, and a record Git already merged as text is repaired instead of failing every later sync)."
+upstream = "no"
+layer = 50
