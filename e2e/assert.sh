@@ -448,6 +448,24 @@ detect_platform() {
   export MISE_PLATFORM MISE_PLATFORM_OS MISE_PLATFORM_ARCH
 }
 
+# Permission bits in octal, as GNU `stat -c %a` prints them (BSD/macOS stat has no -c).
+# Assertions run in `bash -c` and do not see functions, so expand it at the call site:
+#   assert "echo $(file_mode "$f")" 600
+file_mode() {
+  local mode
+  if mode="$(stat -c %a "$1" 2>/dev/null)"; then
+    echo "$mode"
+  else
+    mode="$(stat -f %p "$1")"
+    printf '%o\n' "$((8#${mode: -4}))"
+  fi
+}
+
+# Size in bytes, as GNU `stat -c %s` prints it.
+file_size() {
+  stat -c %s "$1" 2>/dev/null || stat -f %z "$1"
+}
+
 # Skip the test unless every directory from / down to the current one is one mise trusts to hold
 # system plugins: owned by root or the current user, and writable by others only when sticky. Some
 # CI runners own /tmp, where tests run, by another user.
@@ -456,13 +474,8 @@ skip_unless_system_plugin_path_is_trusted() {
   dir="$(pwd -P)"
   uid="$(id -u)"
   while :; do
-    if owner="$(stat -c %u "$dir" 2>/dev/null)"; then
-      mode="$(stat -c %a "$dir")"
-    else
-      owner="$(stat -f %u "$dir")"
-      mode="$(stat -f %p "$dir")"
-      mode="${mode: -4}"
-    fi
+    owner="$(stat -c %u "$dir" 2>/dev/null || stat -f %u "$dir")"
+    mode="$(file_mode "$dir")"
     if [[ $owner != 0 && $owner != "$uid" ]] || { ((8#$mode & 8#022)) && ! ((8#$mode & 8#1000)); }; then
       echo "skipping: mise does not trust $dir to hold system plugins"
       exit 0

@@ -51,7 +51,23 @@ pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareR
     let roots = Roots::current();
     let record = crate::history::held::Held::load(repo)?;
     let mut holds: BTreeMap<String, bool> = BTreeMap::new();
-    for file in repo.ls_tree(&head)? {
+    // one listing and one manifest read for the walk: looking each file up
+    // again by path, and reading the manifest per file, made a sync of a
+    // few thousand files spend seconds here
+    let listing = repo.ls_tree(&head)?;
+    let saved: BTreeMap<&str, (String, String)> = listing
+        .iter()
+        .map(|entry| (entry.path.as_str(), (entry.mode.clone(), entry.oid.clone())))
+        .collect();
+    let encrypted_paths = repo.encrypted_paths_of(&head)?;
+    let restored = |path: &str| -> Result<Option<(String, String)>> {
+        saved
+            .get(path)
+            .cloned()
+            .map(|object| repo.restored(&encrypted_paths, path, object))
+            .transpose()
+    };
+    for file in &listing {
         let (local, variant) = match roots.locate(&file.path) {
             Located::Config(path) => (path, None),
             Located::Tracked { path, variant } => (path, variant),
@@ -68,7 +84,14 @@ pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareR
             Some(held) => *held,
             None => {
                 let held = record.always_holds(&stream)
-                    || record.holds(&stream, repo.object_at(&head, &stream)?.as_ref());
+                    || record.holds(
+                        &stream,
+                        match saved.get(stream.as_str()) {
+                            Some(object) => Some(object.clone()),
+                            None => repo.object_at(&head, &stream)?,
+                        }
+                        .as_ref(),
+                    );
                 holds.insert(stream.clone(), held);
                 held
             }
@@ -76,7 +99,7 @@ pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareR
         // another machine's version is not this one's to compare against:
         // the live file is what this machine has
         let object = if held {
-            repo.restored_object_at(&head, &file.path)?
+            restored(&file.path)?
         } else if let Some(live) = usable_live(repo, &local)? {
             // a file missing here while its stream was not selected is not
             // a deletion this machine made: without a base, the pull
@@ -91,14 +114,14 @@ pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareR
             // a directory or unreadable path where the file belongs is that
             // path's own conflict, decided when the pull plans it, not a
             // reason to stop every other file
-            repo.restored_object_at(&head, &file.path)?
+            restored(&file.path)?
         };
         let Some((mode, oid)) = object else {
             continue;
         };
         report
             .files
-            .insert(file.path, SharedFile { local, mode, oid });
+            .insert(file.path.clone(), SharedFile { local, mode, oid });
     }
     Ok(report)
 }

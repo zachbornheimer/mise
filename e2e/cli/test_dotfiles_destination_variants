@@ -50,9 +50,24 @@ mode = "copy"
 variants = [{ os = "windows", target = "~/.windows-settings.json" }]
 TOML
 
+case "$(uname -s)" in
+Darwin)
+  code_settings="$HOME/Library/Application Support/Code/User/settings.json"
+  rooted_settings="$HOME/Library/Application Support/Rooted Code/User/settings.json"
+  code_settings_name="Library/Application Support/Code/User/settings.json"
+  host_os=macos
+  ;;
+*)
+  code_settings="$HOME/.config/code/settings.json"
+  rooted_settings="$HOME/.config/rooted-code/settings.json"
+  code_settings_name=".config/code/settings.json"
+  host_os=linux
+  ;;
+esac
+
 assert_succeed "mise bootstrap dotfiles apply --yes"
-assert "cat ~/.config/code/settings.json" '{"shared":true}'
-assert "cat ~/.config/rooted-code/settings.json" '{"rooted":true}'
+assert "cat '$code_settings'" '{"shared":true}'
+assert "cat '$rooted_settings'" '{"rooted":true}'
 assert "readlink ~/.default-settings.json" "$PWD/dotfiles/settings.json"
 assert "cat ~/.rendered-settings" "answer = 42"
 assert "readlink ~/.variant-bin/example" "$PWD/dotfiles/bin/example"
@@ -64,11 +79,11 @@ assert_contains "MISE_ENV=work mise bootstrap dotfiles status --verbose" ".work-
 assert_not_contains "MISE_ENV=work mise bootstrap dotfiles status --verbose" ".default-settings.json"
 
 # Commands filter and operate on the resolved destination.
-echo changed >~/.config/code/settings.json
-assert_contains "mise bootstrap dotfiles diff ~/.config/code/settings.json" '+{"shared":true}'
-assert_succeed "mise bootstrap dotfiles apply ~/.config/code/settings.json --yes"
-assert_succeed "mise bootstrap dotfiles unapply ~/.config/code/settings.json --yes"
-assert_fail "test -e ~/.config/code/settings.json"
+echo changed >"$code_settings"
+assert_contains "mise bootstrap dotfiles diff '$code_settings'" '+{"shared":true}'
+assert_succeed "mise bootstrap dotfiles apply '$code_settings' --yes"
+assert_succeed "mise bootstrap dotfiles unapply '$code_settings' --yes"
+assert_fail "test -e '$code_settings'"
 
 # A local override of the logical declaration replaces the old destination.
 cat >mise.local.toml <<'TOML'
@@ -79,8 +94,8 @@ variants = [{ default = true, target = "~/.local-settings.json" }]
 TOML
 assert_succeed "mise bootstrap dotfiles apply --yes"
 assert "cat ~/.local-settings.json" '{"shared":true}'
-assert_fail "test -e ~/.config/code/settings.json"
-assert_not_contains "mise bootstrap dotfiles status --verbose" ".config/code/settings.json"
+assert_fail "test -e '$code_settings'"
+assert_not_contains "mise bootstrap dotfiles status --verbose" "$code_settings_name"
 
 # Invalid local overrides preserve the valid inherited declaration.
 cat >mise.local.toml <<'TOML'
@@ -89,14 +104,14 @@ source = "dotfiles/settings.json"
 mode = "copy"
 variants = [{ default = true, target = "relative.json" }]
 TOML
-assert_contains "mise bootstrap dotfiles status 2>&1" ".config/code/settings.json"
+assert_contains "mise bootstrap dotfiles status 2>&1" "$code_settings_name"
 cat >mise.local.toml <<'TOML'
 [dotfiles.settings]
 source = "dotfiles/settings.json"
 mode = "unknown"
 variants = [{ default = true, target = "~/.invalid-override" }]
 TOML
-assert_contains "mise bootstrap dotfiles status 2>&1" ".config/code/settings.json"
+assert_contains "mise bootstrap dotfiles status 2>&1" "$code_settings_name"
 assert_not_contains "mise bootstrap dotfiles status 2>/dev/null" ".invalid-override"
 
 cat >mise.local.toml <<'TOML'
@@ -105,7 +120,7 @@ source = "dotfiles/settings.json"
 mode = "copy"
 variants = [{ profile = "inactive", target = "~/.inactive-override" }]
 TOML
-assert_contains "mise bootstrap dotfiles status" ".config/code/settings.json"
+assert_contains "mise bootstrap dotfiles status" "$code_settings_name"
 
 # Unsupported defaults cannot route deployment variants into history tracking.
 cat >mise.local.toml <<'TOML'
@@ -119,18 +134,18 @@ assert "readlink ~/.default-mode-settings.json" "$PWD/dotfiles/settings.json"
 
 # Ambiguous matches, invalid defaults, relative paths, and tracking target
 # overrides must not write a destination.
-cat >>mise.toml <<'TOML'
+cat >>mise.toml <<TOML
 [dotfiles.ambiguous]
 source = "dotfiles/settings.json"
 mode = "copy"
 variants = [
-  { os = "linux", target = "~/.ambiguous-one" },
-  { os = "linux", target = "~/.ambiguous-two" },
+  { os = "$host_os", target = "~/.ambiguous-one" },
+  { os = "$host_os", target = "~/.ambiguous-two" },
 ]
 [dotfiles.invalid-default]
 source = "dotfiles/settings.json"
 mode = "copy"
-variants = [{ default = true, os = "linux", target = "~/.bad-default" }]
+variants = [{ default = true, os = "$host_os", target = "~/.bad-default" }]
 [dotfiles.relative]
 source = "dotfiles/settings.json"
 mode = "copy"

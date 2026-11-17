@@ -47,12 +47,13 @@ impl DotfilesSync {
         if !crate::config::Settings::get().history.enabled {
             bail!("history is disabled (history.enabled = false)");
         }
-        let (store, tracked, _) = super::history::open().await?;
+        let (store, tracked) = super::history::open_store().await?;
         if let Some(reason) = store.unavailable() {
             bail!("cannot synchronize: {reason}");
         }
         let mut request = SyncRequest::new(self.fetch_only);
         request.allow_plaintext_history = self.allow_plaintext_history;
+        request.queue = true;
         let outcome = run::sync(&store, &tracked, &request)?;
         crate::system::history::sync::origin::report(&outcome);
         Ok(())
