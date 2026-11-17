@@ -287,9 +287,6 @@ export const values: Record<string, string> = {
   "daemons.<name>.version": '"18"',
   "daemons.<name>.ports": "{ replication = 5434 }",
   "daemons.<name>.ports.<key>": "5434",
-  "daemons.<name>.ports.<key>.auto": "true",
-  "daemons.<name>.ports.<key>.base": "27000",
-  "daemons.<name>.ports.<key>.stride": "1",
   "daemons.<name>.options": '{ database = "app" }',
   "daemons.<name>.image": '"postgres:18"',
   "daemons.<name>.runtime": '"podman"',
@@ -646,7 +643,8 @@ export function candidates(path: string): string[] {
   const task = path.replace(/^task_templates\.<name>\./, "tasks.<name>.");
   add(task);
   add(task.replace(/^tasks\.<name>\.(tools|env|vars)\./, "$1."));
-  for (const p of [...out]) {
+  for (let i = 0, length = out.length; i < length; i++) {
+    const p = out[i];
     // `<github:…>` and the other backends of one shape share their options
     const wild = p.replace(BACKEND, "<*:…>");
     add(wild);
