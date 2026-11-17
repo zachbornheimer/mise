@@ -333,7 +333,9 @@ impl ToolRequest {
         config.tool_config_locked(source)
     }
 
-    pub(crate) fn os(&self) -> &Option<Vec<String>> {
+    /// The tool's configured `os` option. Public for `mise install`, which names the
+    /// platforms a tool is scoped to when it refuses one named on the command line.
+    pub fn os(&self) -> &Option<Vec<String>> {
         &self.resolved_options().effective().os
     }
     pub fn set_options(&mut self, options: ToolVersionOptions) -> &mut Self {
@@ -843,6 +845,16 @@ impl ToolRequest {
         })
     }
 
+    /// Whether the tool's configured `os` option allows the current platform.
+    /// `is_os_supported` folds this together with the registry's `os` list; callers
+    /// that report the two cases with different messages need them apart.
+    pub fn is_os_option_supported(&self) -> bool {
+        self.os().as_ref().is_none_or(|os_list| {
+            os_list
+                .iter()
+                .any(|entry| crate::platform::os_selector_matches(entry))
+        })
+    }
     pub fn is_os_supported(&self) -> bool {
         if let Some(os_list) = self.os() {
             let matched = os_list

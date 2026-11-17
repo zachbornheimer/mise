@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+
+# A tool scoped to another platform by its configured `os` option is skipped by
+# a bare `mise install` (`install_missing_runtimes` filters on it). Naming the
+# tool used to bypass that filter and reach the backend, which then failed with
+# a release-asset error naming the platform instead of the exclusion. Naming a
+# tool is an explicit request, so it is refused with the tool and its `os` list,
+# and no request is resolved or listed.
+
+# The excluded platform has to be the one this suite is not running on.
+case "$(uname -s)" in
+Darwin) other=linux ;;
+*) other=macos ;;
+esac
+
+cat <<EOF >mise.toml
+[tools]
+jq = { version = "1.7.1", os = ["$other"] }
+EOF
+
+# Control: the bare path keeps its output, so the named-path refusal below is
+# not a change in what a bare `mise install` says about the same config.
+assert_contains "mise install --dry-run" "all tools are installed"
+
+# Naming the tool names the exclusion, and never reports an install.
+assert_fail_contains "mise install jq" "jq is not available on"
+assert_fail_contains "mise install jq" "os = [\"$other\"]"
+out="$(mise install jq 2>&1 || true)"
+assert_not_contains_text "$out" "Available assets"
+assert_not_contains_text "$out" "would install"
+assert_not_contains_text "$(mise install --dry-run jq 2>&1 || true)" "would install"
+
+# `mise x` installs first, so it must not reach the backend either.
+assert_fail_contains "mise x jq -- jq --version" "jq is not available on"
