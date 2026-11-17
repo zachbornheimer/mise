@@ -1,29 +1,44 @@
 #!/usr/bin/env bash
-# History commits use an optional Git email shared across machines.
+# Checkpoints and watcher commits use the configured Git identity and SSH signing.
 require_cmd git
-require_cmd hostname
+require_cmd ssh-keygen
 
 repo="$MISE_STATE_DIR/history/repo.git"
+git config --global user.name 'History Test'
+git config --global user.email history@example.com
+ssh-keygen -q -t ed25519 -N '' -f "$HOME/history-signing-key"
+git config --global gpg.format ssh
+git config --global user.signingkey "$HOME/history-signing-key"
+git config --global commit.gpgsign true
+printf 'history@example.com %s\n' "$(cat "$HOME/history-signing-key.pub")" >"$HOME/allowed-signers"
+git config --global gpg.ssh.allowedSignersFile "$HOME/allowed-signers"
+
+identity='History Test <history@example.com> | History Test <history@example.com> | G'
 echo one >~/.history-identity
 assert_succeed 'mise dot track ~/.history-identity'
-assert "git --git-dir=$repo log -1 --format='%an <%ae> | %cn <%ce>'" \
-  'mise <mise@localhost> | mise <mise@localhost>'
-
-cat >>"$MISE_CONFIG_DIR/config.toml" <<'TOML'
-[history]
-git_email = "mise@{hostname}"
-TOML
+assert "git --git-dir=$repo log -1 --format='%an <%ae> | %cn <%ce> | %G?'" "$identity"
 
 echo two >~/.history-identity
 assert_succeed 'mise dot save'
-host=$(hostname)
-assert "git --git-dir=$repo log -1 --format='%an <%ae> | %cn <%ce>'" \
-  "mise <mise@$host> | mise <mise@$host>"
+assert "git --git-dir=$repo log -1 --format='%an <%ae> | %cn <%ce> | %G?'" "$identity"
 
 echo three >~/.history-identity
 before_watch=$(git --git-dir="$repo" rev-parse HEAD)
 assert_succeed 'mise dot watch --once'
 after_watch=$(git --git-dir="$repo" rev-parse HEAD)
 assert_fail "test $before_watch = $after_watch"
-assert "git --git-dir=$repo log -1 --format='%an <%ae> | %cn <%ce>'" \
-  "mise <mise@$host> | mise <mise@$host>"
+assert "git --git-dir=$repo log -1 --format='%an <%ae> | %cn <%ce> | %G?'" "$identity"
+
+git config --global --unset user.name
+echo four >~/.history-identity
+assert_fail_contains 'mise dot save' 'missing Git user.name'
+assert "git --git-dir=$repo rev-parse HEAD" "$after_watch"
+git config --global user.name 'History Test'
+git config --global --unset user.email
+assert_fail_contains 'mise dot save' 'missing Git user.email'
+assert "git --git-dir=$repo rev-parse HEAD" "$after_watch"
+
+git config --global user.email history@example.com
+git config --global user.signingkey "$HOME/missing-signing-key"
+assert_fail_contains 'mise dot save' 'missing-signing-key'
+assert "git --git-dir=$repo rev-parse HEAD" "$after_watch"

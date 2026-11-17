@@ -11,6 +11,7 @@ use crate::history::shadow::HistoryRepo;
 use mise_util::agecrypt;
 
 const MAGIC: &[u8] = b"mise-encrypted-file-v1\n";
+mod conflicts;
 
 #[derive(Clone)]
 struct VerifiedAncestry {
@@ -51,6 +52,48 @@ impl<'de> Deserialize<'de> for Bytes {
         }
         deserializer.deserialize_byte_buf(Visitor)
     }
+}
+
+/// Validate the composed checkpoint, including carried/manual/held files,
+/// before a commit can make plaintext part of saved history. Ancestry is
+/// checked separately at publication so old leaks do not block safe saves.
+pub(crate) fn audit_tree(
+    repo: &HistoryRepo,
+    tree: &str,
+    protected: &BTreeSet<String>,
+) -> Result<()> {
+    if protected.is_empty() {
+        return Ok(());
+    }
+    for entry in repo.ls_tree(tree)? {
+        if !protected.iter().any(|path| {
+            entry.path == *path
+                || entry
+                    .path
+                    .strip_prefix(path)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }) {
+            continue;
+        }
+        let path = entry.path;
+        let object = (entry.mode, entry.oid);
+        let valid = match envelope(repo, &object, agecrypt::MAX_ENCRYPTED_BYTES) {
+            Ok(Some(outer)) => sealed_for(&outer, &path),
+            Ok(None) => false,
+            Err(error) => {
+                if !conflicts::sealed(repo, &object, &path)? {
+                    return Err(error.wrap_err(format!("invalid encrypted checkpoint at {path}")));
+                }
+                true
+            }
+        };
+        if !valid {
+            bail!(
+                "cannot save: encrypted path {path} has an unencrypted or invalid version; save that path explicitly with encryption before carrying it forward"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Audit the complete proposed ancestry, not just the latest tree. A newly
@@ -115,12 +158,16 @@ fn audit_history_cached(
             }
             let path = entry.path;
             let object = (entry.mode, entry.oid);
-            let valid =
-                envelope(repo, &object, agecrypt::MAX_ENCRYPTED_BYTES)?.is_some_and(|outer| {
-                    outer.path == path
-                        && matches!(outer.mode.as_str(), "100644" | "100755" | "120000")
-                        && outer.ciphertext.0.starts_with(b"age-encryption.org/v1\n")
-                });
+let valid = match envelope(repo, &object, agecrypt::MAX_ENCRYPTED_BYTES) {
+                Ok(Some(outer)) => sealed_for(&outer, &path),
+                Ok(None) => false,
+                Err(error) => {
+                    if !conflicts::sealed(repo, &object, &path)? {
+                        return Err(error.wrap_err(format!("invalid encrypted history at {path} in commit {commit}")));
+                    }
+                    true
+                }
+            };
             if !valid {
                 bail!(
                     "cannot publish: encrypted path {path} has an unencrypted or invalid version in commit {commit}; encrypting the latest version does not erase earlier plaintext. Remove that history before pushing, or use `mise dot sync --allow-plaintext-history` to publish it anyway",
@@ -190,6 +237,12 @@ struct Plaintext {
     content: Bytes,
 }
 
+fn sealed_for(outer: &Envelope, path: &str) -> bool {
+    outer.path == path
+        && layout::is_safe_branch_path(path)
+        && matches!(outer.mode.as_str(), "100644" | "100755" | "120000")
+        && outer.ciphertext.0.starts_with(b"age-encryption.org/v1\n")
+}
 fn control_file(path: &str) -> bool {
     if path.starts_with(".mise-history/") {
         return true;
@@ -352,9 +405,21 @@ pub(super) fn commit_object(
     }
     let (strings, scheme) = scheme(&manifest.recipients);
     for parent in parents {
-        if let Some(raw) = repo.object_at(parent, path)?
-            && envelope(repo, &raw, agecrypt::MAX_ENCRYPTED_BYTES)?
-                .is_some_and(|outer| outer.scheme == scheme)
+        let Some(raw) = repo.object_at(parent, path)? else {
+            continue;
+        };
+        let outer = match envelope(repo, &raw, agecrypt::MAX_ENCRYPTED_BYTES) {
+            Ok(outer) => outer,
+            Err(error) => {
+                // A selected plaintext resolution is authoritative. Preserved
+                // encrypted alternatives cannot supply reusable ciphertext.
+                if conflicts::sealed(repo, &raw, path)? {
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        if outer.is_some_and(|outer| outer.scheme == scheme)
             && decrypt(repo, path, &raw, interactive)? == *object
         {
             return Ok(raw);
@@ -499,6 +564,113 @@ pub(crate) fn encode(
 
 #[cfg(test)]
 mod tests {
+    fn encrypted_conflict(left: &[u8], right: &[u8]) -> Vec<u8> {
+        let mut bytes = MAGIC.to_vec();
+        bytes.extend_from_slice(b"<<<<<<< 1111111111111111111111111111111111111111\n");
+        bytes.extend_from_slice(left.strip_prefix(MAGIC).unwrap_or(left));
+        bytes.extend_from_slice(b"\n=======\n");
+        bytes.extend_from_slice(right.strip_prefix(MAGIC).unwrap_or(right));
+        bytes.extend_from_slice(b"\n>>>>>>> 2222222222222222222222222222222222222222\n");
+        bytes
+    }
+
+    #[test]
+    fn encrypted_conflict_ancestry_preserves_both_sealed_versions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let key = age::x25519::Identity::generate();
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        let path = "home/secret";
+        let left = encode(path, "100644", b"left private", "test", &recipients).unwrap();
+        let right = encode(path, "100644", b"right private", "test", &recipients).unwrap();
+        let sealed = encrypted_conflict(&left, &right);
+        let object: Object = ("100644".into(), repo.hash_blob(&sealed).unwrap());
+        let tree = repo
+            .write_tree(&[(object.0.clone(), object.1.clone(), path.into())])
+            .unwrap();
+        let original = repo
+            .commit_tree(&tree, vec![], "preserved encrypted conflict")
+            .unwrap();
+        let clean = repo
+            .write_tree(&[(
+                "100644".into(),
+                repo.hash_blob(&right).unwrap(),
+                path.into(),
+            )])
+            .unwrap();
+        let resolved = repo
+            .commit_tree(&clean, vec![&original], "explicit resolution")
+            .unwrap();
+        audit_history(&repo, &resolved, &BTreeSet::from([path.into()])).unwrap();
+        assert_eq!(repo.cat_object(&object.1).unwrap(), sealed);
+        assert!(decrypt(&repo, path, &object, false).is_err());
+        for unsafe_record in [
+            encrypted_conflict(&left, b"unsealed private text"),
+            encrypted_conflict(
+                &left,
+                &encode("home/other", "100644", b"wrong path", "test", &recipients).unwrap(),
+            ),
+            [sealed.as_slice(), b"private trailing text"].concat(),
+        ] {
+            let tree = repo
+                .write_tree(&[(
+                    "100644".into(),
+                    repo.hash_blob(&unsafe_record).unwrap(),
+                    path.into(),
+                )])
+                .unwrap();
+            let head = repo
+                .commit_tree(&tree, vec![], "must remain refused")
+                .unwrap();
+            assert!(audit_history(&repo, &head, &BTreeSet::from([path.into()])).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_resolution_encrypts_without_reusing_conflicted_parent() {
+        use age::secrecy::ExposeSecret;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let key = age::x25519::Identity::generate();
+        let mut environment = mise_util::testing::EnvVarGuard::new();
+        environment.set("MISE_AGE_KEY", key.to_string().expose_secret());
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        let path = "home/secret";
+        let left = encode(path, "100644", b"local edit", "test", &recipients).unwrap();
+        let right = encode(path, "100644", b"remote edit", "test", &recipients).unwrap();
+        let tree = repo
+            .write_tree(&[(
+                "100644".into(),
+                repo.hash_blob(&encrypted_conflict(&left, &right)).unwrap(),
+                path.into(),
+            )])
+            .unwrap();
+        let parent = repo
+            .commit_tree(&tree, vec![], "conflicted ciphertext")
+            .unwrap();
+        let manifest = crate::history::manifest::Manifest {
+            enrollment: vec![crate::history::manifest::Enrollment {
+                path: path.into(),
+                autosave: true,
+                encrypt: true,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            }],
+            recipients: vec![key.to_public().to_string()],
+            ..Default::default()
+        };
+        let chosen = (
+            "100644".into(),
+            repo.transient_blob_id(b"local edit\nremote edit\n")
+                .unwrap(),
+        );
+        let committed = commit_object(&repo, path, &chosen, &manifest, &[&parent], false).unwrap();
+        assert_eq!(decrypt(&repo, path, &committed, false).unwrap(), chosen);
+        assert!(repo.cat_object(&committed.1).unwrap().starts_with(MAGIC));
+    }
+
     #[test]
     fn audit_reuses_verified_ancestry_but_rechecks_new_encryption_policy() {
         use crate::history::manifest::{Enrollment, Manifest};

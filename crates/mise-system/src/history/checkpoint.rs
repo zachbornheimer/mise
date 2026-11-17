@@ -544,6 +544,27 @@ impl Store {
             }
             (None, None) => (None, vec![], false, self.unavailable.clone()),
         };
+        if let Some(repo) = &self.repo {
+            let mut protected = tracked.manifest.encrypted_paths();
+            if let Some(declared) = &tracked.declarations {
+                protected.extend(declared.encrypted_paths());
+            }
+            for entry in tracked.entries.iter().filter(|entry| entry.policy.encrypt) {
+                protected.insert(entry.tree_path(&entry.path)?);
+            }
+            // A metadata-only checkpoint otherwise reuses its parent's tree.
+            let fallback = if snapshot.is_none() && !protected.is_empty() {
+                parent_commit
+                    .as_deref()
+                    .map(|head| repo.output_tree_of(head))
+                    .transpose()?
+            } else {
+                None
+            };
+            if let Some(tree) = snapshot.as_deref().or(fallback.as_deref()) {
+                super::sync::files::audit_tree(repo, tree, &protected)?;
+            }
+        }
         for (index, entry) in walk.entries.iter().enumerate() {
             if entry.policy.autosave {
                 continue;
@@ -1881,6 +1902,114 @@ mod tests {
             Outcome::Unavailable(_)
         ));
         assert!(store::load_index_in(temp.path())?.entries.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn plaintext_guard_encrypted_baseline_saves_and_pushes_only_ciphertext() -> Result<()> {
+        let state = tempfile::tempdir()?;
+        let live = tempfile::tempdir_in(*mise_util::dirs::HOME)?;
+        let origin_state = tempfile::tempdir()?;
+        let path = live.path().join("private");
+        std::fs::write(&path, "private contents")?;
+        let mut policy = crate::files::FilePolicy::for_mode(crate::files::FileMode::Track);
+        policy.default_history_encryption(true);
+        let entry = TrackedEntry::new(path.clone(), "track", policy);
+        let portable = entry.tree_path(&path)?;
+        let mut tracked = TrackedSet::default();
+        tracked.push(entry);
+        tracked
+            .manifest
+            .enrollment
+            .push(super::super::manifest::Enrollment {
+                path: portable.clone(),
+                autosave: true,
+                encrypt: true,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            });
+        tracked.manifest.recipients =
+            vec![age::x25519::Identity::generate().to_public().to_string()];
+        let store = Store::open_in(state.path())?;
+        let mut baseline = Draft::new(Trigger::Baseline);
+        baseline.explicit_paths = vec![path];
+        assert!(matches!(
+            store.attempt(&tracked, baseline)?,
+            Outcome::Created(_)
+        ));
+        let repo = store.repo().unwrap();
+        let head = repo.ref_oid(HistoryRepo::HISTORY_REF)?.unwrap();
+        let (_, oid) = repo.object_at(&head, &portable)?.unwrap();
+        assert!(
+            repo.cat_object(&oid)?
+                .starts_with(b"mise-encrypted-file-v1\n")
+        );
+        let origin = HistoryRepo::open_or_init_in(origin_state.path())?.unwrap();
+        let url = url::Url::from_file_path(origin.dir()).unwrap();
+        let remote = crate::history::sync::network::Remote::new(repo, url.as_str());
+        assert_eq!(
+            remote.push(&[format!("{head}:refs/heads/main")], Some(("main", None)))?,
+            crate::history::sync::network::PushOutcome::Done
+        );
+        assert_eq!(origin.ref_oid("refs/heads/main")?, Some(head));
+        Ok(())
+    }
+
+    #[test]
+    fn plaintext_guard_manual_carry_cannot_save_plaintext_after_encryption_flip() -> Result<()> {
+        let state = tempfile::tempdir()?;
+        let live = tempfile::tempdir_in(*mise_util::dirs::HOME)?;
+        let path = live.path().join("private");
+        std::fs::write(&path, "private contents")?;
+        let mut policy = crate::files::FilePolicy::for_mode(crate::files::FileMode::Track);
+        policy.autosave = false;
+        let mut tracked = TrackedSet::default();
+        tracked.push(TrackedEntry::new(path.clone(), "track", policy));
+        tracked
+            .manifest
+            .enrollment
+            .push(super::super::manifest::Enrollment {
+                path: tracked.entries[0].tree_path(&tracked.entries[0].path)?,
+                autosave: false,
+                encrypt: false,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            });
+        let store = Store::open_in(state.path())?;
+        let mut baseline = Draft::new(Trigger::Baseline);
+        baseline.explicit_paths = vec![path];
+        assert!(matches!(
+            store.attempt(&tracked, baseline)?,
+            Outcome::Created(_)
+        ));
+        let before = store.repo().unwrap().ref_oid(HistoryRepo::HISTORY_REF)?;
+        tracked.entries[0].policy.encrypt = true;
+        tracked.manifest.enrollment[0].encrypt = true;
+        tracked.manifest.recipients =
+            vec![age::x25519::Identity::generate().to_public().to_string()];
+        let result = store.attempt(&tracked, Draft::new(Trigger::Save));
+        assert!(
+            result.is_err(),
+            "saved a carried plaintext version after enabling encryption: {result:?}"
+        );
+        assert_eq!(
+            store.repo().unwrap().ref_oid(HistoryRepo::HISTORY_REF)?,
+            before
+        );
+        // Failed encryption must not write a metadata checkpoint reusing
+        // the plaintext parent's tree either.
+        tracked.entries[0].policy.autosave = true;
+        tracked.manifest.enrollment[0].autosave = true;
+        tracked.manifest.recipients = vec!["invalid-recipient".into()];
+        assert!(store.attempt(&tracked, Draft::new(Trigger::Save)).is_err());
+        assert_eq!(
+            store.repo().unwrap().ref_oid(HistoryRepo::HISTORY_REF)?,
+            before
+        );
         Ok(())
     }
 

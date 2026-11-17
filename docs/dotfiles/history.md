@@ -887,10 +887,11 @@ project. `[settings.history]` holds the [settings](/configuration/settings.html)
 that control the watcher and sync, which you can also set with
 `mise settings` or environment variables.
 
+History commit identity and signing come from [your Git configuration](/dotfiles/sync.html#identify-commits-by-machine), not a mise setting.
+
 | Table                      | Keys                                                                                                          | Purpose                                                                                                                                               |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `[history]`                | `exclude`                                                                                                     | Globs that history never saves; see [Exclude files across tracked entries](#exclude-files-across-tracked-entries)                                     |
-| `[history]`                | `git_email`                                                                                                   | Author and committer email for history commits; see [Identify commits by machine](/dotfiles/sync.html#identify-commits-by-machine)                    |
 | `[history.reload]`         | `"<glob>" = "<command>"`                                                                                      | Commands to run after rollback, undo, pull, or apply writes matching files; see [Reload an application](#reload-an-application-after-restoring-files) |
 | `[history.encryption]`     | `recipients`                                                                                                  | Public keys that encrypted files are encrypted to; see [Encrypted files](/dotfiles/encryption.html)                                                   |
 | `[history.origin]`         | `url`, `branch`                                                                                               | The origin, written to `config.local.toml` by `mise dot origin set`; see [Sync across machines](/dotfiles/sync.html)                                  |

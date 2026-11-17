@@ -287,9 +287,6 @@ export const values: Record<string, string> = {
   "daemons.<name>.version": '"18"',
   "daemons.<name>.ports": "{ replication = 5434 }",
   "daemons.<name>.ports.<key>": "5434",
-  "daemons.<name>.ports.<key>.auto": "true",
-  "daemons.<name>.ports.<key>.base": "27000",
-  "daemons.<name>.ports.<key>.stride": "1",
   "daemons.<name>.options": '{ database = "app" }',
   "daemons.<name>.image": '"postgres:18"',
   "daemons.<name>.runtime": '"podman"',
@@ -373,7 +370,6 @@ export const values: Record<string, string> = {
   "history.encryption.recipients":
     '["age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p"]',
   "history.exclude": '["~/.ssh/**", "!~/.ssh/config"]',
-  "history.git_email": '"dotfiles@{hostname}"',
   "history.machine": '"work-laptop"',
   "history.reload": '{ "~/.zshrc" = "exec zsh" }',
   "history.reload.<key>": '"tmux source-file ~/.tmux.conf"',
@@ -646,7 +642,8 @@ export function candidates(path: string): string[] {
   const task = path.replace(/^task_templates\.<name>\./, "tasks.<name>.");
   add(task);
   add(task.replace(/^tasks\.<name>\.(tools|env|vars)\./, "$1."));
-  for (const p of [...out]) {
+  for (let i = 0, length = out.length; i < length; i++) {
+    const p = out[i];
     // `<github:…>` and the other backends of one shape share their options
     const wild = p.replace(BACKEND, "<*:…>");
     add(wild);

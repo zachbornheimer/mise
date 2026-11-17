@@ -23,6 +23,12 @@ fn init() {
     // Under the crate, not `/tmp`: the tests need ancestors that are not world-writable.
     let home = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test");
     std::fs::create_dir_all(&home).unwrap();
+    // History commits require an explicit identity, including in this fake home.
+    std::fs::write(
+        home.join(".gitconfig"),
+        "[user]\nname = Mise Test\nemail = mise-test@example.com\n",
+    )
+    .unwrap();
     mise_util::env::set_var("HOME", &home);
     mise_util::testing::enable(home);
     mise_settings::set_loader(mise_settings::load_defaults);

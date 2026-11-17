@@ -10,6 +10,19 @@ the history and your origin hold only ciphertext while the file you edit stays
 readable. Set it up before a file's first save: encrypting a file later does
 not remove the plaintext versions already in history.
 
+When `[history.encryption]` recipients are configured, shared `mode = "track"`
+entries default to encrypted storage, including new `mise dot track` entries.
+An intentional plaintext entry must declare `encrypt = false`; local-only
+history is unchanged. mise's own control configuration cannot be encrypted,
+so a tracked mise config must explicitly use `encrypt = false` and must not
+contain secrets.
+
+Before saving, mise validates the final checkpoint against the current
+configuration, including manual-save and carried files. Enabling encryption
+cannot carry an older plaintext version into a new checkpoint: explicitly save
+that path encrypted first. Every outgoing checkpoint is audited again at the
+Git transport boundary; earlier plaintext ancestry still requires repair.
+
 ## Encrypt a file {#encrypt-a-file}
 
 List public recipients in your global config and mark the file or directory
@@ -233,6 +246,18 @@ Both publish the old plaintext to the origin. New saves still follow each
 file's encryption setting. mise ignores
 [`history.allow_plaintext_history`](/configuration/settings.html#history.allow_plaintext_history)
 in project config.
+
+### Preserved encrypted merge conflicts
+
+Older histories may contain Git conflict markers around two complete encrypted
+file versions. Those records do not expose plaintext. The publication audit
+checks both envelopes and their exact framing, so resolving the current file
+does not require rewriting those earlier checkpoints. Plaintext alternatives,
+wrong paths, damaged framing, and extra bytes still stop publication.
+
+An unresolved encrypted conflict is never decrypted by choosing one side.
+Compare the original versions and resolve the live file explicitly before
+saving and pulling again.
 
 ### Remove plaintext from history {#remove-plaintext-from-history}
 
