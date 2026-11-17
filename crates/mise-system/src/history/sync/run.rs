@@ -1770,7 +1770,10 @@ mod status_tests {
         };
         std::thread::sleep(Duration::from_millis(300));
         drop(held);
-        assert!(waiter.join().unwrap(), "the queued sync should take the lock once it is free");
+        assert!(
+            waiter.join().unwrap(),
+            "the queued sync should take the lock once it is free"
+        );
     }
 
     /// A refusal names who holds the lock, so a permanent holder is visible
