@@ -382,6 +382,14 @@ changes the wait; `MISE_HISTORY_LOCK_WAIT=5m mise dot save` waits up to five
 minutes, and `0` fails at once. `mise dot watch` and `mise dot recover` never
 wait.
 
+A refusal names the holder: the pid it recorded, the command that pid runs, and
+how long it has held the lock. That is the difference between a sync finishing
+in seconds and a watcher parked on the lock, whose window is only open between
+its own syncs. `mise dot sync --wait 5m` and `mise dot pull --wait 5m` queue for
+that long regardless of `history.lock_wait`; stop a watcher you do not want
+instead of waiting for it. A holder from a mise older than this one recorded no
+pid, and the refusal says so.
+
 A `mise bootstrap` with nothing tracked and no existing history touches the
 history store only when it first rewrites a dotfile or edit, to keep a private
 journal for recovering interrupted writes. If another mise process holds the

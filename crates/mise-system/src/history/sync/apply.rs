@@ -9,6 +9,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use eyre::{Result, bail};
 use indexmap::IndexMap;
@@ -47,6 +48,9 @@ pub struct ApplyRequest {
     /// With `dry_run`: the plan is shown before a question, so no
     /// "nothing was changed" note.
     pub plan_only: bool,
+    /// How long a pull someone ran waits for the sync lock before giving
+    /// up (`--wait`); `None` uses `history.lock_wait`.
+    pub wait: Option<Duration>,
 }
 
 impl ApplyRequest {
@@ -60,6 +64,7 @@ impl ApplyRequest {
             keep_local_all: false,
             automatic: true,
             plan_only: false,
+            wait: None,
         }
     }
 }
@@ -99,7 +104,13 @@ pub async fn apply(
     tracked: &TrackedSet,
     req: &ApplyRequest,
 ) -> Result<ApplyOutcome> {
-    let _sync_lock = run::lock(store)?;
+    // a pull someone ran waits its turn behind a running sync; the watcher's
+    // automatic apply never waits
+    let _sync_lock = if req.automatic {
+        run::lock(store)?
+    } else {
+        run::lock_queued(store, req.wait)?
+    };
     apply_locked(store, tracked, req).await
 }
 

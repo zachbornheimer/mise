@@ -151,6 +151,7 @@ struct EncryptionCacheEntry {
 /// tree written from what was left dropped a sorted prefix of its paths,
 /// which a checkpoint then recorded as deliberate deletions and published
 /// to every other machine.
+#[cfg(test)]
 struct ScratchIndex {
     path: PathBuf,
     owner: PathBuf,
@@ -164,12 +165,14 @@ struct ScratchIndex {
 /// process's, for as long as this process runs. A process id would not:
 /// the system reuses them, so a name built from one can collide with a
 /// name an earlier process is still using.
+#[cfg(test)]
 fn scratch_nonce() -> &'static str {
     static NONCE: std::sync::LazyLock<String> =
         std::sync::LazyLock::new(|| format!("{:032x}", rand::random::<u128>()));
     &NONCE
 }
 
+#[cfg(test)]
 impl ScratchIndex {
     /// A scratch index in `dir`, distinct from every other live one.
     fn new(dir: &Path, purpose: &str) -> Self {
@@ -203,6 +206,7 @@ impl ScratchIndex {
     }
 }
 
+#[cfg(test)]
 impl Drop for ScratchIndex {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -228,6 +232,7 @@ impl Drop for ScratchIndex {
 /// Guessing from age instead would eventually delete the index of a
 /// composition suspended midway and truncate the very snapshot this all
 /// exists to protect.
+#[cfg(test)]
 fn sweep_scratch_indexes(dir: &Path) {
     use std::sync::{LazyLock, Mutex};
 
@@ -484,6 +489,9 @@ impl HistoryRepo {
             }
             None => BTreeMap::new(),
         };
+        // opened once: every cached entry below asks whether its blob is an
+        // encrypted envelope, and opening a repository scans every pack index
+        let gix = self.gix()?;
         for (root, encrypted) in roots.iter_mut().zip(encrypted_by_root) {
             root.files.retain(|rel| !encrypted.contains(rel));
             for rel in encrypted {
@@ -520,7 +528,7 @@ impl HistoryRepo {
                             && entry.scheme == scheme
                     })
                     .filter(|entry| {
-                        self.blob_starts_with(&entry.oid, b"mise-encrypted-file-v1\n")
+                        self.blob_starts_with_in(&gix, &entry.oid, b"mise-encrypted-file-v1\n")
                             .unwrap_or(false)
                     });
                 let previous = in_history.remove(&path);
@@ -560,7 +568,7 @@ impl HistoryRepo {
                                 let encoded = super::sync::files::encode(
                                     &path, mode, &bytes, &scheme, recipients,
                                 )?;
-                                self.hash_blob(&encoded)?
+                                self.hash_blob_in(&gix, &encoded)?
                             }
                         };
                         cache.insert(
@@ -650,6 +658,9 @@ impl HistoryRepo {
         root: &CaptureRoot,
         omitted: &mut Vec<super::store::PathReason>,
     ) -> Result<String> {
+        // opening a repository scans every pack index: one open serves every
+        // file of the root, not one per file
+        let gix = self.gix()?;
         let mut overlays = vec![];
         for rel in &root.files {
             let live = root.path.join(rel);
@@ -658,7 +669,7 @@ impl HistoryRepo {
                 let (mode, oid) = if meta.file_type().is_symlink() {
                     (
                         "120000",
-                        self.hash_blob(path_bytes(&std::fs::read_link(&live)?).as_ref())?,
+                        self.hash_blob_in(&gix, path_bytes(&std::fs::read_link(&live)?).as_ref())?,
                     )
                 } else if meta.is_dir() {
                     ("160000", mise_util::git::Git::new(&live).current_sha()?)
@@ -676,7 +687,7 @@ impl HistoryRepo {
                     )?;
                     (
                         if executable { "100755" } else { "100644" },
-                        self.hash_blob(&bytes)?,
+                        self.hash_blob_in(&gix, &bytes)?,
                     )
                 } else {
                     bail!("cannot capture non-file {}", display_path(&live));
@@ -1305,13 +1316,24 @@ impl HistoryRepo {
     }
 
     pub(crate) fn blob_starts_with(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
-        if let Some(bytes) = self.transient_blob(oid) {
-            return Ok(bytes.starts_with(prefix));
+        if self.transient_blob(oid).is_none() && Self::object_id(oid).is_some() {
+            return self.blob_starts_with_in(&self.gix()?, oid, prefix);
         }
-        if let Some(id) = Self::object_id(oid) {
+        self.blob_starts_with_in_git(oid, prefix)
+    }
+
+    /// [`Self::blob_starts_with`] through an already open repository. Opening
+    /// one scans every pack index, so a walk that asks about many blobs opens
+    /// it once and passes it here, not once per blob.
+    pub(crate) fn blob_starts_with_in(
+        &self,
+        repo: &gix::Repository,
+        oid: &str,
+        prefix: &[u8],
+    ) -> Result<bool> {
+        if let (None, Some(id)) = (self.transient_blob(oid), Self::object_id(oid)) {
             // gix reads a full object id without starting Git; a blob
             // shorter than the prefix cannot match, so it is never read
-            let repo = self.gix()?;
             let header = repo
                 .find_header(id)
                 .wrap_err_with(|| format!("reading {id}"))?;
@@ -1325,6 +1347,14 @@ impl HistoryRepo {
                 .find_object(id)
                 .wrap_err_with(|| format!("reading {id}"))?;
             return Ok(object.data.starts_with(prefix));
+        }
+        self.blob_starts_with_in_git(oid, prefix)
+    }
+
+    /// A transient (not yet written) blob, or a revision only Git resolves.
+    fn blob_starts_with_in_git(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
+        if let Some(bytes) = self.transient_blob(oid) {
+            return Ok(bytes.starts_with(prefix));
         }
         self.git.blob_starts_with(oid, prefix)
     }
@@ -1352,8 +1382,13 @@ impl HistoryRepo {
     /// Writes `bytes` as a blob, as `hash-object -w --stdin` does (no
     /// filters), without starting Git once per file of a snapshot.
     pub(crate) fn hash_blob(&self, bytes: &[u8]) -> Result<String> {
-        Ok(self
-            .gix()?
+        self.hash_blob_in(&self.gix()?, bytes)
+    }
+
+    /// [`Self::hash_blob`] through an already open repository, for a walk that
+    /// writes many blobs (opening one scans every pack index).
+    pub(crate) fn hash_blob_in(&self, repo: &gix::Repository, bytes: &[u8]) -> Result<String> {
+        Ok(repo
             .write_blob(bytes)
             .wrap_err("writing a blob")?
             .to_string())
@@ -1747,51 +1782,52 @@ impl HistoryRepo {
     /// Builds a tree from `base` with `overlays` applied: each path is
     /// removed from the tree and, when an object is given, replaced by it.
     ///
-    /// **Applied to a listing in memory, then written in one index update.**
-    /// Asking Git to apply each overlay cost two processes apiece, and a
-    /// snapshot overlays every tracked file, so `mise dot status` on a few
-    /// hundred files spent seconds starting Git. The result is the tree
-    /// [`Self::compose_by_git`] builds, failures included: a path added
+    /// **Applied to the tree in this process, writing only what changed.**
+    /// Listing every file and handing the lot to Git cost the whole tree on
+    /// every call, and a snapshot composes more than once. The result is the
+    /// tree [`Self::compose_by_git`] builds, failures included: a path added
     /// beneath a file is refused, as `update-index` refuses it, while a
     /// subtree replaces a file in its way, as `read-tree --prefix` does.
     pub(crate) fn compose(&self, base: &str, overlays: &[Overlay]) -> Result<String> {
         if overlays.is_empty() {
             return Ok(base.to_string());
         }
-        let mut entries: BTreeMap<String, (String, String)> = self
-            .ls_tree(base)?
-            .into_iter()
-            .map(|entry| (entry.path, (entry.mode, entry.oid)))
-            .collect();
+        // the overlays are applied to the base tree in this process: only the
+        // trees along the changed paths are read and written, where listing
+        // every file and handing the lot to two Git processes cost the whole
+        // tree on every call, and a save composes more than once
+        let repo = self.gix()?;
+        let base_id = Self::object_id(base)
+            .ok_or_else(|| eyre::eyre!("composing needs a tree id, not {base}"))?;
+        let mut editor = repo
+            .find_object(base_id)
+            .wrap_err_with(|| format!("reading {base}"))?
+            .peel_to_tree()?
+            .edit()?;
         for overlay in overlays {
-            // what `ls-files -- :(literal)<path>` lists: the path and everything under it
-            let dir = format!("{}/", overlay.path);
-            entries.remove(&overlay.path);
-            let under: Vec<String> = entries
-                .range(dir.clone()..)
-                .take_while(|(path, _)| path.starts_with(&dir))
-                .map(|(path, _)| path.clone())
-                .collect();
-            for path in under {
-                entries.remove(&path);
-            }
+            // the path and everything under it is replaced
+            editor.remove(overlay.path.as_str())?;
             let ancestors: Vec<&str> = overlay
                 .path
                 .match_indices('/')
                 .map(|(at, _)| &overlay.path[..at])
-                .filter(|ancestor| entries.contains_key(*ancestor))
+                .filter(|ancestor| {
+                    editor
+                        .get(*ancestor)
+                        .is_some_and(|entry| !entry.mode().is_tree())
+                })
                 .collect();
             match &overlay.object {
                 None => {}
                 Some((mode, oid)) if mode == "040000" => {
-                    let subtree = self.ls_tree(oid)?;
-                    if !subtree.is_empty() {
+                    let id = gix::ObjectId::from_hex(oid.as_bytes())?;
+                    let holds_files = repo.find_object(id)?.peel_to_tree()?.iter().next().is_some();
+                    // an empty subtree adds nothing, and takes nothing away
+                    if holds_files {
                         for ancestor in &ancestors {
-                            entries.remove(*ancestor);
+                            editor.remove(*ancestor)?;
                         }
-                    }
-                    for entry in subtree {
-                        entries.insert(format!("{dir}{}", entry.path), (entry.mode, entry.oid));
+                        editor.upsert(overlay.path.as_str(), tree_entry_kind(mode)?, id)?;
                     }
                 }
                 Some((mode, oid)) => {
@@ -1801,28 +1837,13 @@ impl HistoryRepo {
                             overlay.path
                         );
                     }
-                    entries.insert(overlay.path.clone(), (mode.clone(), oid.clone()));
+                    let id = gix::ObjectId::from_hex(oid.as_bytes())?;
+                    editor.upsert(overlay.path.as_str(), tree_entry_kind(mode)?, id)?;
                 }
             }
         }
-        if entries.is_empty() {
-            return self.empty_object("tree");
-        }
-        let mut info: Vec<u8> = vec![];
-        for (path, (mode, oid)) in &entries {
-            info.extend_from_slice(format!("{mode} {oid}\t{path}").as_bytes());
-            info.push(0);
-        }
-        let scratch = ScratchIndex::new(self.dir(), "compose");
-        let index = scratch.path();
-        // index-only operations; git still insists on a work tree
-        self.git.run(
-            PlumbingCall::new(["update-index", "-z", "--index-info"])
-                .work_tree(self.dir())
-                .index_file(index)
-                .stdin(&info),
-        )?;
-        self.write_tree_retrying(index)
+        // Windows refuses a loose object another process holds open
+        retry_on_permission_denied(|| Ok(editor.write()?.to_string()))
     }
 
     /// `git write-tree` over `index`, tried again when Windows refuses a loose
@@ -1833,6 +1854,7 @@ impl HistoryRepo {
     /// replace a loose object another process holds open, so it fails with
     /// `Permission denied`. The object is then written by the other process,
     /// and a second attempt finds it already there.
+    #[cfg(test)]
     fn write_tree_retrying(&self, index: &Path) -> Result<String> {
         retry_on_permission_denied(|| {
             self.output_str(PlumbingCall::new(["write-tree"]).index_file(index))
@@ -2346,6 +2368,19 @@ pub(crate) fn unavailable_reason() -> String {
     } else {
         "git not found".into()
     }
+}
+
+/// The kind a tree entry of git mode `mode` has in a gix tree editor.
+fn tree_entry_kind(mode: &str) -> Result<gix::objs::tree::EntryKind> {
+    use gix::objs::tree::EntryKind;
+    Ok(match mode {
+        "040000" => EntryKind::Tree,
+        "100644" => EntryKind::Blob,
+        "100755" => EntryKind::BlobExecutable,
+        "120000" => EntryKind::Link,
+        "160000" => EntryKind::Commit,
+        other => bail!("unsupported tree entry mode {other}"),
+    })
 }
 
 /// Runs `run`, again after a short pause while it fails with `Permission
