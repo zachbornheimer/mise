@@ -19,17 +19,17 @@ EOF
 assert_contains "mise dot status" "missing"
 assert_succeed "mise dot apply --yes"
 assert_contains "cat $target" "your_github_token"
-assert "stat -c %a $target" "600"
+assert "echo $(file_mode "$target")" "600"
 assert_contains "mise dot status --verbose" "applied"
 
 # the user fills in the token and loosens the mode: neither is drift
-sed -i 's/your_github_token/ghp_secret/' "$target"
+sed -i.bak 's/your_github_token/ghp_secret/' "$target"
 chmod 644 "$target"
 assert_contains "mise dot status --verbose" "applied"
 assert_not_contains "mise dot diff" "ghp_secret"
 assert_succeed "mise dot apply --yes"
 assert_contains "cat $target" "ghp_secret"
-assert "stat -c %a $target" "644"
+assert "echo $(file_mode "$target")" "644"
 
 # a changed source does not reach the existing file either
 echo '# new' >>templates/private.toml
@@ -42,7 +42,7 @@ rm "$target"
 assert_contains "mise dot status" "missing"
 assert_succeed "mise dot apply --yes"
 assert_contains "cat $target" "your_github_token"
-assert "stat -c %a $target" "600"
+assert "echo $(file_mode "$target")" "600"
 
 # the source is not needed while the target exists
 mv templates/private.toml templates/private.toml.away
@@ -95,7 +95,7 @@ cat <<'EOF' >mise.toml
 EOF
 assert_succeed "mise dot apply --yes"
 assert "cat $HOME/.seed" "seed = true"
-assert "stat -c %a $HOME/.seed" "600"
+assert "echo $(file_mode "$HOME/.seed")" "600"
 echo "mine" >"$HOME/.seed"
 assert_succeed "mise dot apply --yes"
 assert "cat $HOME/.seed" "mine"
