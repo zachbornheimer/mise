@@ -65,6 +65,19 @@ pub(crate) fn build(
             ) {
                 merged = Manifest::merge(&base, &ours, &theirs)?.write(repo, &merged)?;
                 conflicts.retain(|path| path != crate::history::manifest::PATH);
+                // A conflicted encrypted path whose decrypted content is equal is not a
+                // conflict to resolve: the local saved envelope stands, and Git's
+                // version of that path is never published.
+                let settled = super::run::settle_conflicts(
+                    repo,
+                    heads.base.as_deref(),
+                    local,
+                    remote,
+                    &merged,
+                    conflicts,
+                )?;
+                merged = settled.0;
+                conflicts = settled.1;
             }
         }
         let unresolved: Vec<_> = conflicts

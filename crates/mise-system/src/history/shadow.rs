@@ -312,6 +312,33 @@ impl HistoryRepo {
     pub(crate) const HISTORY_REF: &'static str = "refs/heads/main";
     const MATCHER_TRAILER: &'static str = "Mise-History-Matcher: ";
     pub(crate) const RECORD_TRAILER: &'static str = "Mise-History: ";
+    /// Nothing mise stores is merged by Git's text merge: an encrypted path
+    /// holds an envelope whose two sides are ciphertext, and the setup
+    /// manifest is a keyed inventory. Git keeps one side of a conflicting path
+    /// instead of writing markers into it, and mise resolves every such path
+    /// from decrypted content before anything is committed.
+    fn write_no_text_merge(git: &GitPlumbing) -> Result<()> {
+        const LINE: &str = "* -merge";
+        let dir = git.git_dir().join("info");
+        let path = dir.join("attributes");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing.lines().any(|line| line.trim() == LINE) {
+            return Ok(());
+        }
+        super::store::create_private_dir(&dir)?;
+        let mut content = existing;
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(LINE);
+        content.push('\n');
+        use std::io::Write;
+        let mut temporary = tempfile::NamedTempFile::new_in(&dir)?;
+        temporary.write_all(content.as_bytes())?;
+        temporary.persist(&path).map_err(|err| err.error)?;
+        Ok(())
+    }
+
     pub fn path_in(state_dir: &Path) -> PathBuf {
         repo_dir_in(state_dir)
     }
@@ -325,6 +352,14 @@ impl HistoryRepo {
         let git = GitPlumbing::new(Self::path_in(state_dir));
         git.init_bare()
             .wrap_err_with(|| format!("initializing {}", display_path(git.git_dir())))?;
+        // Written before anything reads or merges this history: a repository
+        // created before this existed gains it on its next open here.
+        Self::write_no_text_merge(&git).wrap_err_with(|| {
+            format!(
+                "recording merge attributes in {}",
+                display_path(git.git_dir())
+            )
+        })?;
         // the binary may exist and still be unusable (a stub, a broken
         // install): probe it once so callers can say capture is unavailable
         git.run(PlumbingCall::new(["rev-parse", "--is-bare-repository"]))
@@ -1433,6 +1468,16 @@ impl HistoryRepo {
         Ok(repo
             .write_blob(bytes)
             .wrap_err("writing a blob")?
+            .to_string())
+    }
+
+    /// Store a synthesized blob through the same Git child that writes the
+    /// trees referring to it: a tree built from an object no child can read
+    /// fails at `write-tree`.
+    pub(crate) fn store_blob(&self, bytes: &[u8]) -> Result<String> {
+        Ok(self
+            .output_str(PlumbingCall::new(["hash-object", "-w", "--stdin"]).stdin(bytes))?
+            .trim()
             .to_string())
     }
 
