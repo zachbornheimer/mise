@@ -195,7 +195,7 @@ jobs:
     # darwin-arm64 is this Mac; linux-x64 is the VPS and every E2B sandbox.
     permissions:
       contents: write
-    uses: zysys/github-workflows/.github/workflows/rust-release.yml@c0b503bdf59e93271270e8888125fbbb841ad14c
+    uses: zysys/github-workflows/.github/workflows/rust-release.yml@c0b503bdf59e93271270e8888125fbbb841ad14c # v1.2.0
     with:
       binary: mise
       # The assembly the assemble job pushed; the release points at its commit.

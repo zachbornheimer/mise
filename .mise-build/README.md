@@ -9,12 +9,12 @@ so syncing from upstream never conflicts there. The one unavoidable exception is
 
 The `forking-projects` skill has the design.
 
-| Path                                | What it is                                                  |
-| ----------------------------------- | ----------------------------------------------------------- |
-| `.github/workflows/mise-build.yml`  | The build: assemble, build darwin-arm64, publish.           |
-| `.mise-build/resolve-branches.ts`   | Reads `branches/` and prints the ordered branch list.       |
-| `.mise-build/branches/**/*.toml`    | The manifest: one file per carried branch.                  |
-| `.mise-build/README.md`             | This file.                                                  |
+| Path                               | What it is                                            |
+| ---------------------------------- | ----------------------------------------------------- |
+| `.github/workflows/mise-build.yml` | The build: assemble, build both targets, publish.     |
+| `.mise-build/resolve-branches.ts`  | Reads `branches/` and prints the ordered branch list. |
+| `.mise-build/branches/**/*.toml`   | The manifest: one file per carried branch.            |
+| `.mise-build/README.md`            | This file.                                            |
 
 ## How a build works
 
@@ -27,10 +27,12 @@ carried branches, which cannot trigger it), and on `workflow_dispatch`. It:
    `git merge --no-ff`, in order;
 4. skips build and publish when the assembled tree equals the tree of the
    latest release's recorded `build_commit`;
-5. otherwise pushes the result to the throwaway `mise-build` branch, builds the
-   darwin-arm64 binary, and publishes release
-   `build-<timestamp>-<upstream7>-<build7>` as Latest, with `mise-darwin-arm64.tar.gz`
-   and `SHA256SUMS`.
+5. otherwise pushes the result to the throwaway `mise-build` branch, builds
+   `darwin-arm64` on a macOS runner and `linux-x64` on Ubuntu through
+   `zysys/github-workflows` `rust-release.yml`, and publishes release
+   `build-<timestamp>-<upstream7>-<build7>` as Latest, with
+   `mise-darwin-arm64.tar.gz`, `mise-linux-x64.tar.gz` and `SHA256SUMS` — the
+   same targets and asset shape as the `oh-my-pi` `omp-build` release.
 
 It fails, and the previous release stays Latest, when a listed branch is missing
 from the fork or conflicts with the base or an earlier branch. A branch already
