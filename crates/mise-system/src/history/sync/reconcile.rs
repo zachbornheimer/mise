@@ -61,35 +61,34 @@ pub(crate) fn upstream_with_interaction(
         // the listing already holds each entry's mode and object: looking
         // every path up again cost a tree walk per file
         for entry in repo.ls_tree(commit)? {
-            let (mode, oid) = (entry.mode, entry.oid);
-            let object = if encrypted.contains(&entry.path) {
-                match super::files::decrypt(repo, &entry.path, &(mode, oid), interactive) {
-                    Ok(object) => object,
-                    Err(err) if err.downcast_ref::<super::files::Locked>().is_some() => {
-                        locked.push(entry.path);
-                        first_locked.get_or_insert(err);
-                        continue;
-                    }
-                    // A plaintext version of an encrypted path is one
-                    // path's problem, not the setup repository's: it becomes
-                    // a conflict this machine resolves with `--take-remote`
-                    // or `--keep-local` for that path, instead of failing
-                    // every sync and pull on it.
-                    Err(err)
-                        if err
-                            .downcast_ref::<super::files::PlaintextInEncryptedPath>()
-                            .is_some() =>
-                    {
-                        let introduced =
-                            super::files::plaintext_commit(repo, commit, &entry.path)?
-                                .unwrap_or_else(|| commit.to_string());
-                        plaintext.insert(entry.path.clone(), ((mode, oid), introduced));
-                        continue;
-                    }
-                    Err(err) => return Err(err),
+            let listed = (entry.mode, entry.oid);
+            if !encrypted.contains(&entry.path) {
+                files.insert(entry.path, listed);
+                continue;
+            }
+            let object = match super::files::decrypt(repo, &entry.path, &listed, interactive) {
+                Ok(object) => object,
+                Err(err) if err.downcast_ref::<super::files::Locked>().is_some() => {
+                    locked.push(entry.path);
+                    first_locked.get_or_insert(err);
+                    continue;
                 }
-            } else {
-                (mode, oid)
+                // A plaintext version of an encrypted path is one path's
+                // problem, not the setup repository's: it becomes a conflict
+                // this machine resolves with `--take-remote` or
+                // `--keep-local` for that path, instead of failing every
+                // sync and pull on it.
+                Err(err)
+                    if err
+                        .downcast_ref::<super::files::PlaintextInEncryptedPath>()
+                        .is_some() =>
+                {
+                    let introduced = super::files::plaintext_commit(repo, commit, &entry.path)?
+                        .unwrap_or_else(|| commit.to_string());
+                    plaintext.insert(entry.path.clone(), (listed, introduced));
+                    continue;
+                }
+                Err(err) => return Err(err),
             };
             files.insert(entry.path, object);
         }
@@ -688,6 +687,7 @@ mod tests {
                     &Upstream {
                         files: [("tracked/home/script".into(), theirs)].into(),
                         commit: None,
+                        ..Default::default()
                     },
                     &[("tracked/home/script".into(), state)].into(),
                     &BTreeSet::new(),
@@ -713,6 +713,7 @@ mod tests {
         let incoming = Upstream {
             files: [(path.clone(), pointer)].into(),
             commit: Some("pointer-head".into()),
+            ..Default::default()
         };
         // Cover both an absent path and a file that remains unchanged while
         // the upstream version temporarily becomes an unsupported gitlink.
@@ -741,6 +742,7 @@ mod tests {
             let files = Upstream {
                 files: [(path.clone(), obj("new-file"))].into(),
                 commit: Some("files-head".into()),
+                ..Default::default()
             };
             let next = reconcile(&repo, &shared, &files, &state, &BTreeSet::new()).unwrap();
             assert!(next[0].conflict.is_none());
@@ -759,6 +761,7 @@ mod tests {
         let upstream = Upstream {
             files: [(path(), pointer("aaaa"))].into(),
             commit: Some("upstream".into()),
+            ..Default::default()
         };
         let plans = reconcile(
             &repo,
@@ -792,6 +795,7 @@ mod tests {
         let upstream = Upstream {
             files: BTreeMap::new(),
             commit: Some("upstream".into()),
+            ..Default::default()
         };
         let state = [(
             path(),
@@ -813,6 +817,7 @@ mod tests {
         let upstream = Upstream {
             files: [(path(), pointer("aaaa"))].into(),
             commit: Some("upstream".into()),
+            ..Default::default()
         };
         let state = [(path(), rec(Some("plain"), Some("plain"), Some("plain")))].into();
         let plans = reconcile(&repo, &plain, &upstream, &state, &BTreeSet::new()).unwrap();
@@ -836,6 +841,7 @@ mod tests {
         let upstream = Upstream {
             files: [(path(), pointer("aaaa"))].into(),
             commit: Some("upstream".into()),
+            ..Default::default()
         };
         let plans =
             reconcile(&repo, &plain, &upstream, &BTreeMap::new(), &BTreeSet::new()).unwrap();
@@ -846,6 +852,7 @@ mod tests {
         let upstream = Upstream {
             files: [(path(), pointer("bbbb"))].into(),
             commit: Some("upstream".into()),
+            ..Default::default()
         };
         let plans = reconcile(
             &repo,
@@ -868,6 +875,7 @@ mod tests {
         let upstream = Upstream {
             files: [("tracked/home/script".into(), base)].into(),
             commit: None,
+            ..Default::default()
         };
         let state = [(
             "tracked/home/script".into(),
@@ -919,6 +927,7 @@ mod tests {
                 .iter()
                 .map(|(p, o)| (p.to_string(), obj(o)))
                 .collect(),
+            ..Default::default()
         };
         let state: SyncState = state
             .iter()

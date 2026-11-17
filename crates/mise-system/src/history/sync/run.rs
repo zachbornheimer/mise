@@ -997,6 +997,10 @@ fn prepare(
                 })
                 .map(|(path, object)| (path.clone(), object.clone()))
                 .collect(),
+            // never filtered: an origin plaintext version of an encrypted
+            // path is reported for every such path the incoming config
+            // declares, whether or not this machine selects it
+            plaintext: upstream.plaintext.clone(),
         };
         let mut plans = reconcile::reconcile(repo, shared, &selected, &sync_state, unsaved)?;
         // Old acknowledgements are not authority to delete a path this
