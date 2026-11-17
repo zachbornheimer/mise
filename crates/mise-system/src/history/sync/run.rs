@@ -1183,10 +1183,19 @@ pub(super) fn incoming_repository_tree(
     if repo.output_tree_of(local)? == tree && conflicts.is_empty() {
         return Ok(None);
     }
+    // An eligible tracked file is decided per file, so its ordinary text
+    // conflict is not a repository conflict. An encrypted envelope is not
+    // text: dropping its conflict here is how a text-merged ciphertext was
+    // committed as "merge origin dotfiles". It stays a conflict the user resolves.
+    let encrypted = super::files::encrypted_paths(repo, Some(local))?
+        .union(&super::files::encrypted_paths(repo, Some(remote))?)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let unresolved: Vec<_> = conflicts
         .into_iter()
         .filter(|path| {
-            path != crate::history::manifest::PATH && !eligible(&roots, tracked, &exclude, path)
+            path != crate::history::manifest::PATH
+                && (!eligible(&roots, tracked, &exclude, path) || encrypted.contains(path))
         })
         .collect();
     if !unresolved.is_empty() {
