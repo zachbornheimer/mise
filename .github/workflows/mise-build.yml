@@ -41,6 +41,7 @@ permissions:
 jobs:
   assemble:
     name: Assemble mise-build
+    timeout-minutes: 30
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -183,81 +184,32 @@ jobs:
           mapfile -t lease < "$RUNNER_TEMP/lease.txt"
           cd assembly && git push "${lease[@]}" "$FORK_URL" HEAD:refs/heads/mise-build
 
-  build:
-    name: Build mise (darwin-arm64)
-    needs: assemble
-    if: needs.assemble.outputs.skip != 'true'
-    # macos-latest is arm64; a pinned label would need replacing when retired.
-    runs-on: macos-latest
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          ref: mise-build
-          persist-credentials: false
-      - name: Setup Rust toolchain
-        run: rustup toolchain install stable --profile minimal
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - name: Build mise
-        env:
-          # Same macOS floor as upstream's build-tarball.sh: chained fixups.
-          MACOSX_DEPLOYMENT_TARGET: "12.0"
-        run: rustup run stable cargo build --release --bin mise
-      - name: Check mise --version
-        run: ./target/release/mise --version
-      - name: Tar mise
-        run: tar -czf "${{ runner.temp }}/mise-darwin-arm64.tar.gz" -C target/release mise
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: mise-darwin-arm64.tar.gz
-          path: ${{ runner.temp }}/mise-darwin-arm64.tar.gz
-          if-no-files-found: error
-
   release:
     name: Publish release
-    needs: [assemble, build]
-    if: ${{ !cancelled() && needs.assemble.result == 'success' && needs.assemble.outputs.skip != 'true' && needs.build.result == 'success' }}
-    runs-on: ubuntu-22.04
+    needs: [assemble]
+    if: ${{ !cancelled() && needs.assemble.result == 'success' && needs.assemble.outputs.skip != 'true' }}
+    # One native runner per target: Rust cannot cross-compile the way Go does.
+    # darwin-arm64 is this Mac; linux-x64 is the VPS and every E2B sandbox.
     permissions:
       contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-    steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: assets
-          merge-multiple: true
-      - name: Checksum assets
-        run: |
-          set -euo pipefail
-          cd assets
-          sha256sum mise-darwin-arm64.tar.gz > SHA256SUMS
-      - name: Create release
-        env:
-          BUILD_SHA: ${{ needs.assemble.outputs.build-sha }}
-          UPSTREAM_SHA: ${{ needs.assemble.outputs.upstream-sha }}
-          BASE_SHA: ${{ needs.assemble.outputs.base-sha }}
-          OVERRIDE_RUN: ${{ needs.assemble.outputs.override }}
-          TAG: ${{ needs.assemble.outputs.tag }}
-        run: |
-          set -euo pipefail
-          body="Custom \`mise\` assembled from the fork's main (jdx/mise plus one carry commit) plus the branches in \`.mise-build/branches/\`.
+    uses: zysys/github-workflows/.github/workflows/rust-release.yml@45470a74081d8941e02a5e12f7436262c43949fd
+    with:
+      binary: mise
+      # The assembly the assemble job pushed; the release points at its commit.
+      ref: mise-build
+      tag: ${{ needs.assemble.outputs.tag }}
+      release_target: ${{ needs.assemble.outputs.build-sha }}
+      prerelease: ${{ needs.assemble.outputs.override == 'true' }}
+      targets: |
+        [{"target":"darwin-arm64","os":"macos-latest"},
+         {"target":"linux-x64","os":"ubuntu-22.04"}]
+      build_env: |
+        MACOSX_DEPLOYMENT_TARGET=12.0
+      # `build_commit` is read back by the next run's skip check: the same tree
+      # means the latest release already ships this assembly.
+      notes: |
+        Custom `mise` assembled from the fork's main (jdx/mise plus one carry commit) plus the branches in `.mise-build/branches/`.
 
-          build_commit: $BUILD_SHA
-          base_commit: $BASE_SHA
-          upstream_commit: $UPSTREAM_SHA"
-          # A branches_override dispatch publishes a prerelease and never the
-          # latest release.
-          if [ "$OVERRIDE_RUN" = "true" ]; then
-            release_args=(--prerelease)
-          else
-            release_args=(--latest)
-          fi
-          gh release create "$TAG" \
-            --target "$BUILD_SHA" \
-            "${release_args[@]}" \
-            --title "$TAG" \
-            --notes "$body" \
-            assets/mise-darwin-arm64.tar.gz assets/SHA256SUMS
-          echo "published $TAG"
+        build_commit: ${{ needs.assemble.outputs.build-sha }}
+        base_commit: ${{ needs.assemble.outputs.base-sha }}
+        upstream_commit: ${{ needs.assemble.outputs.upstream-sha }}
