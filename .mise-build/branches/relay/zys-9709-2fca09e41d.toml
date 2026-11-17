@@ -1,0 +1,3 @@
+reason = "Sync and pull report an origin plaintext version of an encrypt-declared path as a per-path conflict naming the commit and the one command that fixes it, instead of failing every sync with 'missing encrypted file envelope' (ZYS-9709)"
+upstream = "no"
+pr = ""
