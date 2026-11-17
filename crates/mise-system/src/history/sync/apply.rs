@@ -611,15 +611,22 @@ impl Pull<'_> {
                         .pending
                         .object
                         .as_ref()
-                        .map(|object| {
-                            super::files::commit_object(
+                        .map(|object| -> Result<super::reconcile::Object> {
+                            let object = super::files::commit_object(
                                 repo,
                                 &step.pending.branch_path,
                                 object,
                                 &self.tracked.manifest,
                                 &parents,
                                 self.interactive(),
-                            )
+                            )?;
+                            // A comparison object lives only in this process;
+                            // Git's tree write needs it in the repository.
+                            if repo.object_type(&object.1)?.is_some() {
+                                return Ok(object);
+                            }
+                            let bytes = repo.cat_object(&object.1)?;
+                            Ok((object.0, repo.store_blob(&bytes)?))
                         })
                         .transpose()?,
                 })

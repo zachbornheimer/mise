@@ -1373,10 +1373,22 @@ pub(super) fn incoming_repository_tree(
         return Ok(None);
     }
     let (merged, conflicts) = repo.merge_tree(local, remote)?;
+    // Settling replaces Git's version of a conflicted path, so the merged tree
+    // can equal the saved one; the merge still happened, and its tree is the
+    // one to adopt.
+    let merged_conflicts = !conflicts.is_empty();
+    let (merged, conflicts) = settle_conflicts(
+        repo,
+        heads.base.as_deref(),
+        local,
+        remote,
+        &merged,
+        conflicts,
+    )?;
     let tree = tracked.manifest.write(repo, &merged)?;
     let roots = Roots::current();
     let exclude = tracked.exclude_set()?;
-    if repo.output_tree_of(local)? == tree && conflicts.is_empty() {
+    if repo.output_tree_of(local)? == tree && conflicts.is_empty() && !merged_conflicts {
         return Ok(None);
     }
     let unresolved: Vec<_> = conflicts
@@ -1392,6 +1404,90 @@ pub(super) fn incoming_repository_tree(
         );
     }
     Ok(Some(tree))
+}
+
+/// Git merged the saved envelopes as text. Whatever it wrote for a conflicted
+/// path is not a saved version: when the decrypted content is equal, the local
+/// saved envelope stands, and every other path is replaced by the per-file
+/// plan before anything is adopted. A marker blob is never carried forward.
+pub(super) fn settle_conflicts(
+    repo: &crate::history::shadow::HistoryRepo,
+    base: Option<&str>,
+    local: &str,
+    remote: &str,
+    merged: &str,
+    conflicts: Vec<String>,
+) -> Result<(String, Vec<String>)> {
+    let mut overlays = vec![];
+    let mut settled = std::collections::BTreeSet::new();
+    for path in &conflicts {
+        if path == crate::history::manifest::PATH {
+            continue;
+        }
+        let Some(saved) = repo.object_at(local, path)? else {
+            continue;
+        };
+        let Some(merged_object) = repo.object_at(merged, path)? else {
+            continue;
+        };
+        // A record Git merged as text is repaired here: when its two sides
+        // hold the same content, one clean envelope replaces it.
+        let repaired = match super::files::repair(repo, path, &merged_object, false)? {
+            super::files::Repair::Same { envelope, .. } => {
+                Some(("100644".to_string(), repo.store_blob(&envelope)?))
+            }
+            _ => match super::files::repair(repo, path, &saved, false)? {
+                super::files::Repair::Same { envelope, .. } => {
+                    Some(("100644".to_string(), repo.store_blob(&envelope)?))
+                }
+                _ => None,
+            },
+        };
+        if let Some(object) = repaired {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some(object),
+            });
+            continue;
+        }
+        if super::files::same_content(repo, path, &saved, &merged_object, false) {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some(saved),
+            });
+            continue;
+        }
+        // Nothing here is -merge'd by Git, so a plaintext path whose two sides
+        // changed different lines is merged here exactly as Git used to.
+        let merged_text = match (base, repo.object_at(remote, path)?) {
+            (Some(base), Some(theirs)) => match repo.object_at(base, path)? {
+                Some(base) => repo.merge3(
+                    &repo.cat_object(&base.1)?,
+                    &repo.cat_object(&saved.1)?,
+                    &repo.cat_object(&theirs.1)?,
+                )?,
+                None => None,
+            },
+            _ => None,
+        };
+        if let Some(text) = merged_text {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some((saved.0.clone(), repo.store_blob(&text)?)),
+            });
+        }
+    }
+    let remaining = conflicts
+        .into_iter()
+        .filter(|path| !settled.contains(path))
+        .collect();
+    if overlays.is_empty() {
+        return Ok((merged.to_string(), remaining));
+    }
+    Ok((repo.compose(merged, &overlays)?, remaining))
 }
 
 /// A bootstrap finished: the declarations that arrived through sync are
