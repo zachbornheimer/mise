@@ -280,34 +280,86 @@ fn head_moved(
 pub fn sync(store: &Store, tracked: &TrackedSet, request: &SyncRequest) -> Result<SyncOutcome> {
     let asked = chrono::Utc::now();
     let _sync_lock = if request.queue {
-        lock_queued(store)?
+        match lock_in(store.state_dir()) {
+            Ok(lock) => lock,
+            Err(_) => match wait_in_line(store, tracked, request, asked)? {
+                Queued::Lock(lock) => lock,
+                Queued::Served(outcome) => return Ok(outcome),
+            },
+        }
     } else {
         lock(store)?
     };
-    if let Some(outcome) = served_while_queued(store, tracked, request, asked)? {
-        return Ok(outcome);
-    }
     sync_locked(store, tracked, request)
 }
 
-/// Group commit for syncs that queued: a sync that waited behind another
-/// has nothing left to do when that one fetched after this one was asked,
-/// succeeded, and published every checkpoint this machine has saved, so it
-/// reports that sync's result instead of fetching and planning again. Ten
-/// syncs started a second apart then cost a few syncs, not ten in a row.
-/// Saving what is live first keeps the promise of a sync someone ran: an
-/// edit made after the sync ahead read the history is not covered, and the
-/// sync runs in full.
-fn served_while_queued(
+enum Queued {
+    Lock(fslock::LockFile),
+    Served(SyncOutcome),
+}
+
+/// Waits for the sync lock behind a running sync, and stops waiting as soon
+/// as a sync that began after this one was asked has published what this
+/// machine had saved when it was asked. The lock is not first come, first
+/// served: polling waiters race for it, and one could lose to newer syncs
+/// until its wait ran out although each of them had already done its work.
+/// Checking while waiting needs no lock: `sync.json` is replaced
+/// atomically, and a sync writes it once, when it is done.
+fn wait_in_line(
     store: &Store,
     tracked: &TrackedSet,
     request: &SyncRequest,
     asked: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<SyncOutcome>> {
-    if !request.queue || request.dry_run || request.offline || request.origin.is_some() {
-        return Ok(None);
+) -> Result<Queued> {
+    // a dry run, an offline sync and a sync to another origin are not the
+    // sync whose result another one reports, so they only wait
+    let may_be_covered = !request.dry_run && !request.offline && request.origin.is_none();
+    // what this sync must publish is what is saved now, so save the live
+    // files first, as the sync itself would (skipped while another write
+    // operation holds the files, exactly as the sync would skip it)
+    if may_be_covered && request.capture {
+        capture_now(store, tracked);
     }
-    let status = read_status(store.state_dir())?;
+    let pinned = store
+        .repo()
+        .map(|repo| repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF))
+        .transpose()?
+        .flatten();
+    let publishes = SyncMode::current()?.publishes() && !request.fetch_only;
+    let deadline = Instant::now() + crate::history::scope::operation_lock_wait();
+    let mut seen_fetch = None;
+    loop {
+        if let Some(lock) =
+            mise_util::lock_file::LockFile::at(&lock_path(store.state_dir())).try_lock()?
+        {
+            return Ok(Queued::Lock(lock));
+        }
+        let status = read_status(store.state_dir())?;
+        if may_be_covered && status.last_fetch != seen_fetch {
+            seen_fetch = status.last_fetch.clone();
+            if let Some(outcome) = covered(store, &status, asked, pinned.as_deref(), publishes)? {
+                debug!("history sync: a sync that began after this one covered it");
+                return Ok(Queued::Served(outcome));
+            }
+        }
+        if Instant::now() >= deadline {
+            bail!("another setup sync or pull is running; retry shortly");
+        }
+        std::thread::sleep(STATUS_LOCK_POLL);
+    }
+}
+
+/// Whether the sync that last wrote `status` did this sync's work: it
+/// fetched after this sync was asked, succeeded, and (when this sync would
+/// publish) the origin holds `pinned`, the newest checkpoint saved when this
+/// sync was asked.
+fn covered(
+    store: &Store,
+    status: &SyncStatus,
+    asked: chrono::DateTime<chrono::Utc>,
+    pinned: Option<&str>,
+    publishes: bool,
+) -> Result<Option<SyncOutcome>> {
     let fetched_since_asked = status
         .last_fetch
         .as_deref()
@@ -316,27 +368,17 @@ fn served_while_queued(
     if !fetched_since_asked || status.last_error.is_some() {
         return Ok(None);
     }
-    let Some(repo) = store.repo() else {
-        return Ok(None);
-    };
-    if request.capture {
-        capture_now(store, tracked);
-    }
-    let published = match (
-        repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)?,
-        repo.ref_oid(UPSTREAM_REF)?,
-    ) {
-        (None, _) => true,
-        (Some(_), None) => false,
-        (Some(local), Some(remote)) => {
-            local == remote || repo.merge_bases(&local, &remote)?.contains(&local)
+    if publishes && let Some(pinned) = pinned {
+        let Some(repo) = store.repo() else {
+            return Ok(None);
+        };
+        let Some(upstream) = repo.ref_oid(UPSTREAM_REF)? else {
+            return Ok(None);
+        };
+        if upstream != pinned && !repo.merge_bases(pinned, &upstream)?.iter().any(|base| base == pinned) {
+            return Ok(None);
         }
-    };
-    let mode = SyncMode::current()?;
-    if !published && mode.publishes() && !request.fetch_only {
-        return Ok(None);
     }
-    debug!("history sync: the sync ahead in line covered this one");
     Ok(Some(SyncOutcome {
         published: None,
         pending: status.pending_applications.len() + usize::from(status.pending_repository),
