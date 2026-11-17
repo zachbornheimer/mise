@@ -108,7 +108,7 @@ cat <<'EOF' >mise.toml
 "~/.config/app/work.toml" = { source = "dotfiles/work.toml.tera", mode = "template", permissions = "0600", remove_empty = true }
 EOF
 assert_succeed "WORK=1 mise dot apply --yes"
-assert "stat -c %a $target" "600"
+assert "echo $(file_mode "$target")" "600"
 assert_succeed "mise dot apply --yes"
 assert_fail "test -e $target"
 # a target mise cannot read cannot be proven its own, but --force removes it

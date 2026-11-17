@@ -50,11 +50,14 @@ impl DotfilesConflicts {
         if !crate::config::Settings::get().history.enabled {
             bail!("history is disabled (history.enabled = false)");
         }
-        let (store, tracked, _) = super::history::open().await?;
+        let (store, tracked) = super::history::open_store().await?;
         let Some(repo) = store.repo() else {
             bail!("inspecting conflicts requires git");
         };
-        let sync_lock = run::lock(&store)?;
+        // read-only: no sync lock, so this never waits behind a running sync
+        if run::sync_running(&store) {
+            warn!("a sync or pull is running; these conflicts may change when it finishes");
+        }
         let mut status = run::read_status(store.state_dir())?;
         run::refresh_with_interaction(
             &store,
@@ -62,9 +65,6 @@ impl DotfilesConflicts {
             &mut status,
             console::user_attended_stderr(),
         )?;
-        // Keep the conflict objects stable while encrypted blobs are refreshed,
-        // then release the sync lock before an interactive difftool can block.
-        drop(sync_lock);
         let selected = select(&status.conflicts, &self.paths)?;
         if selected.is_empty() {
             info!("no sharing conflicts");

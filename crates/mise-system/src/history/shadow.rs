@@ -1182,32 +1182,74 @@ impl HistoryRepo {
         from: Option<&gix::Tree<'_>>,
         to: &gix::Tree<'_>,
     ) -> Result<Vec<Change>> {
-        let from = if let Some(tree) = from {
-            Self::gix_tree_entries(repo, tree)?
-        } else {
-            vec![]
-        }
-        .into_iter()
-        .map(|entry| (entry.path, (entry.mode, entry.oid)))
-        .collect::<BTreeMap<_, _>>();
-        let to = Self::gix_tree_entries(repo, to)?
-            .into_iter()
-            .map(|entry| (entry.path, (entry.mode, entry.oid)))
-            .collect::<BTreeMap<_, _>>();
         let mut changes = vec![];
-        for path in from.keys().chain(to.keys()).collect::<BTreeSet<_>>() {
-            let status = match (from.get(path), to.get(path)) {
+        Self::gix_diff_level(
+            repo,
+            from.map(|tree| tree.id),
+            Some(to.id),
+            "",
+            &mut changes,
+        )?;
+        changes.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(changes)
+    }
+
+    /// One level of [`Self::gix_changes`]. A subtree whose id is the same on
+    /// both sides holds the same files, so it is not opened: a checkpoint
+    /// that changed one file reads the directories on that file's path, not
+    /// every saved file twice.
+    fn gix_diff_level(
+        repo: &gix::Repository,
+        from: Option<gix::ObjectId>,
+        to: Option<gix::ObjectId>,
+        prefix: &str,
+        changes: &mut Vec<Change>,
+    ) -> Result<()> {
+        // name -> (is a tree, mode, id)
+        type Level = BTreeMap<String, (bool, gix::object::tree::EntryMode, gix::ObjectId)>;
+        let read = |id: Option<gix::ObjectId>| -> Result<Level> {
+            let Some(id) = id else {
+                return Ok(Level::new());
+            };
+            let tree = repo.find_tree(id)?;
+            let mut level = Level::new();
+            for entry in tree.decode()?.entries.iter() {
+                let name = std::str::from_utf8(entry.filename.as_ref()).wrap_err(
+                    "history cannot represent a non-UTF-8 filename; refusing to change its bytes",
+                )?;
+                level.insert(
+                    name.to_string(),
+                    (entry.mode.is_tree(), entry.mode, entry.oid.to_owned()),
+                );
+            }
+            Ok(level)
+        };
+        let (from, to) = (read(from)?, read(to)?);
+        for name in from.keys().chain(to.keys()).collect::<BTreeSet<_>>() {
+            let path = format!("{prefix}{name}");
+            let (left, right) = (from.get(name), to.get(name));
+            if left == right {
+                continue;
+            }
+            let tree_of = |side: Option<&(bool, _, gix::ObjectId)>| {
+                side.and_then(|(is_tree, _, id)| is_tree.then_some(*id))
+            };
+            let file_of = |side: Option<&(bool, gix::object::tree::EntryMode, gix::ObjectId)>| {
+                side.and_then(|(is_tree, mode, id)| (!is_tree).then_some((*mode, *id)))
+            };
+            let (left_tree, right_tree) = (tree_of(left), tree_of(right));
+            if left_tree.is_some() || right_tree.is_some() {
+                Self::gix_diff_level(repo, left_tree, right_tree, &format!("{path}/"), changes)?;
+            }
+            let status = match (file_of(left), file_of(right)) {
                 (None, Some(_)) => 'A',
                 (Some(_), None) => 'D',
                 (Some(left), Some(right)) if left != right => 'M',
                 _ => continue,
             };
-            changes.push(Change {
-                status,
-                path: path.clone(),
-            });
+            changes.push(Change { status, path });
         }
-        Ok(changes)
+        Ok(())
     }
 
     /// Recursive listing of a tree (or a path inside it).
@@ -1756,16 +1798,35 @@ impl HistoryRepo {
         let Some(object) = self.object_at(tree, path)? else {
             return Ok(None);
         };
+        self.restored(&self.encrypted_paths_of(tree)?, path, object)
+            .map(Some)
+    }
+
+    /// The encrypted streams `tree` declares, read once for a walk over its
+    /// files ([`Self::restored`]) instead of once per file.
+    pub(crate) fn encrypted_paths_of(&self, tree: &str) -> Result<BTreeSet<String>> {
+        Ok(super::manifest::Manifest::read(self, tree)?
+            .map(|manifest| manifest.encrypted_paths())
+            .unwrap_or_default())
+    }
+
+    /// [`Self::restored_object_at`] for an object already listed from the
+    /// tree, with the tree's encrypted streams read beforehand: a walk over
+    /// every saved file then reads the manifest once, not once per file.
+    pub(crate) fn restored(
+        &self,
+        encrypted_paths: &BTreeSet<String>,
+        path: &str,
+        object: (String, String),
+    ) -> Result<(String, String)> {
         if matches!(object.0.as_str(), "040000" | "160000") {
-            return Ok(Some(object));
+            return Ok(object);
         }
-        let encrypted = super::manifest::Manifest::read(self, tree)?.is_some_and(|manifest| {
-            manifest.encrypted_paths().iter().any(|prefix| {
-                path == prefix
-                    || path
-                        .strip_prefix(prefix)
-                        .is_some_and(|rest| rest.starts_with('/'))
-            })
+        let encrypted = encrypted_paths.iter().any(|prefix| {
+            path == prefix
+                || path
+                    .strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
         });
         if encrypted {
             return super::sync::files::decrypt(
@@ -1773,10 +1834,9 @@ impl HistoryRepo {
                 path,
                 &object,
                 console::user_attended_stderr(),
-            )
-            .map(Some);
+            );
         }
-        Ok(Some(object))
+        Ok(object)
     }
 
     /// Builds a tree from `base` with `overlays` applied: each path is

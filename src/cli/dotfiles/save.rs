@@ -4,7 +4,7 @@ use eyre::{Result, bail};
 
 use crate::file::display_path;
 use crate::system::history::checkpoint::{Draft, Outcome, Store};
-use crate::system::history::store::{DescriptionSource, Entry, Trigger};
+use crate::system::history::store::{DescriptionSource, Trigger};
 use crate::system::history::tracked::{display_to_tree_path, normalize_target};
 
 /// Save a checkpoint of the tracked files now
@@ -103,7 +103,7 @@ impl DotfilesSave {
         if !crate::config::Settings::get().history.enabled {
             bail!("history is disabled (history.enabled = false)");
         }
-        let (store, tracked, entries) = super::history::open().await?;
+        let (store, tracked) = super::history::open_store().await?;
         if !crate::system::history::local::active()
             && tracked.invalid_local.iter().any(|invalid| {
                 self.paths.is_empty()
@@ -152,7 +152,7 @@ impl DotfilesSave {
         if self.paths.is_empty() || !shared.is_empty() {
             let mut this = self;
             this.paths = shared;
-            this.save_shared(store, tracked, entries, trigger).await?;
+            this.save_shared(store, tracked, trigger).await?;
         }
         save_local(local_args)
     }
@@ -190,7 +190,6 @@ impl DotfilesSave {
         self,
         store: Store,
         tracked: crate::system::history::tracked::TrackedSet,
-        entries: Vec<Entry>,
         trigger: Trigger,
     ) -> Result<()> {
         if !self.paths.is_empty() {
@@ -207,7 +206,7 @@ impl DotfilesSave {
                         .is_some_and(|entry| !entry.policy.autosave)
                         && std::fs::symlink_metadata(&path)
                             .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound)
-                        && previously_captured(&store, &entries, &path)?;
+                        && previously_captured(&store, &path)?;
                     if deletion {
                         continue;
                     }
@@ -273,15 +272,14 @@ impl DotfilesSave {
 }
 
 /// Whether the newest checkpoint holds `path`.
-fn previously_captured(store: &Store, entries: &[Entry], path: &Path) -> Result<bool> {
+fn previously_captured(store: &Store, path: &Path) -> Result<bool> {
     let Some(repo) = store.repo() else {
         return Ok(false);
     };
-    let Some(snapshot) = entries
-        .iter()
-        .rev()
-        .find_map(|entry| entry.checkpoint.tree.snapshot.as_ref())
-    else {
+    let Some(entry) = store.latest_with_snapshot()? else {
+        return Ok(false);
+    };
+    let Some(snapshot) = entry.checkpoint.tree.snapshot.as_ref() else {
         return Ok(false);
     };
     let tree_path = display_to_tree_path(&display_path(path));
