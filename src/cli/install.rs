@@ -576,6 +576,25 @@ impl Install {
                 }
             }
         }
+        // A tool named on the command line can still be scoped to another platform by
+        // its configured `os`. The bare path drops such tools silently
+        // (`install_missing_runtimes`), but naming one is an explicit request: say the
+        // tool is out of scope here instead of resolving release assets for a platform
+        // the tool never publishes.
+        if let Some(tr) = requests.iter().find(|tr| !tr.is_os_option_supported()) {
+            let scoped_to = tr
+                .os()
+                .iter()
+                .flatten()
+                .map(|os| format!("{os:?}"))
+                .join(", ");
+            eyre::bail!(
+                "{} is not available on {}: its configured os = [{}] excludes this platform",
+                tr.ba().short,
+                Settings::get().os(),
+                scoped_to
+            );
+        }
         Ok(requests)
     }
 
