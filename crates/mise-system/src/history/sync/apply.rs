@@ -356,6 +356,13 @@ impl Pull<'_> {
                             if !encrypted.contains(&conflict.branch_path) {
                                 return Ok(object);
                             }
+                            // The origin version this conflict is about is
+                            // not an envelope: it is the plaintext itself,
+                            // and taking it is what the path needs. The next
+                            // save encrypts it under this machine's policy.
+                            if conflict.kind == super::reconcile::ConflictKind::PlaintextUpstream {
+                                return Ok(object);
+                            }
                             super::files::decrypt(
                                 repo,
                                 &conflict.branch_path,
@@ -1647,7 +1654,11 @@ pub fn describe_conflicts(conflicts: &[Conflict]) -> Vec<(String, String)> {
                 .path()
                 .map(display_path)
                 .unwrap_or_else(|| conflict.branch_path.clone());
-            (path, conflict.kind.describe().to_string())
+            let description = match &conflict.detail {
+                Some(detail) => format!("{}; {detail}", conflict.kind.describe()),
+                None => conflict.kind.describe().to_string(),
+            };
+            (path, description)
         })
         .collect()
 }

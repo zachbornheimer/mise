@@ -1105,6 +1105,10 @@ fn prepare(
                 })
                 .map(|(path, object)| (path.clone(), object.clone()))
                 .collect(),
+            // never filtered: an origin plaintext version of an encrypted
+            // path is reported for every such path the incoming config
+            // declares, whether or not this machine selects it
+            plaintext: upstream.plaintext.clone(),
         };
         let mut plans = reconcile::reconcile(repo, shared, &selected, &sync_state, unsaved)?;
         // Old acknowledgements are not authority to delete a path this
@@ -1165,6 +1169,7 @@ fn prepare(
                         local: shared.get(&plan.branch_path).cloned(),
                         remote: upstream.files.get(&plan.branch_path).cloned(),
                         base: plan.next.acknowledged.clone(),
+                        detail: None,
                     });
                     plan.publish = None;
                 }
@@ -1197,6 +1202,7 @@ fn repository_conflict(status: &mut SyncStatus, error: &eyre::Report) {
         local: None,
         remote: None,
         base: None,
+        detail: None,
     }];
 }
 
@@ -1369,6 +1375,7 @@ fn apply_resolutions(
                 local: shared.get(&plan.branch_path).cloned(),
                 remote: upstream.files.get(&plan.branch_path).cloned(),
                 base: plan.next.acknowledged.clone(),
+                detail: None,
             });
             plan.publish = None;
         }
@@ -1860,6 +1867,7 @@ mod notification_tests {
             local: None,
             remote: None,
             base: None,
+            detail: None,
         }
     }
 
@@ -1928,6 +1936,7 @@ mod status_tests {
             local: None,
             remote: None,
             base: None,
+            detail: None,
         }
     }
 

@@ -193,6 +193,25 @@ pub(crate) fn encrypted_paths(
         .collect())
 }
 
+/// The newest commit in `head`'s ancestry whose tree holds `path` as a blob
+/// that is not an encrypted envelope, so a plaintext origin version names the
+/// commit that introduced it rather than only the branch head.
+pub(crate) fn plaintext_commit(
+    repo: &HistoryRepo,
+    head: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    for commit in repo.rev_list(head, usize::MAX)? {
+        let Some((_mode, oid)) = repo.object_at(&commit, path)? else {
+            continue;
+        };
+        if !repo.blob_starts_with(&oid, MAGIC)? {
+            return Ok(Some(commit));
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     path: String,
@@ -479,6 +498,21 @@ impl std::fmt::Display for Locked {
     }
 }
 
+/// An encrypt-declared path whose origin version is not an encrypted
+/// envelope. It is a per-path condition, not a broken repository: the
+/// version can be taken as it is, or replaced by the encrypted version this
+/// machine publishes, without touching any other path.
+#[derive(Debug)]
+pub(crate) struct PlaintextInEncryptedPath(pub String);
+
+impl std::fmt::Display for PlaintextInEncryptedPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "missing encrypted file envelope: {}", self.0)
+    }
+}
+
+impl std::error::Error for PlaintextInEncryptedPath {}
+
 pub(crate) fn decrypt(
     repo: &HistoryRepo,
     path: &str,
@@ -515,7 +549,12 @@ pub(crate) fn decrypt(
                     .collect::<Vec<_>>()
                     .join(" and ")
             ),
-            Repair::Intact => bail!("missing encrypted file envelope: {path}"),
+            // not a record and not an envelope: a plaintext version of an
+            // encrypted path, which the reconcile step turns into one path's
+            // conflict instead of failing every sync
+            Repair::Intact => Err(eyre::Report::new(PlaintextInEncryptedPath(
+                path.to_string(),
+            ))),
         };
     };
     let decrypted = open(repo, path, &outer, interactive)?;
