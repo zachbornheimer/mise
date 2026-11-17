@@ -375,7 +375,12 @@ fn covered(
         let Some(upstream) = repo.ref_oid(UPSTREAM_REF)? else {
             return Ok(None);
         };
-        if upstream != pinned && !repo.merge_bases(pinned, &upstream)?.iter().any(|base| base == pinned) {
+        if upstream != pinned
+            && !repo
+                .merge_bases(pinned, &upstream)?
+                .iter()
+                .any(|base| base == pinned)
+        {
             return Ok(None);
         }
     }
