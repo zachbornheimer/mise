@@ -411,6 +411,12 @@ pub(crate) fn skip_pointer_applications(plans: &mut [PathPlan], shared: &BTreeMa
     }
 }
 
+/// An encrypted envelope is text, so a line merge would commit conflict
+/// markers inside the ciphertext. It is never a candidate for `merge3`.
+fn is_encrypted_blob(repo: &HistoryRepo, oid: &str) -> Result<bool> {
+    repo.blob_starts_with(oid, b"mise-encrypted-file-v1\n")
+}
+
 enum Merged {
     Clean(Option<Object>),
     Conflict(ConflictKind),
@@ -440,6 +446,13 @@ fn merge(
             let Some(base) = base else {
                 return Ok(Merged::Conflict(ConflictKind::NeedsAdoption));
             };
+            if is_encrypted_blob(repo, &base.1)?
+                || is_encrypted_blob(repo, &o.1)?
+                || is_encrypted_blob(repo, &t.1)?
+            {
+                return Ok(Merged::Conflict(ConflictKind::Binary));
+            }
+
             let base_bytes = repo.cat_object(&base.1)?;
             let ours_bytes = repo.cat_object(&o.1)?;
             let theirs_bytes = repo.cat_object(&t.1)?;
@@ -503,6 +516,54 @@ mod tests {
             merge(&repo, None, Some(&ours), Some(&file)).unwrap(),
             Merged::Conflict(ConflictKind::TypeChange)
         ));
+    }
+
+    /// Two envelopes that share the header and differ below it are a conflict,
+    /// so `merge` never calls `merge3` on them.
+    #[test]
+    fn divergent_encrypted_envelopes_are_a_binary_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let envelope = |body: &[u8]| {
+            let mut bytes = b"mise-encrypted-file-v1\n".to_vec();
+            bytes.extend_from_slice(body);
+            repo.hash_blob(&bytes).unwrap()
+        };
+        let base = ("100644".into(), envelope(b"base-envelope"));
+        let ours = ("100644".into(), envelope(b"local-envelope-aaaa"));
+        let theirs = ("100644".into(), envelope(b"remote-envelope-bbbb"));
+        assert!(matches!(
+            merge(&repo, Some(&base), Some(&ours), Some(&theirs)).unwrap(),
+            Merged::Conflict(ConflictKind::Binary)
+        ));
+    }
+
+    /// A plaintext file changed on both sides still merges.
+    #[test]
+    fn plaintext_changed_on_both_sides_still_merges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let base = (
+            "100644".into(),
+            repo.hash_blob(b"first\nmiddle\nlast\n").unwrap(),
+        );
+        let ours = (
+            "100644".into(),
+            repo.hash_blob(b"local\nmiddle\nlast\n").unwrap(),
+        );
+        let theirs = (
+            "100644".into(),
+            repo.hash_blob(b"first\nmiddle\nremote\n").unwrap(),
+        );
+        let Merged::Clean(Some(object)) =
+            merge(&repo, Some(&base), Some(&ours), Some(&theirs)).unwrap()
+        else {
+            panic!("plaintext merge was not clean");
+        };
+        assert_eq!(
+            repo.cat_object(&object.1).unwrap(),
+            b"local\nmiddle\nremote\n"
+        );
     }
 
     fn rec(a: Option<&str>, u: Option<&str>, l: Option<&str>) -> SyncRecord {

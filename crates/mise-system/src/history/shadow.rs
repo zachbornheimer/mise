@@ -2077,6 +2077,12 @@ impl HistoryRepo {
 
     /// Merge complete ordinary trees using Git's recursive merge-base handling.
     /// Conflict trees are never adopted or written into live configuration.
+    ///
+    /// An encrypted blob is opaque. Git text-merges one because its bytes are
+    /// ASCII, and the result (conflict markers, or a clean line merge of two
+    /// envelopes) is not an age envelope. A path both sides changed is reported
+    /// as a conflict and the tree keeps one parent's blob, never a synthesized
+    /// merge. The caller decides which side; this layer only refuses to invent one.
     pub(crate) fn merge_tree(&self, local: &str, remote: &str) -> Result<(String, Vec<String>)> {
         let output = self.git.output_unchecked(PlumbingCall::new([
             "merge-tree",
@@ -2100,11 +2106,58 @@ impl HistoryRepo {
             .filter(|tree| !tree.is_empty())
             .ok_or_else(|| eyre::eyre!("Git did not return a merged tree"))?
             .to_owned();
-        let conflicts = fields
+        let mut conflicts: Vec<String> = fields
             .filter(|path| !path.is_empty())
             .map(str::to_owned)
             .collect();
+        let tree = self.refuse_merged_ciphertext(&tree, local, remote, &mut conflicts)?;
         Ok((tree, conflicts))
+    }
+
+    /// Replace an encrypted blob git synthesized (conflict markers, or a clean
+    /// line merge of two envelopes) with one parent's blob and report the path.
+    /// A blob only one side changed is left alone, and so is a blob that already
+    /// is one parent's.
+    fn refuse_merged_ciphertext(
+        &self,
+        tree: &str,
+        local: &str,
+        remote: &str,
+        conflicts: &mut Vec<String>,
+    ) -> Result<String> {
+        let magic: &[u8] = b"mise-encrypted-file-v1\n";
+        let mut overlays = Vec::new();
+        for entry in self.ls_tree(tree)? {
+            if !self.blob_starts_with(&entry.oid, magic)? {
+                continue;
+            }
+            let ours = self.object_at(local, &entry.path)?;
+            let theirs = self.object_at(remote, &entry.path)?;
+            let is_envelope = |object: &Option<(String, String)>| {
+                object
+                    .as_ref()
+                    .is_some_and(|object| self.blob_starts_with(&object.1, magic).unwrap_or(false))
+            };
+            if !is_envelope(&ours) && !is_envelope(&theirs) {
+                continue;
+            }
+            let synthesized = ours.as_ref().is_none_or(|object| object.1 != entry.oid)
+                && theirs.as_ref().is_none_or(|object| object.1 != entry.oid);
+            if !synthesized {
+                continue;
+            }
+            if !conflicts.iter().any(|path| path == &entry.path) {
+                conflicts.push(entry.path.clone());
+            }
+            overlays.push(Overlay {
+                path: entry.path,
+                object: ours.or(theirs),
+            });
+        }
+        if overlays.is_empty() {
+            return Ok(tree.to_owned());
+        }
+        self.compose(tree, &overlays)
     }
 
     /// Every object, including blobs of earlier versions, reachable from `head`.
@@ -3696,5 +3749,45 @@ mod tests {
         assert_eq!(link.mode, "160000");
         // the nested repository itself was not touched
         assert_eq!(git_in(&nested, &["status", "--porcelain"]), "?? untracked");
+    }
+
+    /// Two encrypted envelopes that share the header and differ below it must
+    /// not be text-merged. Git would commit the conflict markers; the merge
+    /// keeps one parent's blob and reports the path.
+    #[test]
+    fn merging_two_encrypted_blobs_does_not_commit_conflict_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let envelope = |body: &str| {
+            let mut bytes = b"mise-encrypted-file-v1\nshared line\n".to_vec();
+            bytes.extend_from_slice(body.as_bytes());
+            bytes.extend_from_slice(b"\ntrailer\n");
+            repo.hash_blob(&bytes).unwrap()
+        };
+        let tree = |oid: String| {
+            repo.write_tree(&[("100644".into(), oid, "home/secret".into())])
+                .unwrap()
+        };
+        let base = repo
+            .commit_tree(&tree(envelope("base")), vec![], "base")
+            .unwrap();
+        let local = repo
+            .commit_tree(&tree(envelope("local side")), vec![&base], "local")
+            .unwrap();
+        let remote = repo
+            .commit_tree(&tree(envelope("remote side")), vec![&base], "remote")
+            .unwrap();
+        let (merged, conflicts) = repo.merge_tree(&local, &remote).unwrap();
+        assert!(
+            conflicts.iter().any(|path| path == "home/secret"),
+            "{conflicts:?}"
+        );
+        let object = repo.object_at(&merged, "home/secret").unwrap().unwrap();
+        let bytes = repo.cat_object(&object.1).unwrap();
+        assert!(!bytes.windows(7).any(|window| window == b"<<<<<<<"));
+        assert_eq!(
+            object.1,
+            repo.object_at(&local, "home/secret").unwrap().unwrap().1
+        );
     }
 }
