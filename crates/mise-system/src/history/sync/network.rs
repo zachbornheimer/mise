@@ -84,6 +84,71 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_guard_transport_refuses_plaintext_before_pushing_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = HistoryRepo::open_or_init_in(&temp.path().join("source"))
+            .unwrap()
+            .unwrap();
+        let origin = HistoryRepo::open_or_init_in(&temp.path().join("origin"))
+            .unwrap()
+            .unwrap();
+        let tree = source
+            .compose(
+                &source.empty_object("tree").unwrap(),
+                &[crate::history::shadow::Overlay {
+                    path: "home/private".into(),
+                    object: Some(("100644".into(), source.hash_blob(b"private").unwrap())),
+                }],
+            )
+            .unwrap();
+        let plaintext = source
+            .commit_tree(&tree, vec![], "plaintext baseline")
+            .unwrap();
+        let manifest = crate::history::manifest::Manifest {
+            enrollment: vec![crate::history::manifest::Enrollment {
+                path: "home/private".into(),
+                autosave: true,
+                encrypt: true,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            }],
+            ..Default::default()
+        };
+        let key = age::x25519::Identity::generate();
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        let encrypted = crate::history::sync::files::encode(
+            "home/private",
+            "100644",
+            b"private",
+            "test",
+            &recipients,
+        )
+        .unwrap();
+        let tree = source
+            .compose(
+                &tree,
+                &[crate::history::shadow::Overlay {
+                    path: "home/private".into(),
+                    object: Some(("100644".into(), source.hash_blob(&encrypted).unwrap())),
+                }],
+            )
+            .unwrap();
+        let tree = manifest.write(&source, &tree).unwrap();
+        let encrypted_policy = source
+            .commit_tree(&tree, vec![&plaintext], "enable encryption")
+            .unwrap();
+        let url = url::Url::from_file_path(origin.dir()).unwrap();
+        let result = Remote::new(&source, url.as_str()).push(
+            &[format!("{encrypted_policy}:refs/heads/main")],
+            Some(("main", None)),
+        );
+        assert!(result.is_err(), "transport published plaintext: {result:?}");
+        assert!(origin.ref_oid("refs/heads/main").unwrap().is_none());
+    }
+
+    #[test]
     fn ordinary_push_preserves_ancestry_and_rejects_divergence() {
         if mise_util::git::plumbing_binary().is_none() {
             return;
@@ -235,6 +300,17 @@ impl<'a> Remote<'a> {
         lease: Option<(&str, Option<&str>)>,
     ) -> Result<PushOutcome> {
         validate_url(&self.url)?;
+        // The final transport boundary is strict even when a caller skipped
+        // planning or opted out of its earlier publication audit.
+        for refspec in refspecs {
+            let (source, _) = refspec.split_once(':').ok_or_else(|| {
+                eyre::eyre!("publication requires an explicit source and destination")
+            })?;
+            if source.is_empty() || source.starts_with('+') {
+                bail!("forced publication and branch deletion are not supported");
+            }
+            super::files::audit_history(self.repo, source, &Default::default())?;
+        }
         let mut args = vec!["push".to_string(), "--quiet".to_string()];
         if let Some((branch, expected)) = lease {
             let name = format!("refs/heads/{branch}");

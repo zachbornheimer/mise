@@ -54,6 +54,48 @@ impl<'de> Deserialize<'de> for Bytes {
     }
 }
 
+/// Validate the composed checkpoint, including carried/manual/held files,
+/// before a commit can make plaintext part of saved history. Ancestry is
+/// checked separately at publication so old leaks do not block safe saves.
+pub(crate) fn audit_tree(
+    repo: &HistoryRepo,
+    tree: &str,
+    protected: &BTreeSet<String>,
+) -> Result<()> {
+    if protected.is_empty() {
+        return Ok(());
+    }
+    for entry in repo.ls_tree(tree)? {
+        if !protected.iter().any(|path| {
+            entry.path == *path
+                || entry
+                    .path
+                    .strip_prefix(path)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        }) {
+            continue;
+        }
+        let path = entry.path;
+        let object = (entry.mode, entry.oid);
+        let valid = match envelope(repo, &object, agecrypt::MAX_ENCRYPTED_BYTES) {
+            Ok(Some(outer)) => sealed_for(&outer, &path),
+            Ok(None) => false,
+            Err(error) => {
+                if !conflicts::sealed(repo, &object, &path)? {
+                    return Err(error.wrap_err(format!("invalid encrypted checkpoint at {path}")));
+                }
+                true
+            }
+        };
+        if !valid {
+            bail!(
+                "cannot save: encrypted path {path} has an unencrypted or invalid version; save that path explicitly with encryption before carrying it forward"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Audit the complete proposed ancestry, not just the latest tree. A newly
 /// encrypted path cannot make its previously committed plaintext safe to push.
 pub(crate) fn audit_history(
