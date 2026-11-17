@@ -76,6 +76,9 @@ impl DotfilesConflicts {
                 display_path(&path),
                 conflict.kind.describe()
             );
+            if let Some(detail) = &conflict.detail {
+                miseprintln!("{detail}");
+            }
             if self.difftool {
                 run_difftool(repo, conflict, &path, self.tool.as_deref())?;
             } else {
