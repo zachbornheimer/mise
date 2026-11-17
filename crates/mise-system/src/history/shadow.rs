@@ -1950,7 +1950,7 @@ impl HistoryRepo {
             .collect())
     }
 
-    /// A commit of `tree` with the given parents.
+    /// A new commit of `tree`, using the user's Git identity and signing settings.
     pub(crate) fn commit_tree(
         &self,
         tree: &str,
@@ -1968,13 +1968,10 @@ impl HistoryRepo {
         if !body.ends_with('\n') {
             body.push('\n');
         }
-        let email = super::config::git_email()?;
-        self.output_str(
-            PlumbingCall::new(args)
-                .stdin(body.as_bytes())
-                .env("GIT_AUTHOR_EMAIL", email.as_str())
-                .env("GIT_COMMITTER_EMAIL", email),
-        )
+        let output = self
+            .git
+            .commit_output(PlumbingCall::new(args).stdin(body.as_bytes()))?;
+        Ok(String::from_utf8(output)?.trim().to_string())
     }
 
     /// A commit carrying another commit's identity: its author and committer
@@ -2529,6 +2526,81 @@ mod tests {
         HistoryRepo::open_or_init_in(&tmp.join("state"))
             .unwrap()
             .expect("git is required for these tests")
+    }
+
+    #[test]
+    fn history_commits_use_git_identity_and_signing() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repo(temp.path());
+        let key = temp.path().join("signing-key");
+        let output = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "ssh-keygen failed: {output:?}");
+        for (name, value) in [
+            ("user.name", "History Test"),
+            ("user.email", "history@example.com"),
+            ("commit.gpgsign", "true"),
+            ("gpg.format", "ssh"),
+            ("user.signingkey", key.to_str().unwrap()),
+        ] {
+            repo.git
+                .run(PlumbingCall::new(["config", name, value]))
+                .unwrap();
+        }
+        let tree = repo.empty_object("tree").unwrap();
+        let commit = repo
+            .commit_tree(&tree, vec![], "signed checkpoint")
+            .unwrap();
+        let identity = repo
+            .output_str(PlumbingCall::new([
+                "show",
+                "-s",
+                "--format=%an <%ae> | %cn <%ce>",
+                &commit,
+            ]))
+            .unwrap();
+        assert_eq!(
+            identity,
+            "History Test <history@example.com> | History Test <history@example.com>"
+        );
+        let allowed = temp.path().join("allowed-signers");
+        let public_key = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+        std::fs::write(&allowed, format!("history@example.com {public_key}")).unwrap();
+        repo.git
+            .run(PlumbingCall::new([
+                "-c",
+                "gpg.format=ssh",
+                "-c",
+                &format!("gpg.ssh.allowedSignersFile={}", allowed.display()),
+                "verify-commit",
+                &commit,
+            ]))
+            .unwrap();
+    }
+
+    #[test]
+    fn history_commits_reject_missing_git_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repo(temp.path());
+        let tree = repo.empty_object("tree").unwrap();
+        for key in ["user.name", "user.email"] {
+            repo.git
+                .run(PlumbingCall::new(["config", key, ""]))
+                .unwrap();
+        }
+        let error = repo.commit_tree(&tree, vec![], "missing name").unwrap_err();
+        assert!(format!("{error:#}").contains("missing Git user.name"));
+        repo.git
+            .run(PlumbingCall::new(["config", "user.name", "History Test"]))
+            .unwrap();
+        let error = repo
+            .commit_tree(&tree, vec![], "missing email")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("missing Git user.email"));
+        assert!(repo.ref_oid("HEAD").unwrap().is_none());
     }
 
     fn root(label: &str, path: &Path, files: &[&str]) -> CaptureRoot {

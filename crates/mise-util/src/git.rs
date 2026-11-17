@@ -1335,11 +1335,11 @@ impl<'a> PlumbingCall<'a> {
 /// Runs git plumbing against a repository mise owns (a bare "shadow" repo),
 /// isolated from the user's git configuration.
 ///
-/// Every call ignores the system and global gitconfig, so `filter.*`
-/// (git-crypt, LFS), `core.hooksPath`, `core.excludesFile`, aliases, and
-/// credential helpers from the user's setup cannot act on mise's repository,
-/// and defaults to a fixed committer identity. Only plumbing commands should be run
-/// through it; porcelain (`commit`, `checkout`) would consult hooks.
+/// Object and ref calls ignore the system and global gitconfig, so filters,
+/// hooks, excludes, aliases, and credential helpers cannot act on the shadow
+/// repository. Commit creation explicitly opts into user identity and signing
+/// configuration, and network operations into credentials. Only plumbing runs
+/// here; porcelain (`commit`, `checkout`) would consult hooks.
 #[derive(Debug)]
 pub struct GitPlumbing {
     git_dir: PathBuf,
@@ -1453,6 +1453,97 @@ impl GitPlumbing {
         Ok(String::from_utf8_lossy(&out).trim().to_string())
     }
 
+    /// Creates a commit using the user's Git identity and signing configuration.
+    /// Other object operations remain isolated from user configuration. Only
+    /// commit-tree runs here: hooks, filters, aliases, and checkout are never run.
+    pub fn commit_output(&self, call: PlumbingCall<'_>) -> Result<Vec<u8>> {
+        eyre::ensure!(
+            call.args.first().is_some_and(|arg| arg == "commit-tree") && call.env.is_empty(),
+            "configured Git commits require commit-tree without environment overrides"
+        );
+        let config = run_plumbing(
+            self.commit_command(PlumbingCall::new(["config", "--null", "--list"]))?,
+            None,
+        )?;
+        let mut name = None;
+        let mut email = None;
+        let mut signing = None;
+        for entry in config
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+        {
+            let (key, value) = entry
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or((entry, None), |separator| {
+                    (&entry[..separator], Some(&entry[separator + 1..]))
+                });
+            match key {
+                b"user.name" => name = value,
+                b"user.email" => email = value,
+                b"commit.gpgsign" => signing = Some(value),
+                _ => {}
+            }
+        }
+        for (key, value) in [("user.name", name), ("user.email", email)] {
+            eyre::ensure!(
+                value.is_some_and(|value| !value.iter().all(u8::is_ascii_whitespace)),
+                "cannot create history commit: missing Git {key}; configure it with git config --global {key} before saving history"
+            );
+        }
+        let stdin = call.stdin;
+        let mut cmd = self.commit_command(call)?;
+        let name = std::str::from_utf8(name.expect("validated user.name"))?;
+        let email = std::str::from_utf8(email.expect("validated user.email"))?;
+        cmd.env("GIT_AUTHOR_NAME", name)
+            .env("GIT_COMMITTER_NAME", name)
+            .env("GIT_AUTHOR_EMAIL", email)
+            .env("GIT_COMMITTER_EMAIL", email);
+        let sign = match signing {
+            None => false,
+            Some(None) => true,
+            Some(Some(value)) => bool::from(
+                gix::config::Boolean::try_from(std::str::from_utf8(value)?)
+                    .wrap_err("invalid Git commit.gpgsign")?,
+            ),
+        };
+        if sign {
+            // commit-tree does not honor commit.gpgsign without an explicit -S.
+            cmd.arg("-S");
+        }
+        run_plumbing(cmd, stdin)
+    }
+
+    fn commit_command(&self, mut call: PlumbingCall<'_>) -> Result<std::process::Command> {
+        // Configuration arguments must precede the Git subcommand.
+        call.args.splice(
+            0..0,
+            [
+                OsString::from("-c"),
+                OsString::from("user.useConfigOnly=true"),
+            ],
+        );
+        let mut cmd = self.command(&call)?;
+        for key in ["GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL"] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            } else {
+                cmd.env_remove(key);
+            }
+        }
+        for key in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_AUTHOR_DATE",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+            "GIT_COMMITTER_DATE",
+        ] {
+            cmd.env_remove(key);
+        }
+        Ok(cmd)
+    }
+
     /// Runs a network command (`fetch`, `push`, `ls-remote`) against this
     /// repository with the user's normal git configuration: credential
     /// helpers, ssh settings, and URL rewrites apply, while hooks, filters,
@@ -1526,10 +1617,6 @@ impl GitPlumbing {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("GIT_AUTHOR_NAME", "mise")
-            .env("GIT_AUTHOR_EMAIL", "mise@localhost")
-            .env("GIT_COMMITTER_NAME", "mise")
-            .env("GIT_COMMITTER_EMAIL", "mise@localhost")
             .env("LC_ALL", "C")
             .stdin(std::process::Stdio::null());
         Ok(cmd)
