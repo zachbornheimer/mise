@@ -1177,6 +1177,18 @@ pub(super) fn incoming_repository_tree(
         return Ok(None);
     }
     let (merged, conflicts) = repo.merge_tree(local, remote)?;
+    // Git's object for a conflicted path is never a saved version: keep the
+    // local one until per-file reconciliation applies its own result.
+    let kept = conflicts
+        .iter()
+        .map(|path| {
+            Ok(crate::history::shadow::Overlay {
+                object: repo.object_at(local, path)?,
+                path: path.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let merged = repo.compose(&merged, &kept)?;
     let tree = tracked.manifest.write(repo, &merged)?;
     let roots = Roots::current();
     let exclude = tracked.exclude_set()?;
