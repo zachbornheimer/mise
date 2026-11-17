@@ -278,12 +278,73 @@ fn head_moved(
 
 /// Runs one synchronization.
 pub fn sync(store: &Store, tracked: &TrackedSet, request: &SyncRequest) -> Result<SyncOutcome> {
+    let asked = chrono::Utc::now();
     let _sync_lock = if request.queue {
         lock_queued(store)?
     } else {
         lock(store)?
     };
+    if let Some(outcome) = served_while_queued(store, tracked, request, asked)? {
+        return Ok(outcome);
+    }
     sync_locked(store, tracked, request)
+}
+
+/// Group commit for syncs that queued: a sync that waited behind another
+/// has nothing left to do when that one fetched after this one was asked,
+/// succeeded, and published every checkpoint this machine has saved, so it
+/// reports that sync's result instead of fetching and planning again. Ten
+/// syncs started a second apart then cost a few syncs, not ten in a row.
+/// Saving what is live first keeps the promise of a sync someone ran: an
+/// edit made after the sync ahead read the history is not covered, and the
+/// sync runs in full.
+fn served_while_queued(
+    store: &Store,
+    tracked: &TrackedSet,
+    request: &SyncRequest,
+    asked: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<SyncOutcome>> {
+    if !request.queue || request.dry_run || request.offline || request.origin.is_some() {
+        return Ok(None);
+    }
+    let status = read_status(store.state_dir())?;
+    let fetched_since_asked = status
+        .last_fetch
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|at| at >= asked);
+    if !fetched_since_asked || status.last_error.is_some() {
+        return Ok(None);
+    }
+    let Some(repo) = store.repo() else {
+        return Ok(None);
+    };
+    if request.capture {
+        capture_now(store, tracked);
+    }
+    let published = match (
+        repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)?,
+        repo.ref_oid(UPSTREAM_REF)?,
+    ) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(local), Some(remote)) => {
+            local == remote || repo.merge_bases(&local, &remote)?.contains(&local)
+        }
+    };
+    let mode = SyncMode::current()?;
+    if !published && mode.publishes() && !request.fetch_only {
+        return Ok(None);
+    }
+    debug!("history sync: the sync ahead in line covered this one");
+    Ok(Some(SyncOutcome {
+        published: None,
+        pending: status.pending_applications.len() + usize::from(status.pending_repository),
+        pending_repository: status.pending_repository,
+        pending_directories: status.pending_directories,
+        conflicts: status.conflicts.len(),
+        fetched_upstream: status.upstream_commit.clone(),
+    }))
 }
 
 /// Runs one synchronization while the caller holds the sync lock.
@@ -384,7 +445,20 @@ pub(crate) fn sync_locked(
             // publishing past it is unsafe and failing wastes the whole sync.
             // Read the history again and plan again instead. Re-planning is not
             // a rejected push, so it does not spend the push retries.
-            if head_moved(repo, &shared)? {
+            if head_moved(repo, &shared)?
+                && !shared.checkpoint.as_deref().is_some_and(|pinned| {
+                    publish::fast_forwards(
+                        repo,
+                        pinned,
+                        repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)
+                            .ok()
+                            .flatten()
+                            .as_deref(),
+                        upstream_commit.as_deref(),
+                    )
+                    .unwrap_or(false)
+                })
+            {
                 replans += 1;
                 if replans > REPLAN_LIMIT {
                     bail!(
@@ -585,6 +659,17 @@ pub fn lock_queued(store: &Store) -> Result<fslock::LockFile> {
     )
 }
 
+/// Whether a sync or pull holds the sync lock right now. A reader that only
+/// looks at `sync.json` and the fetched objects takes no lock: the record is
+/// replaced atomically and the objects are immutable, so the worst a running
+/// sync does is make what the reader shows out of date. This lets the reader
+/// say so instead of queueing behind a network round trip.
+pub fn sync_running(store: &Store) -> bool {
+    matches!(
+        mise_util::lock_file::LockFile::at(&lock_path(store.state_dir())).try_lock(),
+        Ok(None)
+    )
+}
 pub(crate) fn lock_in(state_dir: &Path) -> Result<fslock::LockFile> {
     mise_util::lock_file::LockFile::at(&lock_path(state_dir))
         .try_lock()?
