@@ -2,9 +2,12 @@ name: mise-build
 
 # Assembles a custom `mise` from the fork's `main` (upstream plus one carry
 # commit holding this workflow and `.mise-build/`) merged with every branch
-# that has a file under `.mise-build/branches/`, builds a darwin-arm64 binary,
-# and publishes it as a GitHub release marked latest. Same shape as the
-# zachbornheimer/oh-my-pi `omp-build` workflow: see `.mise-build/README.md`.
+# that has a file under `.mise-build/branches/`, builds the binaries the fleet
+# runs (darwin-arm64 on a macOS runner, linux-x64 on Ubuntu) through
+# `zysys/github-workflows` rust-release.yml, and publishes them as a GitHub
+# release marked latest. Same targets and assets as the zachbornheimer/oh-my-pi
+# `omp-build` workflow (`<binary>-<target>.tar.gz` plus SHA256SUMS): see
+# `.mise-build/README.md`.
 #
 # The base of every assembly is the commit that triggered the run
 # ($GITHUB_SHA): main's tip for a push to main or the scheduled poll, the
@@ -192,7 +195,7 @@ jobs:
     # darwin-arm64 is this Mac; linux-x64 is the VPS and every E2B sandbox.
     permissions:
       contents: write
-    uses: zysys/github-workflows/.github/workflows/rust-release.yml@45470a74081d8941e02a5e12f7436262c43949fd
+    uses: zysys/github-workflows/.github/workflows/rust-release.yml@c0b503bdf59e93271270e8888125fbbb841ad14c
     with:
       binary: mise
       # The assembly the assemble job pushed; the release points at its commit.
