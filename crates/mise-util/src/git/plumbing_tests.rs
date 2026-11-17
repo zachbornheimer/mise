@@ -1,4 +1,41 @@
+// Commit-specific configuration must not leak into ordinary object plumbing.
 use super::*;
+
+#[test]
+fn configured_commits_honor_unsigned_mode_and_never_fall_back_after_signing_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = GitPlumbing::new(temp.path().join("history.git"));
+    repo.init_bare().unwrap();
+    for (key, value) in [
+        ("user.name", "History Test"),
+        ("user.email", "history@example.com"),
+        ("commit.gpgsign", "false"),
+        ("gpg.format", "ssh"),
+        ("user.signingkey", "missing-signing-key"),
+    ] {
+        repo.run(PlumbingCall::new(["config", key, value])).unwrap();
+    }
+    let tree = repo
+        .output_str(PlumbingCall::new(["mktree"]).stdin(b""))
+        .unwrap();
+    let commit = repo
+        .commit_output(
+            PlumbingCall::new(["commit-tree", &tree]).stdin(b"unsigned by configuration\n"),
+        )
+        .unwrap();
+    let commit = std::str::from_utf8(&commit).unwrap().trim();
+    let object = repo
+        .output_str(PlumbingCall::new(["cat-file", "commit", commit]))
+        .unwrap();
+    assert!(object.contains("author History Test <history@example.com>"));
+    assert!(!object.contains("gpgsig "));
+    repo.run(PlumbingCall::new(["config", "commit.gpgsign", "true"]))
+        .unwrap();
+    let error = repo
+        .commit_output(PlumbingCall::new(["commit-tree", &tree]).stdin(b"must not fall back\n"))
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("missing-signing-key"));
+}
 
 #[test]
 fn plumbing_isolates_user_config_and_keeps_the_scratch_index() {

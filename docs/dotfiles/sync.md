@@ -318,22 +318,30 @@ or failing notifier never stops history or sync. To turn notifications off:
 mise settings history.notify=false
 ```
 
-## Identify commits by machine {#identify-commits-by-machine}
+## Commit identity and signing {#identify-commits-by-machine}
 
-History commits use `mise <mise@localhost>` as author and committer by
-default. To see which machine made each new commit in a shared history, add
-this to your system or global config:
+New history commits use your Git `user.name` and `user.email` as both author
+and committer, read with the history repository as Git's context (not the
+project you ran mise from). Configure both on **every machine**, including
+machines running only the watcher. If either key is missing or empty, saving
+fails with an error naming the key; mise never substitutes a login name or
+`mise@hostname`.
 
-```toml
-[history]
-git_email = "mise@{hostname}"
+```sh
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+git config --global commit.gpgsign true
 ```
 
-mise replaces `{hostname}` with the machine's hostname when it creates a
-commit, so a save on `work-mbp.local` uses `mise <mise@work-mbp.local>`. This
-also applies to the watcher's commits and to merge commits that mise makes.
-The value can also be a fixed email address. It affects new commits only;
-existing commits keep their identity.
+When `commit.gpgsign` is true, mise asks Git to sign every new checkpoint,
+watcher commit, and merge commit. Git's `gpg.format`, `user.signingkey`, and
+signing-program settings apply, including SSH signing. The signing key and
+agent must be available to the watcher; a signing failure aborts the save
+instead of creating an unsigned commit. Hooks and content filters are not run.
+
+The former `[history].git_email` setting no longer overrides Git identity.
+Remove it from shared configuration after upgrading all machines. Existing
+commits keep their original identity and signatures; they are not rewritten.
 
 ## Move from a symlinked dotfiles repository {#move-from-a-symlinked-repository}
 
