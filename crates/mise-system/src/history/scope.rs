@@ -1043,7 +1043,7 @@ fn acquire_operation_lock(store: &Store, wait: std::time::Duration) -> Result<fs
 /// How long an operation waits for a running one (`history.lock_wait`), and
 /// how often it looks. An unreadable value falls back to the default rather
 /// than failing a command that only wanted to save.
-fn operation_lock_wait() -> std::time::Duration {
+pub(crate) fn operation_lock_wait() -> std::time::Duration {
     const DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
     match parse_lock_wait(&Settings::get().history.lock_wait) {
         Ok(wait) => wait,

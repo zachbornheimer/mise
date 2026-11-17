@@ -226,6 +226,10 @@ pub struct SyncRequest {
     /// A preview: nothing is announced (the caller puts the recorded state
     /// back afterwards).
     pub dry_run: bool,
+    /// Wait in line behind a running sync or pull (`history.lock_wait`)
+    /// instead of failing at once. Commands someone runs queue; the watcher
+    /// does not, because it retries a contended sync on its own schedule.
+    pub queue: bool,
 }
 
 impl SyncRequest {
@@ -237,6 +241,7 @@ impl SyncRequest {
             origin: None,
             offline: false,
             dry_run: false,
+            queue: false,
         }
     }
 }
@@ -273,7 +278,11 @@ fn head_moved(
 
 /// Runs one synchronization.
 pub fn sync(store: &Store, tracked: &TrackedSet, request: &SyncRequest) -> Result<SyncOutcome> {
-    let _sync_lock = lock(store)?;
+    let _sync_lock = if request.queue {
+        lock_queued(store)?
+    } else {
+        lock(store)?
+    };
     sync_locked(store, tracked, request)
 }
 
@@ -562,6 +571,18 @@ fn lock_path(state_dir: &Path) -> PathBuf {
 /// holds it.
 pub fn lock(store: &Store) -> Result<fslock::LockFile> {
     lock_in(store.state_dir())
+}
+
+/// The sync lock for a command someone ran: it waits its turn behind a
+/// running sync or pull for `history.lock_wait`, as a save waits behind a
+/// running save, so syncs started together run one after another instead of
+/// all but one failing. The watcher keeps [`lock`]: waiting would stall its
+/// event loop, and it retries a contended sync on its own schedule.
+pub fn lock_queued(store: &Store) -> Result<fslock::LockFile> {
+    lock_wait(
+        store.state_dir(),
+        crate::history::scope::operation_lock_wait(),
+    )
 }
 
 pub(crate) fn lock_in(state_dir: &Path) -> Result<fslock::LockFile> {
@@ -1614,6 +1635,29 @@ mod status_tests {
             status.declarations_changed = false;
         })
         .unwrap();
+    }
+
+    /// A sync someone ran queues behind a running one instead of failing, and
+    /// the watcher's no-wait lock still fails at once on the same contention.
+    #[test]
+    fn a_queued_sync_waits_for_a_running_one_and_a_plain_one_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hstore::store_dir_in(&state_dir)).unwrap();
+        let held = lock_in(&state_dir).unwrap();
+        assert!(
+            lock_in(&state_dir)
+                .unwrap_err()
+                .to_string()
+                .contains("another setup sync or pull")
+        );
+        let waiter = {
+            let state_dir = state_dir.clone();
+            std::thread::spawn(move || lock_wait(&state_dir, Duration::from_secs(10)).is_ok())
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+        assert!(waiter.join().unwrap(), "the queued sync should take the lock once it is free");
     }
 }
 

@@ -53,6 +53,7 @@ impl DotfilesSync {
         }
         let mut request = SyncRequest::new(self.fetch_only);
         request.allow_plaintext_history = self.allow_plaintext_history;
+        request.queue = true;
         let outcome = run::sync(&store, &tracked, &request)?;
         crate::system::history::sync::origin::report(&outcome);
         Ok(())

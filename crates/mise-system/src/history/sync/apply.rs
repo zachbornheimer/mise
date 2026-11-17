@@ -99,7 +99,13 @@ pub async fn apply(
     tracked: &TrackedSet,
     req: &ApplyRequest,
 ) -> Result<ApplyOutcome> {
-    let _sync_lock = run::lock(store)?;
+    // a pull someone ran waits its turn behind a running sync; the watcher's
+    // automatic apply never waits
+    let _sync_lock = if req.automatic {
+        run::lock(store)?
+    } else {
+        run::lock_queued(store)?
+    };
     apply_locked(store, tracked, req).await
 }
 
