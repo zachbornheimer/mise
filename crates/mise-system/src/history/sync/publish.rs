@@ -35,7 +35,12 @@ pub(crate) fn build(
         }
         if !allow_plaintext_history {
             super::files::audit_history(repo, pinned, &Default::default())?;
-            super::secrets::audit_unpublished(repo, pinned, upstream)?;
+            super::secrets::audit_unpublished(
+                repo,
+                pinned,
+                upstream,
+                &mise_settings::Settings::get().history.allow_secret_values,
+            )?;
         }
         return Ok(Some(pinned.to_string()));
     }
