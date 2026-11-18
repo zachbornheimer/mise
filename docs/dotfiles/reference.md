@@ -494,7 +494,11 @@ line. The events are `started`, `already-running`, `captured`, `unchanged`,
 runs for the store, and 1 when Git is unusable, the store cannot be opened, or
 no watch can be installed. `mise dot watch --once` runs one scan and one
 sync, and exits 1 if its save was deferred or failed, or if its sync with the
-origin failed.
+origin failed. A sync that found another sync holding the lock emits
+`sync-skipped`, names the holder, and retries a few seconds later; that is not
+a failure, and `--once` exits 0. A
+failed sync waits somewhere between half and all of its backoff, and a periodic
+fetch lands within a tenth of `history.fetch_interval`.
 
 ## Retention {#retention}
 
