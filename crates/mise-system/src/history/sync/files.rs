@@ -10,7 +10,7 @@ use super::{layout, reconcile::Object};
 use crate::history::shadow::HistoryRepo;
 use mise_util::agecrypt;
 
-pub(crate) const MAGIC: &[u8] = b"mise-encrypted-file-v1\n";
+pub const MAGIC: &[u8] = b"mise-encrypted-file-v1\n";
 
 /// Git's text-merge markers. A record that holds them is damage from a merge
 /// that treated two envelopes as text: it holds one complete envelope from
@@ -166,10 +166,7 @@ fn audit_history_cached(
 }
 
 /// Resolve encrypted files from the same committed enrollment metadata.
-pub(crate) fn encrypted_paths(
-    repo: &HistoryRepo,
-    commit: Option<&str>,
-) -> Result<BTreeSet<String>> {
+pub fn encrypted_paths(repo: &HistoryRepo, commit: Option<&str>) -> Result<BTreeSet<String>> {
     let Some(commit) = commit else {
         return Ok(BTreeSet::new());
     };
@@ -567,7 +564,14 @@ impl std::fmt::Display for PlaintextInEncryptedPath {
 
 impl std::error::Error for PlaintextInEncryptedPath {}
 
-pub(crate) fn decrypt(
+/// The plaintext mode recorded in an encrypted envelope, without decrypting it.
+/// `None` when the object is not an envelope, including a marker record Git
+/// merged as text.
+pub fn plaintext_mode(repo: &HistoryRepo, object: &Object) -> Result<Option<String>> {
+    Ok(envelope(repo, object, agecrypt::MAX_ENCRYPTED_BYTES)?.map(|outer| outer.mode))
+}
+
+pub fn decrypt(
     repo: &HistoryRepo,
     path: &str,
     object: &Object,

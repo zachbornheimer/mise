@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# A conflict handoff names both plaintext sides of one encrypted file and the
+# commands that decide it. JSON alone writes nothing and never prints the
+# envelope or the secret. --sides writes those sides, and only those sides,
+# into a private directory.
+require_cmd git
+require_cmd jq
+export MISE_HISTORY_NOTIFY=false
+capture_test="${ROOT:?}/e2e/cli/test_dotfiles_encrypted_capture"
+MISE_AGE_KEY=$(sed -n 's/^export MISE_AGE_KEY=//p' "$capture_test" | head -1 | tr -d '"')
+[ -n "$MISE_AGE_KEY" ] || {
+  echo "no age key in $capture_test" >&2
+  exit 1
+}
+export MISE_AGE_KEY
+origin="$PWD/conflict-handoff-origin.git"
+git init -q --bare -b main "$origin"
+
+mkdir -p "$MISE_CONFIG_DIR"
+cat >"$MISE_CONFIG_DIR/config.toml" <<'TOML'
+[history.encryption]
+recipients = ["age1fuvsfq02qr5ju0nhh3rulrwracymjljlr5j49kres24ltd3fjq0s9z9d8l"]
+
+[dotfiles]
+"~/.handoff-secret" = { mode = "track", encrypt = true }
+"~/.handoff-plain" = { mode = "track" }
+TOML
+printf 'base-secret\n' >~/.handoff-secret
+printf 'base-plain\n' >~/.handoff-plain
+assert_succeed 'mise dot save'
+assert_succeed "mise dot origin set file://$origin --sync manual --yes"
+assert_succeed 'mise dot sync'
+
+second="$(dirname "$HOME")/handoff-b"
+mkdir -p "$second"
+b() {
+  (
+    cd "$second" || exit
+    env HOME="$second" XDG_CONFIG_HOME="$second/.config" MISE_CONFIG_DIR="$second/.config/mise" \
+      MISE_STATE_DIR="$second/.local/state/mise" MISE_DATA_DIR="$second/.local/share/mise" \
+      MISE_CACHE_DIR="$second/.cache/mise" MISE_TRUSTED_CONFIG_PATHS="$second" mise "$@"
+  )
+}
+export second
+export -f b
+assert_succeed "b bootstrap --adopt file://$origin --yes"
+
+printf 'local-secret\n' >~/.handoff-secret
+printf 'remote-secret\n' >"$second/.handoff-secret"
+printf 'local-plain\n' >~/.handoff-plain
+printf 'remote-plain\n' >"$second/.handoff-plain"
+assert_succeed 'mise dot save'
+assert_succeed 'b dot save'
+assert_succeed 'b dot sync'
+assert_succeed 'mise dot sync'
+
+live="$HOME/.handoff-secret"
+plain="$HOME/.handoff-plain"
+json=$(mise dot conflicts --json)
+assert_contains "printf '%s' '$json'" '"encrypted": true'
+assert_contains "printf '%s' '$json'" '"encrypted": false'
+assert_not_contains "printf '%s' '$json'" 'mise-encrypted-file-v1'
+assert_not_contains "printf '%s' '$json'" 'local-secret'
+assert_not_contains "printf '%s' '$json'" 'remote-secret'
+assert_not_contains "printf '%s' '$json'" '<<<<<<<'
+assert "printf '%s' '$json' | jq -r --arg path '$live' '.[] | select(.path == \$path) | .local.mode'" '100644'
+assert "printf '%s' '$json' | jq -r --arg path '$live' '.[] | select(.path == \$path) | .remote.mode'" '100644'
+assert "printf '%s' '$json' | jq -r --arg path '$live' '.[] | select(.path == \$path) | .base.mode'" '100644'
+take_remote=$(printf '%s' "$json" | jq -r --arg path "$live" '.[] | select(.path == $path) | .resolve.take_remote')
+keep_local=$(printf '%s' "$json" | jq -r --arg path "$live" '.[] | select(.path == $path) | .resolve.keep_local')
+merged=$(printf '%s' "$json" | jq -r --arg path "$live" '.[] | select(.path == $path) | .resolve.merged')
+assert_contains "printf '%s' '$take_remote'" 'mise dot pull --take-remote'
+assert_contains "printf '%s' '$take_remote'" "$live"
+assert_contains "printf '%s' '$take_remote'" --yes
+assert_contains "printf '%s' '$keep_local'" 'mise dot pull --keep-local'
+assert_contains "printf '%s' '$keep_local'" "$live"
+assert_contains "printf '%s' '$merged'" 'mise dot save'
+assert_contains "printf '%s' '$merged'" 'mise dot sync'
+assert_contains "printf '%s' '$merged'" "$live"
+assert_fail "printf '%s' '$json' | jq -e '.[0] | has(\"sides\")'"
+before=$(git --git-dir="$origin" rev-parse main)
+assert_succeed 'mise dot conflicts --json >/dev/null'
+assert "git --git-dir=$origin rev-parse main" "$before"
+# Refuse a symlink while the conflict still exists, so the check is reached.
+ln -s /tmp "$PWD/sides-link"
+assert_fail "mise dot conflicts --json --sides '$PWD/sides-link'" 'symlink'
+assert_fail 'test -e /tmp/conflict-0000-local.txt'
+
+sides="$PWD/handoff-sides"
+sided=$(mise dot conflicts --json --sides "$sides")
+assert "echo $(file_mode "$sides")" '700'
+secret_local=$(printf '%s' "$sided" | jq -r --arg path "$live" '.[] | select(.path == $path) | .sides.local')
+secret_remote=$(printf '%s' "$sided" | jq -r --arg path "$live" '.[] | select(.path == $path) | .sides.remote')
+secret_base=$(printf '%s' "$sided" | jq -r --arg path "$live" '.[] | select(.path == $path) | .sides.base')
+assert "cat '$secret_local'" 'local-secret'
+assert "cat '$secret_remote'" 'remote-secret'
+assert "cat '$secret_base'" 'base-secret'
+assert "echo $(file_mode "$secret_local")" '600'
+assert "echo $(file_mode "$secret_remote")" '600'
+assert "echo $(file_mode "$secret_base")" '600'
+assert_not_contains "cat '$secret_local' '$secret_remote' '$secret_base'" 'mise-encrypted-file-v1'
+assert_not_contains "cat '$secret_local' '$secret_remote' '$secret_base'" '<<<<<<<'
+plain_local=$(printf '%s' "$sided" | jq -r --arg path "$plain" '.[] | select(.path == $path) | .sides.local')
+assert "cat '$plain_local'" 'local-plain'
+assert_contains 'mise dot conflicts' 'local-secret'
+assert_not_contains 'mise dot conflicts' 'mise-encrypted-file-v1'
+
+# The record's merged command saves the live edit, keeps it, and publishes it.
+printf 'merged-secret\n' >~/.handoff-secret
+printf 'merged-plain\n' >~/.handoff-plain
+secret_merged=$(printf '%s' "$sided" | jq -r --arg path "$live" '.[] | select(.path == $path) | .resolve.merged')
+plain_merged=$(printf '%s' "$sided" | jq -r --arg path "$plain" '.[] | select(.path == $path) | .resolve.merged')
+assert_succeed "bash --noprofile --norc -c $(printf '%q' "$secret_merged")"
+assert_succeed "bash --noprofile --norc -c $(printf '%q' "$plain_merged")"
+assert "mise dot conflicts --json | jq -c ." '[]'
+assert_contains "git --git-dir=$origin show main:home/.handoff-secret | head -1" 'mise-encrypted-file-v1'
+assert "git --git-dir=$origin show main:home/.handoff-plain" 'merged-plain'
+# The published secret is an envelope. Prove the origin holds the merged
+# plaintext by pulling it on the other machine.
+assert_succeed 'b dot sync'
+assert_succeed 'b dot pull --yes'
+assert "cat '$second/.handoff-secret'" 'merged-secret'

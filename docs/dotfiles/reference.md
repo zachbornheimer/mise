@@ -281,6 +281,23 @@ any entry or edit is `missing`, `source missing`, `differs`, or
 - Each `orphaned` element has `target`, `group`, and `state`, which is
   `orphaned` or `orphaned_changed`.
 
+## Conflict handoff {#conflict-handoff}
+
+[`mise dot conflicts --json`](/cli/dotfiles/conflicts.html) prints one record
+per sharing conflict and writes nothing. It does not take the sync lock.
+`--sides DIR` writes each present side as plaintext and adds that side's path
+to the record. Encrypted sides are decrypted first; a plain diff and
+`--difftool` use that same plaintext.
+
+- `path` is the absolute live path. `branch_path` is the path in history.
+- `kind` is the conflict kind. `detail` is present only when the conflict has one.
+- `encrypted` is true when any saved side is an encrypted envelope.
+- `local`, `remote`, and `base` each have `present` and `mode`. An absent side has `mode` `absent`. A present side's `mode` is its Git mode, such as `100644` or `100755`.
+- `resolve.take_remote` and `resolve.keep_local` are exact commands that decide the saved conflict, quoting the absolute live path. `resolve.merged` saves the current live file, keeps that saved version, and syncs it. `resolve` is `null` when no command can decide the conflict.
+- The record never includes file content. Only `--sides` writes files.
+
+`--sides` requires a path that does not exist and creates it at mode `0700`. An existing file, directory, or symlink is refused, so plaintext is never written into a directory someone else can read. Each present side is `conflict-NNNN-local.txt`, `conflict-NNNN-remote.txt`, or `conflict-NNNN-base.txt`, where `NNNN` is that conflict's index, created at mode `0600`. An absent side is omitted. The index keeps two history paths from sharing a file.
+
 ## State files {#state-files}
 
 mise keeps records under [`MISE_STATE_DIR`](/directories.html)

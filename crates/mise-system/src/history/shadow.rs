@@ -309,7 +309,7 @@ fn encryption_cache_key(dir: &Path) -> Result<[u8; 32]> {
 }
 
 impl HistoryRepo {
-    pub(crate) const HISTORY_REF: &'static str = "refs/heads/main";
+    pub const HISTORY_REF: &'static str = "refs/heads/main";
     const MATCHER_TRAILER: &'static str = "Mise-History-Matcher: ";
     pub(crate) const RECORD_TRAILER: &'static str = "Mise-History: ";
     /// Nothing mise stores is merged by Git's text merge: an encrypted path
@@ -1392,7 +1392,7 @@ impl HistoryRepo {
             .data)
     }
 
-    pub(crate) fn blob_starts_with(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
+    pub fn blob_starts_with(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
         if self.transient_blob(oid).is_none() && Self::object_id(oid).is_some() {
             return self.blob_starts_with_in(&self.gix()?, oid, prefix);
         }
@@ -2031,7 +2031,7 @@ impl HistoryRepo {
     }
 
     /// The commit a ref points at, if the ref exists.
-    pub(crate) fn ref_oid(&self, name: &str) -> Result<Option<String>> {
+    pub fn ref_oid(&self, name: &str) -> Result<Option<String>> {
         // **Every pull reads these refs dozens of times**, and a Git process
         // apiece made them most of the processes a short pull started. A
         // full ref name gix resolves itself; anything else is a revision
