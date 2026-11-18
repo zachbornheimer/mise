@@ -1099,8 +1099,19 @@ fn prepare(
     status: &mut SyncStatus,
 ) -> Result<Vec<PathPlan>> {
     let shared = &report.objects();
-    let incoming =
-        incoming_tracking(repo, tracked).inspect_err(|error| repository_conflict(status, error))?;
+    // One observation of the heads, and one virtual base when there are
+    // several. Tracking and the file baseline both use it; neither recomputes it.
+    let heads = super::graph::Heads::read(repo)?;
+    // A base conflict is a repository conflict. Computing it inside the
+    // match would return before status records it, and a later caller
+    // would see an empty conflict list for a pause that already happened.
+    let base = enrollment_manifest(repo, &heads).inspect_err(|error| {
+        if heads.local.is_some() && heads.remote.is_some() {
+            repository_conflict(status, error);
+        }
+    })?;
+    let incoming = incoming_tracking_with(repo, tracked, &heads, base.as_ref())
+        .inspect_err(|error| repository_conflict(status, error))?;
     let tracked = &incoming;
     let roots = Roots::current();
     // **A live file that already holds the incoming version has no edit
@@ -1117,7 +1128,6 @@ fn prepare(
     // Git ancestry, not a machine's replaceable acknowledgement cache,
     // determines the shared baseline. Losing local bookkeeping must not
     // turn an ordinary incoming edit into an unrelated adoption conflict.
-    let heads = super::graph::Heads::read(repo)?;
     status.upstream_commit = heads.remote.clone();
     status.pending_repository = match &heads.local {
         Some(local) => {
@@ -1126,7 +1136,7 @@ fn prepare(
         }
         None => heads.remote.is_some(),
     };
-    let repository_tree = incoming_repository_tree(repo, tracked)
+    let repository_tree = incoming_repository_tree_with(repo, tracked, &heads)
         .inspect_err(|error| repository_conflict(status, error))?;
     status.pending_repository |= repository_tree.is_some();
     status.pending_directories = 0;
@@ -1138,6 +1148,10 @@ fn prepare(
     if heads.remote != upstream.commit {
         bail!("origin changed while planning; reconcile again");
     }
+    // File ancestry is a real commit when there is one. Several merge
+    // bases have no single commit, and a tree that holds only the virtual
+    // enrollment is not their file history: reading it as a baseline would
+    // invent an empty file set. Keep the conservative absence instead.
     let baseline = reconcile::upstream(repo, heads.base.as_deref())?;
     let local_manifest = heads
         .local
@@ -1516,29 +1530,201 @@ pub(super) fn eligible(
     }
 }
 
+/// The enrollment both tips descend from, so [`Manifest::merge`] can tell a
+/// change from an addition.
+///
+/// One merge base is that commit's manifest. Several are one virtual
+/// manifest: each pair is merged against the ancestry they share, and that
+/// result is the base the tips are merged against. Nothing is dropped to
+/// make the bases agree, and a pair that cannot be merged is a conflict
+/// naming its path. A pair with no shared ancestry cannot be constructed;
+/// that fails closed and names `mise dot status`, which prints the manual
+/// reconciliation. The result is a manifest. When the merge needs a parent
+/// for the next pair, that parent is an unreferenced commit whose only job
+/// is to keep the accumulated ancestry; it is not a history ref and not a
+/// file baseline.
+pub(super) fn enrollment_base(
+    repo: &crate::history::shadow::HistoryRepo,
+    local: &str,
+    remote: &str,
+) -> Result<crate::history::manifest::Manifest> {
+    enrollment_against(repo, local, remote, &mut EnrollmentCache::default()).wrap_err(
+        "a virtual enrollment base could not be constructed; run `mise dot status` and reconcile the histories it names before syncing",
+    )
+}
+
+fn enrollment_manifest(
+    repo: &crate::history::shadow::HistoryRepo,
+    heads: &super::graph::Heads,
+) -> Result<Option<crate::history::manifest::Manifest>> {
+    match (&heads.local, &heads.remote) {
+        (Some(local), Some(remote)) => Ok(Some(enrollment_base(repo, local, remote)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Pair, base, and manifest reads for one enrollment computation. A nested
+/// criss-cross asks the same question of commits already answered.
+#[derive(Default)]
+struct EnrollmentCache {
+    bases: std::collections::HashMap<(String, String), Vec<String>>,
+    manifests: std::collections::HashMap<String, Option<crate::history::manifest::Manifest>>,
+}
+
+fn enrollment_against(
+    repo: &crate::history::shadow::HistoryRepo,
+    local: &str,
+    remote: &str,
+    cache: &mut EnrollmentCache,
+) -> Result<crate::history::manifest::Manifest> {
+    let bases = cached_bases(repo, local, remote, cache)?;
+    if bases.is_empty() {
+        // Heads::read already refuses unrelated tips before a sync plans.
+        // Reaching here means two merge bases themselves share nothing, which
+        // a user reconciles by hand. `mise dot conflicts` plans through this
+        // same function, so it cannot be the recovery.
+        bail!(
+            "merge bases share no ancestry, so a virtual base cannot be constructed; \
+             run `mise dot status` and reconcile the histories it names before syncing"
+        );
+    }
+    if bases.len() == 1 {
+        return Ok(cached_manifest(repo, &bases[0], cache)?.unwrap_or_default());
+    }
+    let mut paired = Vec::with_capacity(bases.len());
+    for base in &bases {
+        let manifest = cached_manifest(repo, base, cache)?.ok_or_else(|| {
+            eyre::eyre!(
+                "a merge base has no enrollment metadata, so a virtual base cannot be constructed; \
+                 run `mise dot status` and reconcile the histories it names before syncing"
+            )
+        })?;
+        paired.push((base.clone(), manifest));
+    }
+    virtual_enrollment(repo, &paired, cache)
+}
+
+fn cached_bases(
+    repo: &crate::history::shadow::HistoryRepo,
+    local: &str,
+    remote: &str,
+    cache: &mut EnrollmentCache,
+) -> Result<Vec<String>> {
+    let key = if local <= remote {
+        (local.to_string(), remote.to_string())
+    } else {
+        (remote.to_string(), local.to_string())
+    };
+    if let Some(bases) = cache.bases.get(&key) {
+        return Ok(bases.clone());
+    }
+    let bases = repo.merge_bases(local, remote)?;
+    cache.bases.insert(key, bases.clone());
+    Ok(bases)
+}
+
+fn cached_manifest(
+    repo: &crate::history::shadow::HistoryRepo,
+    commit: &str,
+    cache: &mut EnrollmentCache,
+) -> Result<Option<crate::history::manifest::Manifest>> {
+    if let Some(manifest) = cache.manifests.get(commit) {
+        return Ok(manifest.clone());
+    }
+    let manifest = crate::history::manifest::Manifest::read(repo, commit)?;
+    cache.manifests.insert(commit.to_string(), manifest.clone());
+    Ok(manifest)
+}
+
+/// Merge base manifests pairwise against the ancestry each pair shares.
+///
+/// Reducing left to right is safe because [`Manifest::merge`] is the only
+/// rule, and it does not depend on which side is asked first when the two
+/// sides differ: that is a conflict, not a choice. An accumulated result is
+/// written as an unreferenced commit with both parents, so the next pair's
+/// merge-base sees that ancestry instead of an empty id. A pair whose own
+/// bases are several is the same function again.
+fn virtual_enrollment(
+    repo: &crate::history::shadow::HistoryRepo,
+    bases: &[(String, crate::history::manifest::Manifest)],
+    cache: &mut EnrollmentCache,
+) -> Result<crate::history::manifest::Manifest> {
+    use crate::history::manifest::Manifest;
+    let mut reduced: Option<(String, Manifest)> = None;
+    for (index, (commit, manifest)) in bases.iter().enumerate() {
+        let last = index + 1 == bases.len();
+        reduced = Some(match reduced {
+            None => (commit.clone(), manifest.clone()),
+            Some((previous, previous_manifest)) => {
+                let shared = enrollment_against(repo, &previous, commit, cache)?;
+                let merged = Manifest::merge(&shared, &previous_manifest, manifest)?;
+                // The last pair has no later merge-base to answer, so its
+                // parent commit would be written and never read.
+                let accumulated = if last {
+                    String::new()
+                } else {
+                    accumulated_parent(repo, &merged, &previous, commit, cache)?
+                };
+                (accumulated, merged)
+            }
+        });
+    }
+    reduced
+        .map(|(_, manifest)| manifest)
+        .ok_or_else(|| eyre::eyre!("a virtual base needs at least one merge base"))
+}
+
+/// An unreferenced commit whose parents are the two enrollments just merged.
+/// Later pairs ask merge-base against it; nothing stores it as history or
+/// reads its tree as a file baseline.
+fn accumulated_parent(
+    repo: &crate::history::shadow::HistoryRepo,
+    merged: &crate::history::manifest::Manifest,
+    left: &str,
+    right: &str,
+    cache: &mut EnrollmentCache,
+) -> Result<String> {
+    let empty = repo.empty_object("tree")?;
+    let tree = merged.write(repo, &empty)?;
+    let commit = repo.commit_tree(&tree, vec![left, right], "virtual enrollment base")?;
+    cache.manifests.insert(commit.clone(), Some(merged.clone()));
+    Ok(commit)
+}
+
 /// A fresh store gets its explicit inventory from the fetched ordinary branch.
 /// Do not create an unrelated local root just to discover incoming files.
 pub(super) fn incoming_tracking(
     repo: &crate::history::shadow::HistoryRepo,
     tracked: &TrackedSet,
 ) -> Result<TrackedSet> {
-    use crate::history::manifest::Manifest;
     let heads = super::graph::Heads::read(repo)?;
+    let base = enrollment_manifest(repo, &heads)?;
+    incoming_tracking_with(repo, tracked, &heads, base.as_ref())
+}
+
+fn incoming_tracking_with(
+    repo: &crate::history::shadow::HistoryRepo,
+    tracked: &TrackedSet,
+    heads: &super::graph::Heads,
+    base: Option<&crate::history::manifest::Manifest>,
+) -> Result<TrackedSet> {
+    use crate::history::manifest::Manifest;
     let Some(remote) = &heads.remote else {
         return Ok(tracked.clone());
     };
     let remote = Manifest::read(repo, remote)?
         .ok_or_else(|| eyre::eyre!("setup repository has no enrollment metadata"))?;
-    let manifest = match (&heads.local, &heads.base) {
-        (None, _) => remote,
-        (Some(local), Some(base)) => Manifest::merge(
-            &Manifest::read(repo, base)?.unwrap_or_default(),
+    let manifest = match &heads.local {
+        None => remote,
+        Some(local) => Manifest::merge(
+            base.ok_or_else(|| {
+                eyre::eyre!(
+                "enrollment base was not computed; run `mise dot status` and reconcile the histories it names before syncing"
+                )
+            })?,
             &Manifest::read(repo, local)?.unwrap_or_default(),
             &remote,
         )?,
-        (Some(_), None) => bail!(
-            "multiple merge bases require explicit Git reconciliation before applying enrollment"
-        ),
     };
     let mut incoming = manifest.tracking()?;
     incoming.required_sources = tracked.required_sources.clone();
@@ -1556,7 +1742,14 @@ pub(super) fn incoming_repository_tree(
     repo: &crate::history::shadow::HistoryRepo,
     tracked: &TrackedSet,
 ) -> Result<Option<String>> {
-    let heads = super::graph::Heads::read(repo)?;
+    incoming_repository_tree_with(repo, tracked, &super::graph::Heads::read(repo)?)
+}
+
+fn incoming_repository_tree_with(
+    repo: &crate::history::shadow::HistoryRepo,
+    tracked: &TrackedSet,
+    heads: &super::graph::Heads,
+) -> Result<Option<String>> {
     let (Some(local), Some(remote)) = (&heads.local, &heads.remote) else {
         return Ok(None);
     };
@@ -2542,5 +2735,418 @@ mod tests {
             &exclude,
             "home/.sample/nested/leave"
         ));
+    }
+}
+
+#[cfg(test)]
+mod enrollment_base_tests {
+    use super::*;
+    use crate::history::manifest::{Enrollment, Manifest, PATH};
+    use crate::history::shadow::HistoryRepo;
+
+    fn enrollment(path: &str, autosave: bool) -> Enrollment {
+        Enrollment {
+            path: path.into(),
+            autosave,
+            encrypt: false,
+            allow_plaintext: None,
+            variants: vec![],
+            exclude: None,
+            include: None,
+        }
+    }
+
+    fn manifest(entries: Vec<Enrollment>) -> Manifest {
+        Manifest {
+            enrollment: entries,
+            ..Default::default()
+        }
+    }
+
+    /// A commit whose only content is enrollment metadata.
+    fn commit(repo: &HistoryRepo, parents: &[&str], manifest: &Manifest) -> Result<String> {
+        let empty = repo.empty_object("tree")?;
+        let tree = manifest.write(repo, &empty)?;
+        repo.commit_tree(&tree, parents.to_vec(), "enrollment")
+    }
+
+    /// Criss-cross: root, then A and B, then each side merges the other.
+    /// The two merges are the only merge bases of the resulting tips.
+    fn criss_cross(
+        repo: &HistoryRepo,
+        root: &Manifest,
+        left: &Manifest,
+        right: &Manifest,
+        local_tip: &Manifest,
+        remote_tip: &Manifest,
+    ) -> Result<()> {
+        let root = commit(repo, &[], root)?;
+        let left = commit(repo, &[&root], left)?;
+        let right = commit(repo, &[&root], right)?;
+        let local = commit(repo, &[&left, &right], local_tip)?;
+        let remote = commit(repo, &[&right, &left], remote_tip)?;
+        repo.update_ref(HistoryRepo::HISTORY_REF, &local, None)?;
+        repo.update_ref(UPSTREAM_REF, &remote, None)?;
+        let bases = repo.merge_bases(&local, &remote)?;
+        eyre::ensure!(
+            bases.len() == 2 && bases.contains(&left) && bases.contains(&right),
+            "fixture is not a criss-cross: {bases:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enrollment_with_several_merge_bases() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = HistoryRepo::open_or_init_in(temp.path())?.unwrap();
+        criss_cross(
+            &repo,
+            &manifest(vec![enrollment("home/.shared", true)]),
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-left", true),
+            ]),
+            &manifest(vec![
+                enrollment("home/.shared", false),
+                enrollment("home/.from-right", true),
+            ]),
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-left", true),
+                enrollment("home/.from-right", true),
+                enrollment("home/.local-only", true),
+            ]),
+            &manifest(vec![
+                enrollment("home/.shared", false),
+                enrollment("home/.from-left", true),
+                enrollment("home/.from-right", true),
+                enrollment("home/.remote-only", true),
+            ]),
+        )?;
+
+        let incoming = incoming_tracking(&repo, &TrackedSet::default())?;
+        let paths = incoming
+            .manifest
+            .enrollment
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.autosave))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                ("home/.from-left", true),
+                ("home/.from-right", true),
+                ("home/.local-only", true),
+                ("home/.remote-only", true),
+                ("home/.shared", true),
+            ],
+            "independent additions survive; the base is false, the local tip changed it to true, and the remote tip left the base value, so the result is true"
+        );
+        assert!(
+            incoming_repository_tree(&repo, &incoming)?.is_some(),
+            "several bases are not a fast-forward, so the repository tree is still merged"
+        );
+        assert!(
+            repo.ref_oid(HistoryRepo::HISTORY_REF)?.is_some(),
+            "computing the base writes no history"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enrollment_conflict_across_two_bases_names_the_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = HistoryRepo::open_or_init_in(temp.path())?.unwrap();
+        // Each base changed `.shared` a different way, and neither tip
+        // restates it, so the conflict is between the bases themselves.
+        criss_cross(
+            &repo,
+            &manifest(vec![enrollment("home/.shared", true)]),
+            &manifest(vec![enrollment("home/.shared", false)]),
+            &manifest(vec![]),
+            &manifest(vec![enrollment("home/.local-only", true)]),
+            &manifest(vec![enrollment("home/.remote-only", true)]),
+        )?;
+
+        let error = incoming_tracking(&repo, &TrackedSet::default()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("home/.shared"),
+            "a real enrollment conflict names its path, got {message}"
+        );
+        assert!(
+            !message.contains("home/.local-only") && !message.contains("home/.remote-only"),
+            "an independent addition is not reported as the conflict, got {message}"
+        );
+        let mut status = SyncStatus::default();
+        repository_conflict(&mut status, &error);
+        assert_eq!(
+            status.conflicts[0].branch_path, PATH,
+            "the conflict is reported through the repository conflict, not dropped"
+        );
+        assert!(
+            status
+                .validation_error
+                .as_deref()
+                .is_some_and(|text| text.contains("home/.shared")),
+            "status keeps the path the merge named"
+        );
+        Ok(())
+    }
+
+    /// Each of the two merge bases is itself a criss-cross, so the pair
+    /// has two common bases. Recursion has to merge that inner pair; a
+    /// walk that only descends one side never asks.
+    #[test]
+    fn a_nested_criss_cross_merges_bases_that_themselves_have_two_bases() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = HistoryRepo::open_or_init_in(temp.path())?.unwrap();
+        let root = commit(
+            &repo,
+            &[],
+            &manifest(vec![enrollment("home/.shared", true)]),
+        )?;
+        let west = commit(
+            &repo,
+            &[&root],
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-west", true),
+            ]),
+        )?;
+        let east = commit(
+            &repo,
+            &[&root],
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-east", true),
+            ]),
+        )?;
+        let left = commit(
+            &repo,
+            &[&west, &east],
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-west", true),
+                enrollment("home/.from-east", true),
+            ]),
+        )?;
+        let right = commit(
+            &repo,
+            &[&east, &west],
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-west", true),
+                enrollment("home/.from-east", true),
+                enrollment("home/.from-right", true),
+            ]),
+        )?;
+        let local = commit(
+            &repo,
+            &[&left, &right],
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-west", true),
+                enrollment("home/.from-east", true),
+                enrollment("home/.from-right", true),
+                enrollment("home/.local-only", true),
+            ]),
+        )?;
+        let remote = commit(
+            &repo,
+            &[&right, &left],
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-west", true),
+                enrollment("home/.from-east", true),
+                enrollment("home/.from-right", true),
+                enrollment("home/.remote-only", true),
+            ]),
+        )?;
+        repo.update_ref(HistoryRepo::HISTORY_REF, &local, None)?;
+        repo.update_ref(UPSTREAM_REF, &remote, None)?;
+        let bases = repo.merge_bases(&local, &remote)?;
+        assert_eq!(bases.len(), 2, "tips have two merge bases: {bases:?}");
+        for base in &bases {
+            let other = bases.iter().find(|candidate| *candidate != base).unwrap();
+            let inner = repo.merge_bases(base, other)?;
+            assert_eq!(
+                inner.len(),
+                2,
+                "merge bases {base} and {other} themselves have two bases: {inner:?}"
+            );
+            assert!(inner.contains(&west) && inner.contains(&east));
+        }
+
+        let incoming = incoming_tracking(&repo, &TrackedSet::default())?;
+        let paths: Vec<_> = incoming
+            .manifest
+            .enrollment
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "home/.from-east",
+                "home/.from-right",
+                "home/.from-west",
+                "home/.local-only",
+                "home/.remote-only",
+                "home/.shared",
+            ],
+            "additions from both inner bases survive the recursive merge"
+        );
+        Ok(())
+    }
+
+    /// Three merge bases. The accumulated parent of the first pair must
+    /// stay a real commit, or the third base is asked against an empty id.
+    #[test]
+    fn enrollment_with_three_merge_bases_keeps_each_independent_addition() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = HistoryRepo::open_or_init_in(temp.path())?.unwrap();
+        let root = commit(
+            &repo,
+            &[],
+            &manifest(vec![enrollment("home/.shared", true)]),
+        )?;
+        let added = |name: &str| {
+            manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment(name, true),
+            ])
+        };
+        let first = commit(&repo, &[&root], &added("home/.from-first"))?;
+        let second = commit(&repo, &[&root], &added("home/.from-second"))?;
+        let third = commit(&repo, &[&root], &added("home/.from-third"))?;
+        let combined = manifest(vec![
+            enrollment("home/.shared", true),
+            enrollment("home/.from-first", true),
+            enrollment("home/.from-second", true),
+            enrollment("home/.from-third", true),
+        ]);
+        let mut local_entries = combined.enrollment.clone();
+        local_entries.push(enrollment("home/.local-only", true));
+        let mut remote_entries = combined.enrollment.clone();
+        remote_entries.push(enrollment("home/.remote-only", true));
+        let local = commit(&repo, &[&first, &second, &third], &manifest(local_entries))?;
+        let remote = commit(&repo, &[&third, &first, &second], &manifest(remote_entries))?;
+        repo.update_ref(HistoryRepo::HISTORY_REF, &local, None)?;
+        repo.update_ref(UPSTREAM_REF, &remote, None)?;
+        assert_eq!(repo.merge_bases(&local, &remote)?.len(), 3);
+
+        let incoming = incoming_tracking(&repo, &TrackedSet::default())?;
+        let paths: Vec<_> = incoming
+            .manifest
+            .enrollment
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "home/.from-first",
+                "home/.from-second",
+                "home/.from-third",
+                "home/.local-only",
+                "home/.remote-only",
+                "home/.shared",
+            ],
+            "each of the three bases contributes its addition"
+        );
+        assert_eq!(
+            repo.ref_oid(HistoryRepo::HISTORY_REF)?.as_deref(),
+            Some(local.as_str()),
+            "the accumulated parent is unreferenced and does not move history"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_bases_without_shared_ancestry_fail_closed_and_name_status() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = HistoryRepo::open_or_init_in(temp.path())?.unwrap();
+        let left_root = commit(&repo, &[], &manifest(vec![enrollment("home/.left", true)]))?;
+        let right_root = commit(&repo, &[], &manifest(vec![enrollment("home/.right", true)]))?;
+        let left = commit(
+            &repo,
+            &[&left_root],
+            &manifest(vec![enrollment("home/.left", true)]),
+        )?;
+        let right = commit(
+            &repo,
+            &[&right_root],
+            &manifest(vec![enrollment("home/.right", true)]),
+        )?;
+        let local = commit(
+            &repo,
+            &[&left, &right],
+            &manifest(vec![enrollment("home/.left", true)]),
+        )?;
+        let remote = commit(
+            &repo,
+            &[&right, &left],
+            &manifest(vec![enrollment("home/.right", true)]),
+        )?;
+        repo.update_ref(HistoryRepo::HISTORY_REF, &local, None)?;
+        repo.update_ref(UPSTREAM_REF, &remote, None)?;
+        assert_eq!(repo.merge_bases(&local, &remote)?.len(), 2);
+        assert!(
+            repo.merge_bases(&left, &right)?.is_empty(),
+            "the two bases must share no ancestry"
+        );
+
+        let error = incoming_tracking(&repo, &TrackedSet::default()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("mise dot status"),
+            "recovery names status, which can print the reconciliation, got {message}"
+        );
+        assert!(
+            !message.contains("mise dot conflicts"),
+            "conflicts plans through the same failing code, got {message}"
+        );
+        assert!(
+            message.contains("no ancestry"),
+            "the failure says why a virtual base cannot be built, got {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_records_a_base_conflict_before_returning() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = crate::history::checkpoint::Store::open_in(temp.path())?;
+        let repo = store.repo().unwrap();
+        criss_cross(
+            repo,
+            &manifest(vec![enrollment("home/.shared", true)]),
+            &manifest(vec![enrollment("home/.shared", false)]),
+            &manifest(vec![]),
+            &manifest(vec![enrollment("home/.local-only", true)]),
+            &manifest(vec![enrollment("home/.remote-only", true)]),
+        )?;
+        let mut status = SyncStatus::default();
+        let error = refresh(&store, &TrackedSet::default(), &mut status).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("home/.shared"),
+            "refresh returns the named path conflict, got {message}"
+        );
+        assert!(
+            status.pending_repository,
+            "a base conflict is a repository conflict, not an empty plan"
+        );
+        assert_eq!(status.conflicts[0].branch_path, PATH);
+        assert!(
+            status
+                .validation_error
+                .as_deref()
+                .is_some_and(|text| text.contains("home/.shared")),
+            "status was filled before planning returned, got {:?}",
+            status.validation_error
+        );
+        Ok(())
     }
 }
