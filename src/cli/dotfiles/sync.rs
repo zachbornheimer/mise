@@ -55,7 +55,7 @@ impl DotfilesSync {
         if !crate::config::Settings::get().history.enabled {
             bail!("history is disabled (history.enabled = false)");
         }
-        let (store, tracked, _) = super::history::open().await?;
+        let (store, tracked) = super::history::open_store().await?;
         if let Some(reason) = store.unavailable() {
             bail!("cannot synchronize: {reason}");
         }

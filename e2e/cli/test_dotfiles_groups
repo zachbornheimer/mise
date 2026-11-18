@@ -239,7 +239,7 @@ target = "~/.config"
 EOF
 assert_contains "mise dot status 2>&1" "must be inside the group's target"
 # nor onto the group's target itself
-sed -i 's|target = "~/.elsewhere"|target = "~/.config"|' mise.toml
+sed -i.bak 's|target = "~/.elsewhere"|target = "~/.config"|' mise.toml
 assert_contains "mise dot status 2>&1" "must be inside the group's target"
 
 # Removal works under a target whose parent directory is a symlink.

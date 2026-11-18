@@ -32,6 +32,10 @@ pub type Object = (String, String);
 pub(crate) struct Upstream {
     pub commit: Option<String>,
     pub files: BTreeMap<String, Object>,
+    /// Encrypt-declared paths whose origin version is not an encrypted
+    /// envelope, with that version and the commit that introduced it. They
+    /// are never applied or merged here: each is its own conflict.
+    pub plaintext: BTreeMap<String, (Object, String)>,
 }
 
 pub(crate) fn upstream(repo: &HistoryRepo, commit: Option<&str>) -> Result<Upstream> {
@@ -52,24 +56,41 @@ pub(crate) fn upstream_with_interaction(
     // not be listed as locked.
     let mut locked: Vec<String> = vec![];
     let mut first_locked = None;
+    let mut plaintext = BTreeMap::new();
     if let Some(commit) = commit {
+        // the listing already holds each entry's mode and object: looking
+        // every path up again cost a tree walk per file
         for entry in repo.ls_tree(commit)? {
-            if let Some((mode, oid)) = repo.object_at(commit, &entry.path)? {
-                let object = if encrypted.contains(&entry.path) {
-                    match super::files::decrypt(repo, &entry.path, &(mode, oid), interactive) {
-                        Ok(object) => object,
-                        Err(err) if err.downcast_ref::<super::files::Locked>().is_some() => {
-                            locked.push(entry.path);
-                            first_locked.get_or_insert(err);
-                            continue;
-                        }
-                        Err(err) => return Err(err),
+            let listed = (entry.mode, entry.oid);
+            let object = if encrypted.contains(&entry.path) {
+                match super::files::decrypt(repo, &entry.path, &listed, interactive) {
+                    Ok(object) => object,
+                    Err(err) if err.downcast_ref::<super::files::Locked>().is_some() => {
+                        locked.push(entry.path);
+                        first_locked.get_or_insert(err);
+                        continue;
                     }
-                } else {
-                    (mode, oid)
-                };
-                files.insert(entry.path, object);
-            }
+                    // A plaintext version of an encrypted path is one path's
+                    // problem, not the setup repository's: it becomes a conflict
+                    // this machine resolves with `--take-remote` or
+                    // `--keep-local` for that path, instead of failing every
+                    // sync and pull on it.
+                    Err(err)
+                        if err
+                            .downcast_ref::<super::files::PlaintextInEncryptedPath>()
+                            .is_some() =>
+                    {
+                        let introduced = super::files::plaintext_commit(repo, commit, &entry.path)?
+                            .unwrap_or_else(|| commit.to_string());
+                        plaintext.insert(entry.path.clone(), (listed.clone(), introduced));
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                }
+            } else {
+                listed
+            };
+            files.insert(entry.path, object);
         }
     }
     if let Some(err) = first_locked {
@@ -85,6 +106,7 @@ pub(crate) fn upstream_with_interaction(
     Ok(Upstream {
         commit: commit.map(str::to_string),
         files,
+        plaintext,
     })
 }
 
@@ -111,6 +133,10 @@ pub enum ConflictKind {
     UnsavedEdits,
     /// The incoming configuration cannot be applied safely.
     InvalidIncoming,
+    /// The origin holds a plaintext version of a path this profile encrypts.
+    /// Taking it writes that version here (the next save re-encrypts it);
+    /// keeping this machine's version publishes the encrypted one.
+    PlaintextUpstream,
     /// A user checkout has staged changes that must not be overwritten.
     StagedEdits,
     /// The path on this machine cannot stand in for a shared file at all:
@@ -133,6 +159,9 @@ impl ConflictKind {
             Self::Binary => "both sides changed a binary file",
             Self::UnsavedEdits => "unsaved edits: save or discard them first",
             Self::InvalidIncoming => "incoming configuration is invalid; correct it upstream",
+            Self::PlaintextUpstream => {
+                "the origin holds a plaintext version of a path this profile encrypts"
+            }
             Self::StagedEdits => "staged git changes: commit or unstage them first",
             Self::UnusableLive => {
                 "a directory or unreadable path stands where the repository has a file"
@@ -151,6 +180,10 @@ pub struct Conflict {
     pub remote: Option<Object>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<Object>,
+    /// The reason in this conflict's own terms: what the origin holds and
+    /// the one command that decides it. Absent when `kind` says it all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Why sync neither applies nor removes a nested repository: the pointer
@@ -215,6 +248,7 @@ pub(crate) fn reconcile(
     let mut paths: BTreeSet<&String> = BTreeSet::new();
     paths.extend(shared.keys());
     paths.extend(upstream.files.keys());
+    paths.extend(upstream.plaintext.keys());
     paths.extend(state.keys());
     let mut plans = vec![];
     for branch_path in paths {
@@ -233,6 +267,29 @@ pub(crate) fn reconcile(
         let (s_version, t_version) = (version(s), version(t));
         let a = record.acknowledged.clone();
         let u = record.reconciled.clone();
+
+        // An origin version of an encrypted path that is not an envelope is
+        // neither ciphertext this machine can write nor text it can merge.
+        // It is one path's decision, so every sync reports it and no other
+        // path waits on it; the commit that introduced it is named, and one
+        // command per path decides it.
+        if let Some((raw, introduced)) = upstream.plaintext.get(branch_path) {
+            let path = crate::history::tracked::tree_path_to_display(branch_path);
+            plan.conflict = Some(Conflict {
+                branch_path: branch_path.clone(),
+                kind: ConflictKind::PlaintextUpstream,
+                local: s_version,
+                remote: Some(raw.clone()),
+                base: a,
+                detail: Some(format!(
+                    "origin commit {commit} holds a plaintext version of {path}, a path this profile encrypts; take it with `mise dot pull --take-remote {path}` (the next save re-encrypts it), or publish this machine's encrypted version with `mise dot pull --keep-local {path}`",
+                    commit = crate::history::short(introduced),
+                    path = path,
+                )),
+            });
+            plans.push(plan);
+            continue;
+        }
 
         if s_version == t_version {
             plan.next.acknowledged = s_version.clone();
@@ -283,6 +340,7 @@ pub(crate) fn reconcile(
                         local: s_version,
                         remote: t_version,
                         base: None,
+                        detail: None,
                     });
                 }
                 (None, None) => {}
@@ -313,6 +371,7 @@ pub(crate) fn reconcile(
                             local: s_version,
                             remote: t_version,
                             base: a,
+                            detail: None,
                         });
                     } else {
                         plan.apply = Some(t.cloned());
@@ -333,6 +392,7 @@ pub(crate) fn reconcile(
                         local: s_version,
                         remote: t_version,
                         base: a,
+                        detail: None,
                     });
                 } else {
                     plan.apply = Some(t.cloned());
@@ -354,6 +414,7 @@ pub(crate) fn reconcile(
                                 local: s_version.clone(),
                                 remote: t_version,
                                 base: a,
+                                detail: None,
                             });
                             plan.publish = None;
                         } else if object_version == s_version {
@@ -376,6 +437,7 @@ pub(crate) fn reconcile(
                             local: s_version,
                             remote: t_version,
                             base: a,
+                            detail: None,
                         });
                     }
                 }
@@ -485,6 +547,97 @@ mod tests {
 
     fn obj(oid: &str) -> Object {
         ("100644".to_string(), oid.to_string())
+    }
+
+    /// An origin version of an encrypted path that is not an envelope must
+    /// not fail the whole sync: it is that path's own conflict, and the
+    /// commit that introduced it plus one command decide it.
+    #[test]
+    fn plaintext_origin_version_of_an_encrypted_path_is_a_per_path_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let plain = repo.hash_blob(b"secret contents").unwrap();
+        let tree = repo
+            .write_tree(&[("100644".into(), plain.clone(), "home/secret".into())])
+            .unwrap();
+        let introduced = repo
+            .commit_tree(&tree, vec![], "saved without encryption")
+            .unwrap();
+        let mut shared = BTreeMap::new();
+        shared.insert(
+            "home/secret".to_string(),
+            (
+                "100644".into(),
+                repo.hash_blob(b"mise-encrypted-file-v1\n..").unwrap(),
+            ),
+        );
+        let mut plaintext = BTreeMap::new();
+        plaintext.insert(
+            "home/secret".to_string(),
+            (("100644".into(), plain), introduced.clone()),
+        );
+        let upstream = Upstream {
+            commit: Some(introduced.clone()),
+            files: BTreeMap::new(),
+            plaintext,
+        };
+        let plans = reconcile(
+            &repo,
+            &shared,
+            &upstream,
+            &SyncState::default(),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let conflict = plans
+            .iter()
+            .find_map(|plan| plan.conflict.clone())
+            .expect("the plaintext origin version is a conflict");
+        assert_eq!(conflict.kind, ConflictKind::PlaintextUpstream);
+        let detail = conflict
+            .detail
+            .expect("detail names the commit and the fix");
+        assert!(
+            detail.contains(&crate::history::short(&introduced)),
+            "{detail}"
+        );
+        assert!(detail.contains("mise dot pull --take-remote"), "{detail}");
+        assert!(detail.contains("mise dot pull --keep-local"), "{detail}");
+    }
+
+    /// A plaintext version of an encrypted path on the origin is collected
+    /// per path with the commit that introduced it, instead of aborting the
+    /// read of every other incoming path.
+    #[test]
+    fn upstream_collects_a_plaintext_encrypted_path_instead_of_failing() {
+        use crate::history::manifest::{Enrollment, Manifest};
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let plain = repo.hash_blob(b"secret contents").unwrap();
+        let tree = repo
+            .write_tree(&[("100644".into(), plain, "home/secret".into())])
+            .unwrap();
+        let manifest = Manifest {
+            enrollment: vec![Enrollment {
+                path: "home/secret".into(),
+                autosave: true,
+                encrypt: true,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            }],
+            ..Default::default()
+        };
+        let tree = manifest.write(&repo, &tree).unwrap();
+        let commit = repo.commit_tree(&tree, vec![], "plaintext origin").unwrap();
+        let upstream = upstream_with_interaction(&repo, Some(&commit), false).unwrap();
+        let (_, introduced) = upstream
+            .plaintext
+            .get("home/secret")
+            .expect("the plaintext version is reported, not an error");
+        assert_eq!(*introduced, commit);
+        assert!(!upstream.files.contains_key("home/secret"));
     }
 
     #[test]
@@ -605,6 +758,7 @@ mod tests {
                     &Upstream {
                         files: [("tracked/home/script".into(), theirs)].into(),
                         commit: None,
+                        ..Default::default()
                     },
                     &[("tracked/home/script".into(), state)].into(),
                     &BTreeSet::new(),
@@ -630,6 +784,7 @@ mod tests {
         let incoming = Upstream {
             files: [(path.clone(), pointer)].into(),
             commit: Some("pointer-head".into()),
+            ..Default::default()
         };
         // Cover both an absent path and a file that remains unchanged while
         // the upstream version temporarily becomes an unsupported gitlink.
@@ -658,6 +813,7 @@ mod tests {
             let files = Upstream {
                 files: [(path.clone(), obj("new-file"))].into(),
                 commit: Some("files-head".into()),
+                ..Default::default()
             };
             let next = reconcile(&repo, &shared, &files, &state, &BTreeSet::new()).unwrap();
             assert!(next[0].conflict.is_none());
@@ -676,6 +832,7 @@ mod tests {
         let upstream = Upstream {
             files: [(path(), pointer("aaaa"))].into(),
             commit: Some("upstream".into()),
+            ..Default::default()
         };
         let plans = reconcile(
             &repo,
@@ -709,6 +866,7 @@ mod tests {
         let upstream = Upstream {
             files: BTreeMap::new(),
             commit: Some("upstream".into()),
+            ..Default::default()
         };
         let state = [(
             path(),
@@ -730,6 +888,7 @@ mod tests {
         let upstream = Upstream {
             files: [(path(), pointer("aaaa"))].into(),
             commit: Some("upstream".into()),
+            ..Default::default()
         };
         let state = [(path(), rec(Some("plain"), Some("plain"), Some("plain")))].into();
         let plans = reconcile(&repo, &plain, &upstream, &state, &BTreeSet::new()).unwrap();
@@ -753,6 +912,7 @@ mod tests {
         let upstream = Upstream {
             files: [(path(), pointer("aaaa"))].into(),
             commit: Some("upstream".into()),
+            ..Default::default()
         };
         let plans =
             reconcile(&repo, &plain, &upstream, &BTreeMap::new(), &BTreeSet::new()).unwrap();
@@ -763,6 +923,7 @@ mod tests {
         let upstream = Upstream {
             files: [(path(), pointer("bbbb"))].into(),
             commit: Some("upstream".into()),
+            ..Default::default()
         };
         let plans = reconcile(
             &repo,
@@ -785,6 +946,7 @@ mod tests {
         let upstream = Upstream {
             files: [("tracked/home/script".into(), base)].into(),
             commit: None,
+            ..Default::default()
         };
         let state = [(
             "tracked/home/script".into(),
@@ -836,6 +998,7 @@ mod tests {
                 .iter()
                 .map(|(p, o)| (p.to_string(), obj(o)))
                 .collect(),
+            ..Default::default()
         };
         let state: SyncState = state
             .iter()

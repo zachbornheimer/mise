@@ -283,12 +283,124 @@ fn head_moved(
 
 /// Runs one synchronization.
 pub fn sync(store: &Store, tracked: &TrackedSet, request: &SyncRequest) -> Result<SyncOutcome> {
+    let asked = chrono::Utc::now();
     let _sync_lock = if request.queue {
-        lock_queued(store, request.wait)?
+        match lock_in(store.state_dir()) {
+            Ok(lock) => lock,
+            Err(_) => match wait_in_line(store, tracked, request, asked)? {
+                Queued::Lock(lock) => lock,
+                Queued::Served(outcome) => return Ok(outcome),
+            },
+        }
     } else {
         lock(store)?
     };
     sync_locked(store, tracked, request)
+}
+
+enum Queued {
+    Lock(fslock::LockFile),
+    Served(SyncOutcome),
+}
+
+/// Waits for the sync lock behind a running sync, and stops waiting as soon
+/// as a sync that began after this one was asked has published what this
+/// machine had saved when it was asked. The lock is not first come, first
+/// served: polling waiters race for it, and one could lose to newer syncs
+/// until its wait ran out although each of them had already done its work.
+/// Checking while waiting needs no lock: `sync.json` is replaced
+/// atomically, and a sync writes it once, when it is done.
+fn wait_in_line(
+    store: &Store,
+    tracked: &TrackedSet,
+    request: &SyncRequest,
+    asked: chrono::DateTime<chrono::Utc>,
+) -> Result<Queued> {
+    // a dry run, an offline sync and a sync to another origin are not the
+    // sync whose result another one reports, so they only wait
+    let may_be_covered = !request.dry_run && !request.offline && request.origin.is_none();
+    // what this sync must publish is what is saved now, so save the live
+    // files first, as the sync itself would (skipped while another write
+    // operation holds the files, exactly as the sync would skip it)
+    if may_be_covered && request.capture {
+        capture_now(store, tracked);
+    }
+    let pinned = store
+        .repo()
+        .map(|repo| repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF))
+        .transpose()?
+        .flatten();
+    let publishes = SyncMode::current()?.publishes() && !request.fetch_only;
+    let wait = request
+        .wait
+        .unwrap_or_else(crate::history::scope::operation_lock_wait);
+    let deadline = Instant::now() + wait;
+    let mut seen_fetch = None;
+    loop {
+        if let Some(lock) = mise_util::lock_file::LockFile::at(&lock_path(store.state_dir()))
+            .with_pid()
+            .try_lock()?
+        {
+            return Ok(Queued::Lock(lock));
+        }
+        let status = read_status(store.state_dir())?;
+        if may_be_covered && status.last_fetch != seen_fetch {
+            seen_fetch = status.last_fetch.clone();
+            if let Some(outcome) = covered(store, &status, asked, pinned.as_deref(), publishes)? {
+                debug!("history sync: a sync that began after this one covered it");
+                return Ok(Queued::Served(outcome));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(contended(store.state_dir(), Some(wait)));
+        }
+        std::thread::sleep(STATUS_LOCK_POLL);
+    }
+}
+
+/// Whether the sync that last wrote `status` did this sync's work: it
+/// fetched after this sync was asked, succeeded, and (when this sync would
+/// publish) the origin holds `pinned`, the newest checkpoint saved when this
+/// sync was asked.
+fn covered(
+    store: &Store,
+    status: &SyncStatus,
+    asked: chrono::DateTime<chrono::Utc>,
+    pinned: Option<&str>,
+    publishes: bool,
+) -> Result<Option<SyncOutcome>> {
+    let fetched_since_asked = status
+        .last_fetch
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|at| at >= asked);
+    if !fetched_since_asked || status.last_error.is_some() {
+        return Ok(None);
+    }
+    if publishes && let Some(pinned) = pinned {
+        let Some(repo) = store.repo() else {
+            return Ok(None);
+        };
+        let Some(upstream) = repo.ref_oid(UPSTREAM_REF)? else {
+            return Ok(None);
+        };
+        if upstream != pinned
+            && !repo
+                .merge_bases(pinned, &upstream)?
+                .iter()
+                .any(|base| base == pinned)
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(SyncOutcome {
+        published: None,
+        pending: status.pending_applications.len() + usize::from(status.pending_repository),
+        pending_repository: status.pending_repository,
+        pending_directories: status.pending_directories,
+        conflicts: status.conflicts.len(),
+        fetched_upstream: status.upstream_commit.clone(),
+    }))
 }
 
 /// Runs one synchronization while the caller holds the sync lock.
@@ -389,7 +501,20 @@ pub(crate) fn sync_locked(
             // publishing past it is unsafe and failing wastes the whole sync.
             // Read the history again and plan again instead. Re-planning is not
             // a rejected push, so it does not spend the push retries.
-            if head_moved(repo, &shared)? {
+            if head_moved(repo, &shared)?
+                && !shared.checkpoint.as_deref().is_some_and(|pinned| {
+                    publish::fast_forwards(
+                        repo,
+                        pinned,
+                        repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)
+                            .ok()
+                            .flatten()
+                            .as_deref(),
+                        upstream_commit.as_deref(),
+                    )
+                    .unwrap_or(false)
+                })
+            {
                 replans += 1;
                 if replans > REPLAN_LIMIT {
                     bail!(
@@ -685,6 +810,17 @@ pub(crate) fn contended(state_dir: &Path, waited: Option<Duration>) -> eyre::Rep
     }
 }
 
+/// Whether a sync or pull holds the sync lock right now. A reader that only
+/// looks at `sync.json` and the fetched objects takes no lock: the record is
+/// replaced atomically and the objects are immutable, so the worst a running
+/// sync does is make what the reader shows out of date. This lets the reader
+/// say so instead of queueing behind a network round trip.
+pub fn sync_running(store: &Store) -> bool {
+    matches!(
+        mise_util::lock_file::LockFile::at(&lock_path(store.state_dir())).try_lock(),
+        Ok(None)
+    )
+}
 pub(crate) fn lock_in(state_dir: &Path) -> Result<fslock::LockFile> {
     mise_util::lock_file::LockFile::at(&lock_path(state_dir))
         .with_pid()
@@ -969,6 +1105,10 @@ fn prepare(
                 })
                 .map(|(path, object)| (path.clone(), object.clone()))
                 .collect(),
+            // never filtered: an origin plaintext version of an encrypted
+            // path is reported for every such path the incoming config
+            // declares, whether or not this machine selects it
+            plaintext: upstream.plaintext.clone(),
         };
         let mut plans = reconcile::reconcile(repo, shared, &selected, &sync_state, unsaved)?;
         // Old acknowledgements are not authority to delete a path this
@@ -1029,6 +1169,7 @@ fn prepare(
                         local: shared.get(&plan.branch_path).cloned(),
                         remote: upstream.files.get(&plan.branch_path).cloned(),
                         base: plan.next.acknowledged.clone(),
+                        detail: None,
                     });
                     plan.publish = None;
                 }
@@ -1061,6 +1202,7 @@ fn repository_conflict(status: &mut SyncStatus, error: &eyre::Report) {
         local: None,
         remote: None,
         base: None,
+        detail: None,
     }];
 }
 
@@ -1233,6 +1375,7 @@ fn apply_resolutions(
                 local: shared.get(&plan.branch_path).cloned(),
                 remote: upstream.files.get(&plan.branch_path).cloned(),
                 base: plan.next.acknowledged.clone(),
+                detail: None,
             });
             plan.publish = None;
         }
@@ -1345,10 +1488,22 @@ pub(super) fn incoming_repository_tree(
         return Ok(None);
     }
     let (merged, conflicts) = repo.merge_tree(local, remote)?;
+    // Settling replaces Git's version of a conflicted path, so the merged tree
+    // can equal the saved one; the merge still happened, and its tree is the
+    // one to adopt.
+    let merged_conflicts = !conflicts.is_empty();
+    let (merged, conflicts) = settle_conflicts(
+        repo,
+        heads.base.as_deref(),
+        local,
+        remote,
+        &merged,
+        conflicts,
+    )?;
     let tree = tracked.manifest.write(repo, &merged)?;
     let roots = Roots::current();
     let exclude = tracked.exclude_set()?;
-    if repo.output_tree_of(local)? == tree && conflicts.is_empty() {
+    if repo.output_tree_of(local)? == tree && conflicts.is_empty() && !merged_conflicts {
         return Ok(None);
     }
     // An eligible tracked file is decided per file, so its ordinary text
@@ -1373,6 +1528,90 @@ pub(super) fn incoming_repository_tree(
         );
     }
     Ok(Some(tree))
+}
+
+/// Git merged the saved envelopes as text. Whatever it wrote for a conflicted
+/// path is not a saved version: when the decrypted content is equal, the local
+/// saved envelope stands, and every other path is replaced by the per-file
+/// plan before anything is adopted. A marker blob is never carried forward.
+pub(super) fn settle_conflicts(
+    repo: &crate::history::shadow::HistoryRepo,
+    base: Option<&str>,
+    local: &str,
+    remote: &str,
+    merged: &str,
+    conflicts: Vec<String>,
+) -> Result<(String, Vec<String>)> {
+    let mut overlays = vec![];
+    let mut settled = std::collections::BTreeSet::new();
+    for path in &conflicts {
+        if path == crate::history::manifest::PATH {
+            continue;
+        }
+        let Some(saved) = repo.object_at(local, path)? else {
+            continue;
+        };
+        let Some(merged_object) = repo.object_at(merged, path)? else {
+            continue;
+        };
+        // A record Git merged as text is repaired here: when its two sides
+        // hold the same content, one clean envelope replaces it.
+        let repaired = match super::files::repair(repo, path, &merged_object, false)? {
+            super::files::Repair::Same { envelope, .. } => {
+                Some(("100644".to_string(), repo.store_blob(&envelope)?))
+            }
+            _ => match super::files::repair(repo, path, &saved, false)? {
+                super::files::Repair::Same { envelope, .. } => {
+                    Some(("100644".to_string(), repo.store_blob(&envelope)?))
+                }
+                _ => None,
+            },
+        };
+        if let Some(object) = repaired {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some(object),
+            });
+            continue;
+        }
+        if super::files::same_content(repo, path, &saved, &merged_object, false) {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some(saved),
+            });
+            continue;
+        }
+        // Nothing here is -merge'd by Git, so a plaintext path whose two sides
+        // changed different lines is merged here exactly as Git used to.
+        let merged_text = match (base, repo.object_at(remote, path)?) {
+            (Some(base), Some(theirs)) => match repo.object_at(base, path)? {
+                Some(base) => repo.merge3(
+                    &repo.cat_object(&base.1)?,
+                    &repo.cat_object(&saved.1)?,
+                    &repo.cat_object(&theirs.1)?,
+                )?,
+                None => None,
+            },
+            _ => None,
+        };
+        if let Some(text) = merged_text {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some((saved.0.clone(), repo.store_blob(&text)?)),
+            });
+        }
+    }
+    let remaining = conflicts
+        .into_iter()
+        .filter(|path| !settled.contains(path))
+        .collect();
+    if overlays.is_empty() {
+        return Ok((merged.to_string(), remaining));
+    }
+    Ok((repo.compose(merged, &overlays)?, remaining))
 }
 
 /// A bootstrap finished: the declarations that arrived through sync are
@@ -1628,6 +1867,7 @@ mod notification_tests {
             local: None,
             remote: None,
             base: None,
+            detail: None,
         }
     }
 
@@ -1696,6 +1936,7 @@ mod status_tests {
             local: None,
             remote: None,
             base: None,
+            detail: None,
         }
     }
 

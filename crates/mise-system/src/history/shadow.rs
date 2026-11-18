@@ -312,6 +312,33 @@ impl HistoryRepo {
     pub(crate) const HISTORY_REF: &'static str = "refs/heads/main";
     const MATCHER_TRAILER: &'static str = "Mise-History-Matcher: ";
     pub(crate) const RECORD_TRAILER: &'static str = "Mise-History: ";
+    /// Nothing mise stores is merged by Git's text merge: an encrypted path
+    /// holds an envelope whose two sides are ciphertext, and the setup
+    /// manifest is a keyed inventory. Git keeps one side of a conflicting path
+    /// instead of writing markers into it, and mise resolves every such path
+    /// from decrypted content before anything is committed.
+    fn write_no_text_merge(git: &GitPlumbing) -> Result<()> {
+        const LINE: &str = "* -merge";
+        let dir = git.git_dir().join("info");
+        let path = dir.join("attributes");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing.lines().any(|line| line.trim() == LINE) {
+            return Ok(());
+        }
+        super::store::create_private_dir(&dir)?;
+        let mut content = existing;
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(LINE);
+        content.push('\n');
+        use std::io::Write;
+        let mut temporary = tempfile::NamedTempFile::new_in(&dir)?;
+        temporary.write_all(content.as_bytes())?;
+        temporary.persist(&path).map_err(|err| err.error)?;
+        Ok(())
+    }
+
     pub fn path_in(state_dir: &Path) -> PathBuf {
         repo_dir_in(state_dir)
     }
@@ -325,6 +352,14 @@ impl HistoryRepo {
         let git = GitPlumbing::new(Self::path_in(state_dir));
         git.init_bare()
             .wrap_err_with(|| format!("initializing {}", display_path(git.git_dir())))?;
+        // Written before anything reads or merges this history: a repository
+        // created before this existed gains it on its next open here.
+        Self::write_no_text_merge(&git).wrap_err_with(|| {
+            format!(
+                "recording merge attributes in {}",
+                display_path(git.git_dir())
+            )
+        })?;
         // the binary may exist and still be unusable (a stub, a broken
         // install): probe it once so callers can say capture is unavailable
         git.run(PlumbingCall::new(["rev-parse", "--is-bare-repository"]))
@@ -1182,32 +1217,74 @@ impl HistoryRepo {
         from: Option<&gix::Tree<'_>>,
         to: &gix::Tree<'_>,
     ) -> Result<Vec<Change>> {
-        let from = if let Some(tree) = from {
-            Self::gix_tree_entries(repo, tree)?
-        } else {
-            vec![]
-        }
-        .into_iter()
-        .map(|entry| (entry.path, (entry.mode, entry.oid)))
-        .collect::<BTreeMap<_, _>>();
-        let to = Self::gix_tree_entries(repo, to)?
-            .into_iter()
-            .map(|entry| (entry.path, (entry.mode, entry.oid)))
-            .collect::<BTreeMap<_, _>>();
         let mut changes = vec![];
-        for path in from.keys().chain(to.keys()).collect::<BTreeSet<_>>() {
-            let status = match (from.get(path), to.get(path)) {
+        Self::gix_diff_level(
+            repo,
+            from.map(|tree| tree.id),
+            Some(to.id),
+            "",
+            &mut changes,
+        )?;
+        changes.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(changes)
+    }
+
+    /// One level of [`Self::gix_changes`]. A subtree whose id is the same on
+    /// both sides holds the same files, so it is not opened: a checkpoint
+    /// that changed one file reads the directories on that file's path, not
+    /// every saved file twice.
+    fn gix_diff_level(
+        repo: &gix::Repository,
+        from: Option<gix::ObjectId>,
+        to: Option<gix::ObjectId>,
+        prefix: &str,
+        changes: &mut Vec<Change>,
+    ) -> Result<()> {
+        // name -> (is a tree, mode, id)
+        type Level = BTreeMap<String, (bool, gix::object::tree::EntryMode, gix::ObjectId)>;
+        let read = |id: Option<gix::ObjectId>| -> Result<Level> {
+            let Some(id) = id else {
+                return Ok(Level::new());
+            };
+            let tree = repo.find_tree(id)?;
+            let mut level = Level::new();
+            for entry in tree.decode()?.entries.iter() {
+                let name = std::str::from_utf8(entry.filename.as_ref()).wrap_err(
+                    "history cannot represent a non-UTF-8 filename; refusing to change its bytes",
+                )?;
+                level.insert(
+                    name.to_string(),
+                    (entry.mode.is_tree(), entry.mode, entry.oid.to_owned()),
+                );
+            }
+            Ok(level)
+        };
+        let (from, to) = (read(from)?, read(to)?);
+        for name in from.keys().chain(to.keys()).collect::<BTreeSet<_>>() {
+            let path = format!("{prefix}{name}");
+            let (left, right) = (from.get(name), to.get(name));
+            if left == right {
+                continue;
+            }
+            let tree_of = |side: Option<&(bool, _, gix::ObjectId)>| {
+                side.and_then(|(is_tree, _, id)| is_tree.then_some(*id))
+            };
+            let file_of = |side: Option<&(bool, gix::object::tree::EntryMode, gix::ObjectId)>| {
+                side.and_then(|(is_tree, mode, id)| (!is_tree).then_some((*mode, *id)))
+            };
+            let (left_tree, right_tree) = (tree_of(left), tree_of(right));
+            if left_tree.is_some() || right_tree.is_some() {
+                Self::gix_diff_level(repo, left_tree, right_tree, &format!("{path}/"), changes)?;
+            }
+            let status = match (file_of(left), file_of(right)) {
                 (None, Some(_)) => 'A',
                 (Some(_), None) => 'D',
                 (Some(left), Some(right)) if left != right => 'M',
                 _ => continue,
             };
-            changes.push(Change {
-                status,
-                path: path.clone(),
-            });
+            changes.push(Change { status, path });
         }
-        Ok(changes)
+        Ok(())
     }
 
     /// Recursive listing of a tree (or a path inside it).
@@ -1391,6 +1468,16 @@ impl HistoryRepo {
         Ok(repo
             .write_blob(bytes)
             .wrap_err("writing a blob")?
+            .to_string())
+    }
+
+    /// Store a synthesized blob through the same Git child that writes the
+    /// trees referring to it: a tree built from an object no child can read
+    /// fails at `write-tree`.
+    pub(crate) fn store_blob(&self, bytes: &[u8]) -> Result<String> {
+        Ok(self
+            .output_str(PlumbingCall::new(["hash-object", "-w", "--stdin"]).stdin(bytes))?
+            .trim()
             .to_string())
     }
 
@@ -1756,16 +1843,35 @@ impl HistoryRepo {
         let Some(object) = self.object_at(tree, path)? else {
             return Ok(None);
         };
+        self.restored(&self.encrypted_paths_of(tree)?, path, object)
+            .map(Some)
+    }
+
+    /// The encrypted streams `tree` declares, read once for a walk over its
+    /// files ([`Self::restored`]) instead of once per file.
+    pub(crate) fn encrypted_paths_of(&self, tree: &str) -> Result<BTreeSet<String>> {
+        Ok(super::manifest::Manifest::read(self, tree)?
+            .map(|manifest| manifest.encrypted_paths())
+            .unwrap_or_default())
+    }
+
+    /// [`Self::restored_object_at`] for an object already listed from the
+    /// tree, with the tree's encrypted streams read beforehand: a walk over
+    /// every saved file then reads the manifest once, not once per file.
+    pub(crate) fn restored(
+        &self,
+        encrypted_paths: &BTreeSet<String>,
+        path: &str,
+        object: (String, String),
+    ) -> Result<(String, String)> {
         if matches!(object.0.as_str(), "040000" | "160000") {
-            return Ok(Some(object));
+            return Ok(object);
         }
-        let encrypted = super::manifest::Manifest::read(self, tree)?.is_some_and(|manifest| {
-            manifest.encrypted_paths().iter().any(|prefix| {
-                path == prefix
-                    || path
-                        .strip_prefix(prefix)
-                        .is_some_and(|rest| rest.starts_with('/'))
-            })
+        let encrypted = encrypted_paths.iter().any(|prefix| {
+            path == prefix
+                || path
+                    .strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
         });
         if encrypted {
             return super::sync::files::decrypt(
@@ -1773,10 +1879,9 @@ impl HistoryRepo {
                 path,
                 &object,
                 console::user_attended_stderr(),
-            )
-            .map(Some);
+            );
         }
-        Ok(Some(object))
+        Ok(object)
     }
 
     /// Builds a tree from `base` with `overlays` applied: each path is
