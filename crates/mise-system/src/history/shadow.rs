@@ -2134,9 +2134,9 @@ impl HistoryRepo {
             let ours = self.object_at(local, &entry.path)?;
             let theirs = self.object_at(remote, &entry.path)?;
             let is_envelope = |object: &Option<(String, String)>| {
-                object.as_ref().is_some_and(|object| {
-                    self.blob_starts_with(&object.1, magic).unwrap_or(false)
-                })
+                object
+                    .as_ref()
+                    .is_some_and(|object| self.blob_starts_with(&object.1, magic).unwrap_or(false))
             };
             if !is_envelope(&ours) && !is_envelope(&theirs) {
                 continue;
@@ -3778,10 +3778,16 @@ mod tests {
             .commit_tree(&tree(envelope("remote side")), vec![&base], "remote")
             .unwrap();
         let (merged, conflicts) = repo.merge_tree(&local, &remote).unwrap();
-        assert!(conflicts.iter().any(|path| path == "home/secret"), "{conflicts:?}");
+        assert!(
+            conflicts.iter().any(|path| path == "home/secret"),
+            "{conflicts:?}"
+        );
         let object = repo.object_at(&merged, "home/secret").unwrap().unwrap();
         let bytes = repo.cat_object(&object.1).unwrap();
         assert!(!bytes.windows(7).any(|window| window == b"<<<<<<<"));
-        assert_eq!(object.1, repo.object_at(&local, "home/secret").unwrap().unwrap().1);
+        assert_eq!(
+            object.1,
+            repo.object_at(&local, "home/secret").unwrap().unwrap().1
+        );
     }
 }
