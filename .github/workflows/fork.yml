@@ -38,5 +38,5 @@ jobs:
       smoke: '"$BIN" --version'
       tools: rust
       targets: >-
-        [{"target":"darwin-arm64","os":"macos-latest"}]
+        [{"target":"darwin-arm64","os":"macos-latest"},{"target":"linux-x64","os":"ubuntu-latest"}]
       force: ${{ inputs.force || false }}
