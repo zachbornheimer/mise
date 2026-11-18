@@ -312,6 +312,47 @@ fn encryption_cache_key(dir: &Path) -> Result<[u8; 32]> {
 
 impl HistoryRepo {
     pub const HISTORY_REF: &'static str = "refs/heads/main";
+    /// A protective snapshot taken during a fresh adoption. It is this
+    /// machine's recovery record, not a checkpoint of the shared setup:
+    /// fetch and push name `main` only, so this ref never leaves the machine.
+    pub(crate) const RECOVERY_REF: &'static str = "refs/mise-history/recovery";
+
+    /// Keeps `commit` reachable without dropping an earlier recovery snapshot.
+    /// Each adoption gets its own ref; undo names the commit, and a rebuilt
+    /// index walks every ref under the prefix.
+    pub(crate) fn retain_recovery(&self, commit: &str) -> Result<()> {
+        let name = format!("{}/{}", Self::RECOVERY_REF, &commit[..12]);
+        if self.ref_oid(&name)?.as_deref() == Some(commit) {
+            return Ok(());
+        }
+        self.update_ref(&name, commit, None)
+    }
+
+    /// Drops the private ref of one recovery snapshot. Other adoptions keep
+    /// theirs.
+    pub(crate) fn release_recovery(&self, commit: &str) -> Result<()> {
+        self.delete_ref(&format!("{}/{}", Self::RECOVERY_REF, &commit[..12]))
+    }
+
+    /// Every private adoption recovery tip. Its parent is published history,
+    /// which the index already lists, so the remote ancestry is not walked.
+    pub(crate) fn recovery_commits(&self) -> Result<Vec<(String, String)>> {
+        let mut messages = vec![];
+        let prefix = format!("{}/", Self::RECOVERY_REF);
+        let repo = self.gix()?;
+        for (name, oid) in self.list_refs(&prefix)? {
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let object = repo.find_commit(gix::ObjectId::from_hex(oid.as_bytes())?)?;
+            let message = String::from_utf8_lossy(object.message_raw()?.as_ref())
+                .trim()
+                .to_string();
+            messages.push((oid, message));
+        }
+        Ok(messages)
+    }
+
     const MATCHER_TRAILER: &'static str = "Mise-History-Matcher: ";
     pub(crate) const RECORD_TRAILER: &'static str = "Mise-History: ";
     /// Nothing mise stores is merged by Git's text merge: an encrypted path
@@ -947,7 +988,11 @@ impl HistoryRepo {
             return Ok(vec![]);
         };
         let head = head.peel_to_id()?.detach();
-        let commits = gix::traverse::commit::topo::Builder::new(&repo)
+        Self::messages_from(&repo, head)
+    }
+
+    fn messages_from(repo: &gix::Repository, head: gix::ObjectId) -> Result<Vec<(String, String)>> {
+        let commits = gix::traverse::commit::topo::Builder::new(repo)
             .with_tips([head])
             .sorting(gix::traverse::commit::topo::Sorting::TopoOrder)
             .build()?;

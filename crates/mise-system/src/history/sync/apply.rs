@@ -876,7 +876,7 @@ impl Applying<'_> {
             self.adopted_head = Some(remote.to_owned());
             // every path this pull writes, the ones it creates included,
             // and manual-save ones as they are now: undo puts back exactly
-            // what was here
+            // what was here. The snapshot stays off the published history.
             let written: Vec<PathBuf> = self.ready.iter().map(|step| step.path.clone()).collect();
             self.scope.recapture_before(&written)?;
             self.protected_head = repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)?;
@@ -1053,6 +1053,7 @@ impl Applying<'_> {
             message: Some("apply failed; recovery attempted".into()),
         });
         let mut operation_id = None;
+        let recovery = scope.before().map(|(_, commit)| commit);
         scope.with_operation(|op| operation_id = Some(op.id.clone()));
         if recovery_errors.is_empty() {
             scope.finish(status.application_failure.clone(), summary);
@@ -1095,6 +1096,12 @@ impl Applying<'_> {
                 && recorded_by_this_operation(&head)?
                 && repo.delete_history_head(&head).is_ok()
             {
+                // Drop this adoption's private snapshot before rebuilding.
+                // Rebuilding first would keep its stale index entry after the
+                // ref is gone.
+                if let Some(recovery) = &recovery {
+                    repo.release_recovery(recovery)?;
+                }
                 pull.store.rebuild_index()?;
             }
             status.application_failure = None;

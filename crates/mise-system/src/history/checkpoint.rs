@@ -65,6 +65,10 @@ pub struct Draft {
     /// checkpoint holds under other recipients, including the saved
     /// versions it carries forward rather than reads live.
     pub re_encrypt: bool,
+    /// Commit the snapshot without moving the published history. A fresh
+    /// adoption's protective snapshot records files this machine does not have
+    /// as absent; publishing that would delete them for every other machine.
+    pub recovery_only: bool,
 }
 
 impl Draft {
@@ -822,6 +826,7 @@ impl Store {
             reserved_id,
             &messages,
             !draft.protective && heard(&draft),
+            draft.recovery_only,
         )?;
         if available
             && snapshot.is_some()
@@ -863,6 +868,7 @@ impl Store {
         reserved_id: Option<u64>,
         messages: &[String],
         speak: bool,
+        recovery_only: bool,
     ) -> Result<Box<Entry>> {
         let id = reserved_id.unwrap_or_else(|| {
             let id = index.next_id.max(1);
@@ -875,7 +881,13 @@ impl Store {
                 let commit = repo
                     .write_checkpoint_commit(checkpoint.tree.snapshot.as_deref(), &checkpoint)
                     .wrap_err("writing the checkpoint")?;
-                let advanced = repo.update_history_head(&commit, parent.as_deref());
+                let advanced = if recovery_only {
+                    // The snapshot stays reachable for undo, and out of the
+                    // history every other machine fetches.
+                    repo.retain_recovery(&commit)
+                } else {
+                    repo.update_history_head(&commit, parent.as_deref())
+                };
                 // Updating the ref makes the snapshot durable. Even a later
                 // symbolic-HEAD, metadata-cache, index, or enrollment failure
                 // must not lose its warnings. A failed snapshot can still
@@ -892,7 +904,7 @@ impl Store {
                 {
                     self.deliver_capture_notices(messages, speak);
                 }
-                advanced.wrap_err("advancing the checkpoint")?;
+                advanced.wrap_err("recording the checkpoint")?;
                 commit
             }
             None => String::new(),
@@ -1079,10 +1091,25 @@ impl Store {
         };
         let existing = store::load_index_in(&self.state_dir)?;
         let mut entries = vec![];
-        let commits: Vec<_> = repo
-            .history_messages()?
+        let messages = repo.history_messages()?;
+        // A fresh adoption's protective snapshot is not an ancestor of the
+        // published history. Undo finds it by the commit the operation
+        // recorded, so the rebuilt index keeps every private recovery tip.
+        // Published history stays last: it is the baseline the next capture
+        // compares against.
+        let published: std::collections::BTreeSet<String> =
+            messages.iter().map(|(commit, _)| commit.clone()).collect();
+        let mut recovery = vec![];
+        for (commit, message) in repo.recovery_commits()? {
+            if !published.contains(&commit) {
+                recovery.push((commit, message));
+            }
+        }
+        // Recovery tips come first and published history last. Reversing the
+        // combined list would make a private snapshot the baseline.
+        let commits: Vec<_> = recovery
             .into_iter()
-            .rev()
+            .chain(messages.into_iter().rev())
             .map(|(commit, message)| Ok((commit, HistoryRepo::annotation_from_message(&message)?)))
             .collect::<Result<_>>()?;
         let mut annotations: BTreeMap<String, Vec<Annotation>> = BTreeMap::new();
@@ -1742,6 +1769,7 @@ mod tests {
                     Index::default(),
                     None,
                     std::slice::from_ref(&notice),
+                    false,
                     false
                 )
                 .is_err()
@@ -1772,6 +1800,7 @@ mod tests {
                 Index::default(),
                 None,
                 &["history: synthetic credential saved in plaintext".into()],
+                false,
                 false,
             );
             assert_eq!(result.is_err(), fail_commit);
