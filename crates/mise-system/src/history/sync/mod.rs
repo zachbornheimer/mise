@@ -11,7 +11,7 @@ use eyre::{Result, bail};
 
 pub mod apply;
 mod directories;
-pub(crate) mod files;
+pub mod files;
 pub(crate) mod format;
 pub(crate) mod graph;
 pub mod layout;
