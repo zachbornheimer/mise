@@ -333,7 +333,10 @@ impl ToolRequest {
         config.tool_config_locked(source)
     }
 
-    pub(crate) fn os(&self) -> &Option<Vec<String>> {
+    /// The `os` this tool is scoped to by its configuration, if any. The
+    /// `mise` binary is a separate crate and reports a named tool whose
+    /// configured `os` excludes this platform, so this is public.
+    pub fn os(&self) -> &Option<Vec<String>> {
         &self.resolved_options().effective().os
     }
     pub fn set_options(&mut self, options: ToolVersionOptions) -> &mut Self {
