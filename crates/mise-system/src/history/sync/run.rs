@@ -848,20 +848,42 @@ pub fn lock_queued(store: &Store, wait: Option<Duration>) -> Result<fslock::Lock
     )
 }
 
+/// The sync lock was already held. The text is the refusal a command prints;
+/// the type is how the watcher tells a held lock from a sync that failed.
+#[derive(Debug)]
+pub(crate) struct SyncLockHeld {
+    pub holder: String,
+    waited: Option<Duration>,
+}
+
+impl std::fmt::Display for SyncLockHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.waited {
+            None => write!(
+                f,
+                "another setup sync or pull is running: {}; pass `--wait <duration>` to queue behind it, or stop the holder",
+                self.holder
+            ),
+            Some(waited) => write!(
+                f,
+                "another setup sync or pull is running: {}; waited {} and gave up, so raise `history.lock_wait`, pass a longer `--wait`, or stop the holder",
+                self.holder,
+                human_duration(waited)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SyncLockHeld {}
+
 /// The refusal for a sync that could not take the lock: who holds it, and
 /// what to do instead of retrying into the same wall. A command someone ran
 /// can pick a wait; the watcher can only be stopped or waited out.
 pub(crate) fn contended(state_dir: &Path, waited: Option<Duration>) -> eyre::Report {
-    let holder = describe_holder(state_dir);
-    match waited {
-        None => eyre::eyre!(
-            "another setup sync or pull is running: {holder}; pass `--wait <duration>` to queue behind it, or stop the holder"
-        ),
-        Some(waited) => eyre::eyre!(
-            "another setup sync or pull is running: {holder}; waited {} and gave up, so raise `history.lock_wait`, pass a longer `--wait`, or stop the holder",
-            human_duration(waited)
-        ),
-    }
+    eyre::Report::new(SyncLockHeld {
+        holder: describe_holder(state_dir),
+        waited,
+    })
 }
 
 /// Whether a sync or pull holds the sync lock right now. A reader that only
