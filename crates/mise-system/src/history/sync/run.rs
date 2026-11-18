@@ -24,12 +24,40 @@ use crate::history::store as hstore;
 use crate::history::tracked::{Asked, ExcludeSet, TrackedSet};
 use mise_util::file::display_path;
 
-const PUSH_RETRIES: usize = 5;
-
 /// How many times one sync re-plans because the local saved history moved
 /// while it planned. The watcher saves every edit, so a busy machine moves it
 /// often; a bound keeps a machine that never settles from looping forever.
 const REPLAN_LIMIT: usize = 20;
+
+/// How many times one sync may push before a rejection is final. Machines
+/// that publish together all lose the race except one; enough attempts let
+/// the losers fetch the winner and fast-forward instead of failing together.
+const PUSH_ATTEMPTS: usize = 8;
+
+/// Upper bound of the wait before the next fetch, in milliseconds, growing by
+/// retry and then capped. The first rejected push waits at most half a second.
+const REJECTION_DELAYS_MS: [u64; 3] = [500, 1_000, 2_000];
+const REJECTION_DELAY_CAP_MS: u64 = 3_000;
+
+/// How long to wait before fetching again after rejected publication `retry`
+/// (the first rejection is 1). `sample` picks a delay from the upper half of
+/// that retry's bound: `0` is the lower end and `u32::MAX` is the bound, so
+/// two machines that lose the same race do not fetch again together.
+fn rejection_delay(retry: u32, sample: u32) -> Duration {
+    let bound = REJECTION_DELAYS_MS
+        .get(retry.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or(REJECTION_DELAY_CAP_MS);
+    let lower = bound / 2;
+    let span = bound - lower;
+    Duration::from_millis(lower + (span * u64::from(sample)) / u64::from(u32::MAX))
+}
+
+/// Draws the wait for rejected publication `retry` and hands it to `wait`.
+/// Production sleeps; a test records the duration and returns.
+fn pause_after_rejection(retry: u32, wait: &mut impl FnMut(Duration)) {
+    wait(rejection_delay(retry, rand::random()));
+}
 
 /// An incoming change waiting for `mise dot pull` (or automatic
 /// application in `sync` mode).
@@ -409,6 +437,27 @@ pub(crate) fn sync_locked(
     tracked: &TrackedSet,
     request: &SyncRequest,
 ) -> Result<SyncOutcome> {
+    sync_locked_waiting(
+        store,
+        tracked,
+        request,
+        &mut std::thread::sleep,
+        &mut |_| {},
+    )
+}
+
+/// [`sync_locked`], with the wait a rejected publication takes before it
+/// fetches again and the hook that runs after each fetch. Production sleeps
+/// and does nothing after a fetch; a caller may record the wait and move the
+/// origin between the fetch and the push. The publication and the re-plan are
+/// unchanged.
+fn sync_locked_waiting(
+    store: &Store,
+    tracked: &TrackedSet,
+    request: &SyncRequest,
+    wait: &mut impl FnMut(Duration),
+    after_fetch: &mut impl FnMut(&str),
+) -> Result<SyncOutcome> {
     // Synchronizing publishes and applies, so it does not run on a rule
     // set that could not be fully built: the missing rules are exactly
     // the paths that would then look selected here.
@@ -436,6 +485,7 @@ pub(crate) fn sync_locked(
             // synced with is not an empty upstream: reading it as one would
             // queue the deletion of every file it held
             let found = remote.fetch(&origin.branch)?;
+            after_fetch(&origin.url);
             if !found && status.upstream_commit.is_some() {
                 bail!(
                     "the setup branch `{}` is not at {} any more (renamed, or deleted?); nothing was changed. `mise dot origin set {} --branch <name>` follows a renamed branch",
@@ -628,9 +678,13 @@ pub(crate) fn sync_locked(
                     )?;
                     break;
                 }
-                PushOutcome::Rejected(reason) if attempts < PUSH_RETRIES => {
-                    debug!("history sync: publication rejected, fetching again: {reason}");
+                PushOutcome::Rejected(reason) if attempts < PUSH_ATTEMPTS => {
+                    debug!(
+                        "history sync: publication rejected, waiting before fetching again: {reason}"
+                    );
+                    pause_after_rejection(attempts as u32, wait);
                     remote.fetch(&origin.branch)?;
+                    after_fetch(&origin.url);
                     upstream_commit = repo.ref_oid(UPSTREAM_REF)?;
                 }
                 PushOutcome::Rejected(reason) => {
@@ -2138,6 +2192,243 @@ mod nested_repository_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod rejection_backoff_tests {
+    use super::*;
+    use crate::history::manifest::Manifest;
+    use crate::history::shadow::HistoryRepo;
+
+    /// A marked history whose saved manifest matches an empty tracked set, so
+    /// publication is not held for an incoming repository change.
+    fn marked(repo: &HistoryRepo, parent: Option<&str>, message: &str) -> String {
+        let tree = Manifest::default()
+            .write(repo, &repo.empty_object("tree").unwrap())
+            .unwrap();
+        let parents = parent.into_iter().collect::<Vec<_>>();
+        let commit = repo.commit_tree(&tree, parents, message).unwrap();
+        repo.update_history_head(&commit, parent).unwrap();
+        commit
+    }
+
+    /// A bare origin and a local store one commit ahead of the fetched base.
+    fn ahead(name: &str) -> (tempfile::TempDir, Store, std::path::PathBuf, String) {
+        let root = tempfile::tempdir().unwrap();
+        let origin = root.path().join(format!("{name}.git"));
+        std::fs::create_dir_all(&origin).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "mise"])
+            .current_dir(&origin)
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let store = Store::open_in(&root.path().join("state")).unwrap();
+        let repo = store.repo().unwrap();
+        let base = marked(repo, None, "base");
+        let seeded = std::process::Command::new("git")
+            .args([
+                "push",
+                "--quiet",
+                &origin.to_string_lossy(),
+                &format!("{base}:refs/heads/mise"),
+            ])
+            .current_dir(repo.dir())
+            .output()
+            .unwrap();
+        assert!(
+            seeded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&seeded.stderr)
+        );
+        repo.update_ref(UPSTREAM_REF, &base, None).unwrap();
+        let local = marked(repo, Some(&base), name);
+        (root, store, origin, local)
+    }
+
+    /// Moves the origin branch on after a fetch, the race a rejected push
+    /// retries. The move happens inside the fetch the sync just made, so the
+    /// lease check sees a branch the fetch did not, and the next fetch sees
+    /// the move. `moves` bounds how many fetches lose the race.
+    fn race_after_fetch<'a>(
+        branch: &str,
+        remaining: &'a mut usize,
+        raced: &'a mut Vec<String>,
+    ) -> impl FnMut(&str) + 'a {
+        let branch = branch.to_string();
+        move |url: &str| {
+            if *remaining == 0 {
+                return;
+            }
+            *remaining -= 1;
+            // the commit is born in the origin, so the next fetch can read it
+            let moved = std::process::Command::new("git")
+                .args([
+                    "commit-tree",
+                    &format!("refs/heads/{branch}^{{tree}}"),
+                    "-p",
+                    &format!("refs/heads/{branch}"),
+                    "-m",
+                    "raced",
+                ])
+                .current_dir(url)
+                .env("GIT_AUTHOR_NAME", "mise")
+                .env("GIT_AUTHOR_EMAIL", "mise@localhost")
+                .env("GIT_COMMITTER_NAME", "mise")
+                .env("GIT_COMMITTER_EMAIL", "mise@localhost")
+                .output()
+                .unwrap();
+            assert!(
+                moved.status.success(),
+                "{}",
+                String::from_utf8_lossy(&moved.stderr)
+            );
+            let commit = String::from_utf8(moved.stdout).unwrap().trim().to_string();
+            raced.push(commit.clone());
+            let advanced = std::process::Command::new("git")
+                .args(["update-ref", &format!("refs/heads/{branch}"), &commit])
+                .current_dir(url)
+                .output()
+                .unwrap();
+            assert!(
+                advanced.status.success(),
+                "{}",
+                String::from_utf8_lossy(&advanced.stderr)
+            );
+        }
+    }
+    fn publishing(origin: &std::path::Path) -> SyncRequest {
+        let mut request = SyncRequest::new(false);
+        request.capture = false;
+        request.allow_plaintext_history = true;
+        request.origin = Some(OriginTomlConfig::plain(
+            origin.to_string_lossy().into_owned(),
+            "mise".into(),
+        ));
+        request
+    }
+
+    fn sync_recording(
+        store: &Store,
+        request: &SyncRequest,
+        after_fetch: &mut impl FnMut(&str),
+    ) -> (Result<SyncOutcome>, Vec<Duration>) {
+        let mut delays = Vec::new();
+        let result = sync_locked_waiting(
+            store,
+            &TrackedSet::default(),
+            request,
+            &mut |delay| delays.push(delay),
+            after_fetch,
+        );
+        (result, delays)
+    }
+
+    /// The origin rejects the first pushes of this sync, after the fetch. Each
+    /// rejection waits, the waits grow, and their worst case stays under 16
+    /// seconds. The later push is accepted and this machine's commit is kept.
+    #[test]
+    fn rejected_push_backs_off() {
+        let (_root, store, origin, local) = ahead("rejected");
+        let mut moves = 1;
+        let mut raced = Vec::new();
+        let (result, delays) = sync_recording(
+            &store,
+            &publishing(&origin),
+            &mut race_after_fetch("mise", &mut moves, &mut raced),
+        );
+        assert_eq!(
+            moves, 0,
+            "the origin moved after the fetch, so the push was rejected"
+        );
+        assert_eq!(raced.len(), 1);
+        assert!(
+            result.is_ok(),
+            "the retry publishes once the race ends: {result:?}"
+        );
+        assert_eq!(
+            delays.len(),
+            1,
+            "one rejection waits once before fetching again"
+        );
+        assert!(
+            (Duration::from_millis(250)..=Duration::from_millis(500)).contains(&delays[0]),
+            "the first wait is the upper half of half a second: {:?}",
+            delays[0]
+        );
+        let published = result
+            .unwrap()
+            .published
+            .expect("the retried publication is accepted");
+        let history = store
+            .repo()
+            .unwrap()
+            .rev_list(&published, usize::MAX)
+            .unwrap();
+        assert!(
+            history.contains(&local),
+            "this machine's commit is what the retry publishes"
+        );
+        assert!(
+            history.contains(&raced[0]),
+            "the competing commit is reconciled in"
+        );
+    }
+
+    /// The first push is accepted: nothing was rejected, so nothing waits.
+    #[test]
+    fn an_accepted_push_does_not_wait() {
+        let (_root, store, origin, local) = ahead("accepted");
+        let (result, delays) = sync_recording(&store, &publishing(&origin), &mut |_| {});
+        assert!(
+            delays.is_empty(),
+            "an accepted push waits for nothing: {delays:?}"
+        );
+        assert_eq!(result.unwrap().published.as_deref(), Some(local.as_str()));
+    }
+
+    /// Every push is rejected. The failure names how many were tried and the
+    /// reason the origin gave.
+    #[test]
+    fn an_exhausted_rejection_names_the_attempts_and_the_reason() {
+        let (_root, store, origin, _local) = ahead("exhausted");
+        let mut moves = PUSH_ATTEMPTS;
+        let mut raced = Vec::new();
+        let (result, delays) = sync_recording(
+            &store,
+            &publishing(&origin),
+            &mut race_after_fetch("mise", &mut moves, &mut raced),
+        );
+        assert_eq!(raced.len(), PUSH_ATTEMPTS, "every attempt lost the race");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("after {PUSH_ATTEMPTS} attempts")),
+            "{err}"
+        );
+        assert!(err.contains("the origin branch changed"), "{err}");
+        assert_eq!(delays.len(), PUSH_ATTEMPTS - 1);
+    }
+
+    #[test]
+    fn a_rejection_delay_grows_then_caps_and_two_samples_differ_by_half() {
+        let bounds = [500, 1_000, 2_000, 3_000, 3_000, 3_000, 3_000];
+        for (index, bound) in bounds.into_iter().enumerate() {
+            let retry = index as u32 + 1;
+            assert_eq!(rejection_delay(retry, 0), Duration::from_millis(bound / 2));
+            assert_eq!(
+                rejection_delay(retry, u32::MAX),
+                Duration::from_millis(bound)
+            );
+        }
+        let worst: Duration = (1..PUSH_ATTEMPTS)
+            .map(|retry| rejection_delay(retry as u32, u32::MAX))
+            .sum();
+        assert_eq!(worst, Duration::from_millis(15_500));
+        assert!(worst <= Duration::from_secs(16));
+    }
+}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

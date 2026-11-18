@@ -434,10 +434,14 @@ managed files. Other files in the repository, such as a README, stay in Git
 and are never restored as live configuration.
 
 Sync uses Git ancestry, fast-forwards, and merge commits. A push keeps the
-saved commits and their Git author identities. A rejected push triggers
-another fetch and reconciliation. mise never force-pushes, and leaves
-divergent or unrelated histories for you to resolve. Before it writes incoming
-changes, it checks the complete batch, including configuration, required
+saved commits and their Git author identities. A rejected push waits a short,
+growing, jittered interval, then fetches and reconciles again, up to eight
+attempts. Those waits add up to at most fifteen and a half seconds. That bound
+is only the time spent waiting, not the fetches and pushes themselves, and the
+jitter keeps several machines that publish at once from retrying together.
+mise never force-pushes, and leaves divergent or unrelated histories for you to
+resolve. Before it writes incoming changes, it checks the complete batch,
+including configuration, required
 sources, committed files, and unsaved local edits.
 
 When you adopt the repository on a new machine, mise restores the shared
