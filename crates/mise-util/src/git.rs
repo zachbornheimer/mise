@@ -1855,7 +1855,10 @@ mod network_deadline {
     use std::time::{Duration, Instant};
 
     fn repo() -> (tempfile::TempDir, GitPlumbing) {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::Builder::new()
+            .prefix("network deadline ")
+            .tempdir()
+            .unwrap();
         let repo = GitPlumbing::new(temp.path().join("network.git"));
         repo.init_bare().unwrap();
         (temp, repo)
@@ -1875,23 +1878,22 @@ mod network_deadline {
             permissions.set_mode(0o755);
             std::fs::set_permissions(&script, permissions).unwrap();
         }
+        // Git's ext transport decodes `%%` and `% `, not URL percent-encoding.
         let path = script
             .to_string_lossy()
-            .replace('%', "%25")
-            .replace(' ', "%20");
+            .replace('%', "%%")
+            .replace(' ', "% ");
         format!("ext::sh {path}")
     }
 
     fn stalled_url(dir: &std::path::Path) -> String {
-        let recorded = dir
-            .join("grandchild.pgid")
-            .to_string_lossy()
-            .replace(' ', "%20");
+        let recorded_path = dir.join("grandchild.pgid");
+        let recorded = shell_escape::unix::escape(recorded_path.to_string_lossy());
         helper_url(
             dir,
             "stall.sh",
             &format!(
-                "( exec 3>&1 4>&2; printf grandchild-out >&3; printf grandchild-err >&4; ps -o pid=,pgid= -p $$ > {recorded}; exec sleep 30 ) & exit 0"
+                "ps -o pid=,pgid= -p $$ > {recorded}\n( exec 3>&1 4>&2; printf grandchild-out >&3; printf grandchild-err >&4; exec sleep 30 ) & exit 0"
             ),
         )
     }
