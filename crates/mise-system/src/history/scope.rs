@@ -667,6 +667,11 @@ impl Writer {
     fn capture_before(&mut self, id: u64, paths: &[PathBuf]) {
         let mut draft = Draft::new(before_trigger(self.kind()));
         draft.protective = true;
+        // Only a fresh adoption skips its first snapshot. Its protective
+        // snapshot records files this machine does not have as absent, which
+        // must not become the history other machines fetch. A bootstrap,
+        // capture, or undo with no starting head is ordinary history.
+        draft.recovery_only = self.kind() == OperationKind::Apply && self.starting_head.is_none();
         // A tree equal to the newest checkpoint's is already protected by it:
         // the operation's `before` points there instead of recording a copy.
         draft.skip_unchanged = self.kind() == OperationKind::Bootstrap;

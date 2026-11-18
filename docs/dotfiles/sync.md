@@ -421,7 +421,9 @@ history and sync locks, so a running watcher cannot save a checkpoint during
 the replacement. Existing files that differ from the incoming setup still
 wait for your decision before setup can finish; add `--take-remote-all` to take
 the repository's version of each. The replaced versions are saved first, so
-`mise dot undo` restores them. A failure restores the previous local branch and
+`mise dot undo` restores them. A fresh adoption keeps that recovery snapshot
+on this machine: it does not publish a deletion of a file the adoption
+created, or a new encrypted envelope for content that did not change. A failure restores the previous local branch and
 sync state. `--replace-history` applies only to
 this adoption; no setting lets the watcher discard divergent history. It
 does not work with an ordinary Git repository that holds no mise history. To
