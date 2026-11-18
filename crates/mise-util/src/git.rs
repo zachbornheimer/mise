@@ -1854,8 +1854,11 @@ mod plumbing_tests;
 #[cfg(test)]
 mod network_deadline {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    #[cfg(unix)]
+    use std::time::Instant;
 
+    #[cfg(unix)]
     fn repo() -> (tempfile::TempDir, GitPlumbing) {
         let temp = tempfile::Builder::new()
             .prefix("network deadline ")
@@ -1866,6 +1869,7 @@ mod network_deadline {
         (temp, repo)
     }
 
+    #[cfg(unix)]
     /// A shell Git execs through `ext::sh -c`, named in the URL rather than
     /// found on `PATH`. The helper exits at once. Its child keeps both output
     /// pipes open, records the process group, and ends itself after 30
@@ -1888,35 +1892,30 @@ mod network_deadline {
         format!("ext::sh {path}")
     }
 
+    #[cfg(unix)]
     fn stalled_url(dir: &std::path::Path) -> String {
-        let recorded_path = dir.join("grandchild.pgid");
-        let recorded = shell_escape::unix::escape(recorded_path.to_string_lossy());
         helper_url(
             dir,
             "stall.sh",
-            &format!(
-                "ps -o pid=,pgid= -p $$ > {recorded}\n( exec 3>&1 4>&2; printf grandchild-out >&3; printf grandchild-err >&4; exec sleep 30 ) & exit 0"
-            ),
+            "( exec 3>&1 4>&2; printf grandchild-out >&3; printf grandchild-err >&4; exec sleep 30 ) & exit 0",
         )
     }
 
-    fn recorded_group(dir: &std::path::Path) -> Option<u32> {
-        let text = std::fs::read_to_string(dir.join("grandchild.pgid")).ok()?;
-        text.split_whitespace().nth(1)?.parse().ok()
-    }
-
+    #[cfg(unix)]
+    /// Whether any process in `group` can still be signalled. A killed
+    /// process can be a zombie for a moment, and signal 0 still reaches a
+    /// zombie, so this waits out that moment. It does not wait out a process
+    /// that is still running.
     fn group_alive(group: u32) -> bool {
-        let listed = std::process::Command::new("ps")
-            .args(["-o", "pid=,pgid=,stat=", "-ax"])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&listed.stdout).lines().any(|line| {
-            let mut fields = line.split_whitespace();
-            let pid = fields.next().and_then(|field| field.parse::<u32>().ok());
-            let pgid = fields.next().and_then(|field| field.parse::<u32>().ok());
-            let stat = fields.next().unwrap_or_default();
-            pgid == Some(group) && pid.is_some_and(|pid| pid > 1) && !stat.contains('Z')
-        })
+        let group = nix::unistd::Pid::from_raw(group as i32);
+        let until = Instant::now() + Duration::from_millis(200);
+        while nix::sys::signal::killpg(group, None).is_ok() {
+            if Instant::now() >= until {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
     }
 
     #[cfg(unix)]
@@ -1947,10 +1946,48 @@ mod network_deadline {
         );
         assert!(err.contains("git fetch timed out"), "{err}");
         assert!(err.contains("history.network_timeout"), "{err}");
-        let group = recorded_group(temp.path()).expect("grandchild recorded its group");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_ends_a_shell_whose_child_holds_the_pipes() {
+        let (temp, _repo) = repo();
+        let recorded = temp.path().join("group.pid");
+        let quoted = shell_escape::unix::escape(recorded.to_string_lossy());
+        // The direct shell is the process group leader. It records that pid
+        // and exits before its child, which keeps both pipes open and ends
+        // itself after 30 seconds. The deadline therefore has to kill the
+        // grandchild; waiting for the shell would return while the pipes
+        // were still held.
+        let mut shell = std::process::Command::new("sh");
+        shell.args([
+            "-c",
+            &format!(
+                "printf %s \"$$\" > {quoted}\n( exec 3>&1 4>&2; printf holding >&3; printf held >&4; exec sleep 30 ) &\nexit 0"
+            ),
+        ]);
+        let deadline = Duration::from_millis(400);
+        let started = Instant::now();
+        let err = spawn_network(shell, Some(deadline))
+            .unwrap_err()
+            .to_string();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < deadline + Duration::from_secs(1),
+            "returned {elapsed:?} after a {deadline:?} deadline: {err}"
+        );
+        let group = std::fs::read_to_string(&recorded).unwrap_or_else(|read| {
+            panic!(
+                "shell did not record its process group in {}: {read}; timeout was {err}",
+                recorded.display()
+            )
+        });
+        let group: u32 = group.trim().parse().unwrap_or_else(|_| {
+            panic!("process group record {group:?} is not a pid; timeout was {err}")
+        });
         assert!(
             !group_alive(group),
-            "process group {group} still has a live process"
+            "process group {group} can still be signalled; timeout was {err}"
         );
     }
 
