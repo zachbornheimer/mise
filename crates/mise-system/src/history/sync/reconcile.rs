@@ -400,6 +400,23 @@ pub(crate) fn reconcile(
                 }
             }
             (true, true) => {
+                // The objects here are already decrypted. A line ending,
+                // trailing ASCII whitespace, or one final newline is this
+                // machine's saved version, and nothing is published or
+                // applied. `merge` still refuses a raw envelope, so this
+                // comparison is the one that sees the text.
+                if let (Some(saved), Some(remote)) = (s, t)
+                    && saved.0 == remote.0
+                    && super::files::normalized_equal(repo, branch_path, saved, remote, false)?
+                {
+                    plan.next.acknowledged = s_version.clone();
+                    plan.next.reconciled = s_version.clone();
+                    plan.next.applied = s_version;
+                    if !plan.is_noop() || plan.next != record {
+                        plans.push(plan);
+                    }
+                    continue;
+                }
                 let merged = merge(repo, a.as_ref(), s, t)?;
                 match merged {
                     Merged::Clean(object) => {
@@ -508,6 +525,10 @@ fn merge(
             let Some(base) = base else {
                 return Ok(Merged::Conflict(ConflictKind::NeedsAdoption));
             };
+            // An envelope here is still ciphertext. The listing that calls
+            // this has already decrypted a real one, so this guard is for a
+            // raw or damaged envelope: it stays a binary conflict and is
+            // never decrypted as if it were text.
             if is_encrypted_blob(repo, &base.1)?
                 || is_encrypted_blob(repo, &o.1)?
                 || is_encrypted_blob(repo, &t.1)?

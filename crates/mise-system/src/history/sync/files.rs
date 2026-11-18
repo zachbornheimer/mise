@@ -10,7 +10,7 @@ use super::{layout, reconcile::Object};
 use crate::history::shadow::HistoryRepo;
 use mise_util::agecrypt;
 
-const MAGIC: &[u8] = b"mise-encrypted-file-v1\n";
+pub(crate) const MAGIC: &[u8] = b"mise-encrypted-file-v1\n";
 
 /// Git's text-merge markers. A record that holds them is damage from a merge
 /// that treated two envelopes as text: it holds one complete envelope from
@@ -409,29 +409,83 @@ pub(crate) fn repair(
     })
 }
 
-/// Whether two saved sides hold the same content, whatever their ciphertext.
-/// An encrypted path compares what it decrypts to; anything else its object.
-pub(crate) fn same_content(
+/// Whether two saved sides are the same file once line endings and trailing
+/// ASCII whitespace are set aside. An encrypted path is decrypted first.
+///
+/// Equal means the same mode and, for a regular UTF-8 file, the same text
+/// after CRLF becomes LF, spaces and tabs at the end of each line are
+/// dropped, and one missing or extra final newline is ignored. Leading
+/// whitespace, a lone CR, and any other byte stay significant. A symlink,
+/// a file with a NUL, and invalid UTF-8 are equal only byte for byte.
+/// A read or decryption failure is returned, never treated as equality.
+pub(crate) fn normalized_equal(
     repo: &HistoryRepo,
     path: &str,
     left: &Object,
     right: &Object,
     interactive: bool,
-) -> bool {
+) -> Result<bool> {
     if left == right {
-        return true;
+        return Ok(true);
     }
-    let envelope = |object: &Object| repo.blob_starts_with(&object.1, MAGIC).unwrap_or(false);
-    if !envelope(left) || !envelope(right) {
-        return false;
+    let (left_mode, left_bytes) = body(repo, path, left, interactive)?;
+    let (right_mode, right_bytes) = body(repo, path, right, interactive)?;
+    // An envelope is always stored as a regular file. The mode that matters
+    // is the one recovered from it, so two encrypted executables compare as
+    // executables even though both outer objects are 100644.
+    if left_mode != right_mode {
+        return Ok(false);
     }
-    match (
-        decrypt(repo, path, left, interactive),
-        decrypt(repo, path, right, interactive),
-    ) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
+    if left_bytes == right_bytes {
+        return Ok(true);
     }
+    // Only a regular file has a line ending to normalize. A symlink target
+    // and a binary file are equal only byte for byte, decided above.
+    if !matches!(left_mode.as_str(), "100644" | "100755")
+        || !utf8_text(&left_bytes)
+        || !utf8_text(&right_bytes)
+    {
+        return Ok(false);
+    }
+    Ok(normalized_lines(&left_bytes).eq(normalized_lines(&right_bytes)))
+}
+
+/// The mode the file was saved with, and its bytes. An envelope yields the
+/// mode inside it; anything else yields the object's own mode.
+fn body(
+    repo: &HistoryRepo,
+    path: &str,
+    object: &Object,
+    interactive: bool,
+) -> Result<(String, Vec<u8>)> {
+    if repo.blob_starts_with(&object.1, MAGIC)? {
+        let decrypted = decrypt(repo, path, object, interactive)?;
+        return Ok((decrypted.0, repo.cat_object(&decrypted.1)?));
+    }
+    Ok((object.0.clone(), repo.cat_object(&object.1)?))
+}
+
+pub(crate) fn utf8_text(bytes: &[u8]) -> bool {
+    !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
+}
+
+/// Lines with CRLF reduced to LF, trailing ASCII spaces and tabs removed,
+/// and one missing final newline supplied. No allocation when the line
+/// already has that shape.
+fn normalized_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
+    bytes.split_inclusive(|byte| *byte == b'\n').map(|line| {
+        // A CR counts as a line ending only when LF follows it. A line that
+        // has no LF, including the last line, keeps a trailing CR.
+        let line = match line.strip_suffix(b"\n") {
+            Some(ended) => ended.strip_suffix(b"\r").unwrap_or(ended),
+            None => line,
+        };
+        let end = line
+            .iter()
+            .rposition(|byte| *byte != b' ' && *byte != b'\t')
+            .map_or(0, |index| index + 1);
+        &line[..end]
+    })
 }
 
 /// Whether a record merged as text still holds only envelopes.
