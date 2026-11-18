@@ -16,6 +16,8 @@ pub(crate) mod format;
 pub(crate) mod graph;
 pub mod layout;
 pub mod network;
+#[cfg(test)]
+mod normalized_equal;
 pub mod onboard;
 pub mod origin;
 mod preflight;

@@ -1629,7 +1629,13 @@ pub(super) fn settle_conflicts(
             });
             continue;
         }
-        if super::files::same_content(repo, path, &saved, &merged_object, false) {
+        // Compare the two saved sides, not the blob Git kept. With -merge
+        // that blob is one parent, so comparing it with the local side
+        // would settle a real difference.
+        let Some(theirs) = repo.object_at(remote, path)? else {
+            continue;
+        };
+        if super::files::normalized_equal(repo, path, &saved, &theirs, false)? {
             settled.insert(path.clone());
             overlays.push(crate::history::shadow::Overlay {
                 path: path.clone(),
@@ -1637,18 +1643,36 @@ pub(super) fn settle_conflicts(
             });
             continue;
         }
-        // Nothing here is -merge'd by Git, so a plaintext path whose two sides
-        // changed different lines is merged here exactly as Git used to.
-        let merged_text = match (base, repo.object_at(remote, path)?) {
-            (Some(base), Some(theirs)) => match repo.object_at(base, path)? {
-                Some(base) => repo.merge3(
-                    &repo.cat_object(&base.1)?,
-                    &repo.cat_object(&saved.1)?,
-                    &repo.cat_object(&theirs.1)?,
-                )?,
-                None => None,
-            },
-            _ => None,
+        // A symlink, a binary file, and a mode change are not text to merge.
+        // A regular file whose sides changed different lines is merged here
+        // exactly as Git used to, before -merge kept one side instead.
+        // An envelope is valid UTF-8, so the text check below would merge it.
+        // It is never text: its comparison happened above, after decryption.
+        let encrypted = repo.blob_starts_with(&saved.1, super::files::MAGIC)?
+            || repo.blob_starts_with(&theirs.1, super::files::MAGIC)?;
+        let merged_text = if !encrypted
+            && saved.0 == theirs.0
+            && saved.0 != "120000"
+            && let Some(base) = base
+            && let Some(base) = repo.object_at(base, path)?
+            && base.0 == saved.0
+            && !repo.blob_starts_with(&base.1, super::files::MAGIC)?
+        {
+            let (base_bytes, saved_bytes, remote_bytes) = (
+                repo.cat_object(&base.1)?,
+                repo.cat_object(&saved.1)?,
+                repo.cat_object(&theirs.1)?,
+            );
+            if super::files::utf8_text(&base_bytes)
+                && super::files::utf8_text(&saved_bytes)
+                && super::files::utf8_text(&remote_bytes)
+            {
+                repo.merge3(&base_bytes, &saved_bytes, &remote_bytes)?
+            } else {
+                None
+            }
+        } else {
+            None
         };
         if let Some(text) = merged_text {
             settled.insert(path.clone());

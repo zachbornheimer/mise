@@ -227,6 +227,14 @@ latest checkpoint, unsaved changes), Repository (the origin, branch, mode, and
 sync times), Conflicts, Automatic capture, and Bootstrap. A Next steps list
 names the commands that clear whatever needs attention.
 
+The Conflicts section lists a path both machines changed. A regular text file
+is not listed when the only difference is CRLF versus LF, spaces or tabs at
+the end of a line, or one missing or extra final newline. mise keeps this
+machine's saved bytes, including an encrypted file's saved envelope, and does
+not rewrite them. A changed byte, leading whitespace, a blank line, a lone
+carriage return, other Unicode whitespace, a mode change, a symlink target,
+and a binary file stay conflicts.
+
 | State                                              | Meaning                                                                                      | What to do                                                            |
 | -------------------------------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
 | `applied`                                          | The target matches its entry.                                                                | Nothing.                                                              |
