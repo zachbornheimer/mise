@@ -16,22 +16,22 @@ target="$HOME/.config/mise/conf.d/private.local.toml"
 # a missing target is created from the source with the declared mode
 assert_succeed "mise dot apply --yes"
 assert_contains "cat $target" "your_github_token"
-assert "stat -c %a $target" "600"
+assert "echo $(file_mode "$target")" "600"
 assert_contains "mise dot status --verbose" "applied"
 
 # the user fills in the token and loosens the mode: the merge keeps both
-sed -i 's/your_github_token/ghp_secret/' "$target"
+sed -i.bak 's/your_github_token/ghp_secret/' "$target"
 chmod 644 "$target"
 assert_succeed "mise dot apply --yes"
 assert_contains "cat $target" "ghp_secret"
-assert "stat -c %a $target" "644"
+assert "echo $(file_mode "$target")" "644"
 assert_contains "mise dot status --verbose" "applied"
 
 # deleting the file creates it again with the declared mode
 rm "$target"
 assert_succeed "mise dot apply --yes"
 assert_contains "cat $target" "your_github_token"
-assert "stat -c %a $target" "600"
+assert "echo $(file_mode "$target")" "600"
 
 # an enforced merge works the same way
 cat <<'EOF' >templates/shared.json
@@ -42,11 +42,11 @@ cat <<'EOF' >mise.toml
 "~/.config/app/settings.json/shared" = { source = "templates/shared.json", merge = true, permissions = "0640" }
 EOF
 assert_succeed "mise dot apply --yes"
-assert "stat -c %a $HOME/.config/app/settings.json" "640"
+assert "echo $(file_mode "$HOME/.config/app/settings.json")" "640"
 chmod 600 "$HOME/.config/app/settings.json"
 echo '{"theme": "light", "other": 1}' >"$HOME/.config/app/settings.json"
 assert_succeed "mise dot apply --yes"
-assert "stat -c %a $HOME/.config/app/settings.json" "600"
+assert "echo $(file_mode "$HOME/.config/app/settings.json")" "600"
 
 # entries that disagree about the mode of one file are refused
 cat <<'EOF' >templates/extra.json
@@ -71,7 +71,7 @@ cat <<'EOF' >mise.toml
 "~/.config/other/settings.json/shared" = { source = "templates/shared.json", merge = true, permissions = "0600" }
 EOF
 assert_succeed "mise dot apply --yes ~/.config/other/settings.json/shared"
-assert "stat -c %a $HOME/.config/other/settings.json" "600"
+assert "echo $(file_mode "$HOME/.config/other/settings.json")" "600"
 assert_fail "test -e $HOME/.config/two/settings.json"
 
 # a read-only mode is set after every merge for the file has written it
@@ -81,7 +81,7 @@ cat <<'EOF' >mise.toml
 "~/.config/ro/settings.json/two" = { source = "templates/extra.json", merge = true, permissions = "0444" }
 EOF
 assert_succeed "mise dot apply --yes"
-assert "stat -c %a $HOME/.config/ro/settings.json" "444"
+assert "echo $(file_mode "$HOME/.config/ro/settings.json")" "444"
 assert_contains "cat $HOME/.config/ro/settings.json" "theme"
 assert_contains "cat $HOME/.config/ro/settings.json" "extra"
 

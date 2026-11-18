@@ -12,6 +12,21 @@ use mise_util::agecrypt;
 
 const MAGIC: &[u8] = b"mise-encrypted-file-v1\n";
 
+/// Git's text-merge markers. A record that holds them is damage from a merge
+/// that treated two envelopes as text: it holds one complete envelope from
+/// each side and nothing else.
+const OURS: &[u8] = b"<<<<<<< ";
+const BASE: &[u8] = b"||||||| ";
+const SEP: &[u8] = b"=======";
+const THEIRS: &[u8] = b">>>>>>> ";
+
+/// A record Git merged as text: an envelope whose body starts with a marker.
+pub(crate) fn is_marker_record(bytes: &[u8]) -> bool {
+    bytes
+        .strip_prefix(MAGIC)
+        .is_some_and(|body| body.starts_with(OURS))
+}
+
 #[derive(Clone)]
 struct VerifiedAncestry {
     head: String,
@@ -120,7 +135,11 @@ fn audit_history_cached(
                     outer.path == path
                         && matches!(outer.mode.as_str(), "100644" | "100755" | "120000")
                         && outer.ciphertext.0.starts_with(b"age-encryption.org/v1\n")
-                });
+                })
+                // A record Git merged as text still holds only envelopes, so
+                // no plaintext enters history through it; its sides are
+                // resolved from decrypted content when it is read.
+                || record_of_envelopes(repo, &object)?;
             if !valid {
                 bail!(
                     "cannot publish: encrypted path {path} has an unencrypted or invalid version in commit {commit}; encrypting the latest version does not erase earlier plaintext. Remove that history before pushing, or use `mise dot sync --allow-plaintext-history` to publish it anyway",
@@ -174,6 +193,25 @@ pub(crate) fn encrypted_paths(
         .collect())
 }
 
+/// The newest commit in `head`'s ancestry whose tree holds `path` as a blob
+/// that is not an encrypted envelope, so a plaintext origin version names the
+/// commit that introduced it rather than only the branch head.
+pub(crate) fn plaintext_commit(
+    repo: &HistoryRepo,
+    head: &str,
+    path: &str,
+) -> Result<Option<String>> {
+    for commit in repo.rev_list(head, usize::MAX)? {
+        let Some((_mode, oid)) = repo.object_at(&commit, path)? else {
+            continue;
+        };
+        if !repo.blob_starts_with(&oid, MAGIC)? {
+            return Ok(Some(commit));
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     path: String,
@@ -219,9 +257,217 @@ fn envelope(repo: &HistoryRepo, object: &Object, limit: u64) -> Result<Option<En
     let Some(body) = bytes.strip_prefix(MAGIC) else {
         return Ok(None);
     };
-    Ok(Some(
-        rmp_serde::from_slice(body).wrap_err("invalid encrypted file envelope")?,
-    ))
+    match rmp_serde::from_slice(body) {
+        Ok(outer) => Ok(Some(outer)),
+        // two envelopes with markers between them are not one envelope
+        Err(_) if body.starts_with(OURS) => Ok(None),
+        Err(err) => Err(err).wrap_err("invalid encrypted file envelope"),
+    }
+}
+
+/// One envelope, parsed from bytes that may instead hold two.
+fn parse_envelope(bytes: &[u8]) -> Option<Envelope> {
+    let body = bytes.strip_prefix(MAGIC)?;
+    let mut cursor = std::io::Cursor::new(body);
+    let outer: Envelope = rmp_serde::from_read(&mut cursor).ok()?;
+    let used = cursor.position() as usize;
+    // Git terminates a side it had to cut with a newline
+    let trailing = &body[used..];
+    if !trailing.is_empty() && trailing != b"\n" {
+        return None;
+    }
+    if !outer.ciphertext.0.starts_with(b"age-encryption.org/v1\n") {
+        return None;
+    }
+    Some(outer)
+}
+
+/// Both sides of the outermost markers, with any markers inside a side kept as
+/// that side's text.
+fn conflict_sides(bytes: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    #[derive(Clone, Copy)]
+    enum Side {
+        Common,
+        Ours,
+        Base,
+        Theirs,
+    }
+    let mut ours = Vec::new();
+    let mut theirs = Vec::new();
+    let mut side = Side::Common;
+    let mut depth = 0usize;
+    let mut seen = false;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let (line, next) = match rest.iter().position(|byte| *byte == b'\n') {
+            Some(end) => (&rest[..=end], &rest[end + 1..]),
+            None => (rest, &rest[rest.len()..]),
+        };
+        let emit = |ours: &mut Vec<u8>, theirs: &mut Vec<u8>, side: Side| match side {
+            Side::Common => {
+                ours.extend_from_slice(line);
+                theirs.extend_from_slice(line);
+            }
+            Side::Ours => ours.extend_from_slice(line),
+            Side::Theirs => theirs.extend_from_slice(line),
+            Side::Base => {}
+        };
+        if line.starts_with(OURS) {
+            depth += 1;
+            if depth == 1 {
+                seen = true;
+                side = Side::Ours;
+            } else {
+                emit(&mut ours, &mut theirs, side);
+            }
+        } else if line.starts_with(BASE) && depth == 1 {
+            side = Side::Base;
+        } else if line.strip_suffix(b"\n").unwrap_or(line) == SEP && depth == 1 {
+            side = Side::Theirs;
+        } else if line.starts_with(THEIRS) {
+            if depth == 1 {
+                side = Side::Common;
+            } else {
+                emit(&mut ours, &mut theirs, side);
+            }
+            depth = depth.saturating_sub(1);
+        } else {
+            emit(&mut ours, &mut theirs, side);
+        }
+        rest = next;
+    }
+    (seen && depth == 0).then_some((ours, theirs))
+}
+
+/// Every complete envelope a record holds, one per side, however many merges
+/// nested markers in it.
+fn record_envelopes(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let mut found = vec![];
+    let mut pending = vec![bytes.to_vec()];
+    while let Some(candidate) = pending.pop() {
+        if parse_envelope(&candidate).is_some() {
+            found.push(candidate);
+            continue;
+        }
+        match conflict_sides(&candidate) {
+            Some((ours, theirs)) => {
+                pending.push(theirs);
+                pending.push(ours);
+            }
+            None => found.push(candidate),
+        }
+    }
+    found
+}
+
+/// What a damaged record holds: two envelopes Git merged as text.
+#[derive(Debug)]
+pub(crate) enum Repair {
+    /// Every side decrypts to the same content: one side's envelope is the record.
+    Same { envelope: Vec<u8>, object: Object },
+    /// The sides hold different content: a real conflict between two versions.
+    Conflict { sides: Vec<Object> },
+    /// Not a record Git merged as text.
+    Intact,
+}
+
+/// Decrypt both embedded envelopes. Equal content takes one side; different
+/// content is a real conflict, not a record to adopt.
+pub(crate) fn repair(
+    repo: &HistoryRepo,
+    path: &str,
+    object: &Object,
+    interactive: bool,
+) -> Result<Repair> {
+    // Ordinary paths, and files too large to be an envelope, are not records
+    // Git merged as text: check the cheap prefix before reading any body.
+    if !repo.blob_starts_with(&object.1, MAGIC)?
+        || !is_marker_record(&repo.cat_object_bounded(&object.1, agecrypt::MAX_ENCRYPTED_BYTES)?)
+    {
+        return Ok(Repair::Intact);
+    }
+    let bytes = repo.cat_object_bounded(&object.1, agecrypt::MAX_ENCRYPTED_BYTES)?;
+    let mut found = vec![];
+    for candidate in record_envelopes(&bytes) {
+        let Some(outer) = parse_envelope(&candidate) else {
+            continue;
+        };
+        if outer.path != path || !matches!(outer.mode.as_str(), "100644" | "100755" | "120000") {
+            continue;
+        }
+        found.push((candidate, open(repo, path, &outer, interactive)?));
+    }
+    if found.is_empty() {
+        bail!("{path} holds merge markers but no complete encrypted file");
+    }
+    if found.iter().all(|(_, object)| *object == found[0].1) {
+        let (envelope, object) = found.swap_remove(0);
+        return Ok(Repair::Same { envelope, object });
+    }
+    Ok(Repair::Conflict {
+        sides: found.into_iter().map(|(_, object)| object).collect(),
+    })
+}
+
+/// Whether two saved sides hold the same content, whatever their ciphertext.
+/// An encrypted path compares what it decrypts to; anything else its object.
+pub(crate) fn same_content(
+    repo: &HistoryRepo,
+    path: &str,
+    left: &Object,
+    right: &Object,
+    interactive: bool,
+) -> bool {
+    if left == right {
+        return true;
+    }
+    let envelope = |object: &Object| repo.blob_starts_with(&object.1, MAGIC).unwrap_or(false);
+    if !envelope(left) || !envelope(right) {
+        return false;
+    }
+    match (
+        decrypt(repo, path, left, interactive),
+        decrypt(repo, path, right, interactive),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Whether a record merged as text still holds only envelopes.
+fn record_of_envelopes(repo: &HistoryRepo, object: &Object) -> Result<bool> {
+    if !repo.blob_starts_with(&object.1, MAGIC)? {
+        return Ok(false);
+    }
+    let bytes = repo.cat_object_bounded(&object.1, agecrypt::MAX_ENCRYPTED_BYTES)?;
+    if !is_marker_record(&bytes) {
+        return Ok(false);
+    }
+    let envelopes = record_envelopes(&bytes);
+    Ok(!envelopes.is_empty()
+        && envelopes
+            .iter()
+            .all(|candidate| parse_envelope(candidate).is_some()))
+}
+
+fn open(repo: &HistoryRepo, path: &str, outer: &Envelope, interactive: bool) -> Result<Object> {
+    let bytes = agecrypt::decrypt_sync(&outer.ciphertext.0, interactive).map_err(|err| {
+        // a damaged file is not one another key would unlock, so it is not
+        // collected with the locked ones: it fails as itself
+        if matches!(
+            err.downcast_ref::<agecrypt::DecryptError>(),
+            Some(agecrypt::DecryptError::Corrupt(_))
+        ) {
+            err.wrap_err(format!("{path} is not a readable encrypted file"))
+        } else {
+            err.wrap_err(Locked(path.to_string()))
+        }
+    })?;
+    let inner: Plaintext =
+        rmp_serde::from_slice(&bytes).wrap_err("invalid encrypted file payload")?;
+    validate(path, outer, &inner)?;
+    let oid = repo.transient_blob_id(&inner.content.0)?;
+    Ok((inner.mode, oid))
 }
 
 fn validate(path: &str, outer: &Envelope, inner: &Plaintext) -> Result<()> {
@@ -252,40 +498,66 @@ impl std::fmt::Display for Locked {
     }
 }
 
+/// An encrypt-declared path whose origin version is not an encrypted
+/// envelope. It is a per-path condition, not a broken repository: the
+/// version can be taken as it is, or replaced by the encrypted version this
+/// machine publishes, without touching any other path.
+#[derive(Debug)]
+pub(crate) struct PlaintextInEncryptedPath(pub String);
+
+impl std::fmt::Display for PlaintextInEncryptedPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "missing encrypted file envelope: {}", self.0)
+    }
+}
+
+impl std::error::Error for PlaintextInEncryptedPath {}
+
 pub(crate) fn decrypt(
     repo: &HistoryRepo,
     path: &str,
     object: &Object,
     interactive: bool,
 ) -> Result<Object> {
-    let outer = envelope(repo, object, agecrypt::MAX_ENCRYPTED_BYTES)?
-        .ok_or_else(|| eyre::eyre!("missing encrypted file envelope: {path}"))?;
+    let envelope = envelope(repo, object, agecrypt::MAX_ENCRYPTED_BYTES)?;
     if control_file(path) {
         bail!("setup configuration itself cannot be encrypted: {path}");
     }
-    if outer.path != path {
+    // An envelope is bound to one path: a cached decryption of the same blob
+    // must not stand in for another path.
+    if envelope.as_ref().is_some_and(|outer| outer.path != path) {
         bail!("encrypted file does not match its path: {path}");
     }
     if let Some(decrypted) = repo.decrypted_object(&object.1) {
         return Ok(decrypted);
     }
-    let bytes = agecrypt::decrypt_sync(&outer.ciphertext.0, interactive).map_err(|err| {
-        // a damaged file is not one another key would unlock, so it is not
-        // collected with the locked ones: it fails as itself
-        if matches!(
-            err.downcast_ref::<agecrypt::DecryptError>(),
-            Some(agecrypt::DecryptError::Corrupt(_))
-        ) {
-            err.wrap_err(format!("{path} is not a readable encrypted file"))
-        } else {
-            err.wrap_err(Locked(path.to_string()))
-        }
-    })?;
-    let inner: Plaintext =
-        rmp_serde::from_slice(&bytes).wrap_err("invalid encrypted file payload")?;
-    validate(path, &outer, &inner)?;
-    let oid = repo.transient_blob_id(&inner.content.0)?;
-    let decrypted = (inner.mode, oid);
+    let Some(outer) = envelope else {
+        // the only other thing mise saves at an encrypted path is a record
+        // Git merged as text, which holds the two sides' envelopes
+        return match repair(repo, path, object, interactive)? {
+            Repair::Same {
+                object: decrypted, ..
+            } => {
+                repo.remember_decrypted(&object.1, decrypted.clone());
+                Ok(decrypted)
+            }
+            Repair::Conflict { sides } => bail!(
+                "{path} holds two different saved versions Git merged as text; resolve which one stands: {}",
+                sides
+                    .iter()
+                    .map(|(mode, oid)| format!("{mode} {oid}"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ),
+            // not a record and not an envelope: a plaintext version of an
+            // encrypted path, which the reconcile step turns into one path's
+            // conflict instead of failing every sync
+            Repair::Intact => Err(eyre::Report::new(PlaintextInEncryptedPath(
+                path.to_string(),
+            ))),
+        };
+    };
+    let decrypted = open(repo, path, &outer, interactive)?;
     repo.remember_decrypted(&object.1, decrypted.clone());
     Ok(decrypted)
 }
@@ -303,6 +575,14 @@ pub(crate) fn holds(
     content: &[u8],
     scheme: &str,
 ) -> bool {
+    // a record Git merged as text is rewritten by this save, not kept: its
+    // sides hold the same content, and one clean envelope replaces it
+    if repo
+        .cat_object_bounded(&object.1, agecrypt::MAX_ENCRYPTED_BYTES)
+        .is_ok_and(|bytes| is_marker_record(&bytes))
+    {
+        return false;
+    }
     let Ok(Some(outer)) = envelope(repo, object, agecrypt::MAX_ENCRYPTED_BYTES) else {
         return false;
     };
@@ -682,6 +962,69 @@ mod tests {
                 content: Bytes(vec![]),
             };
             assert!(validate("tracked/home/secret", &outer, &inner).is_err());
+        }
+    }
+
+    #[test]
+    fn a_record_git_merged_as_text_resolves_by_decrypted_content() {
+        use age::secrecy::ExposeSecret;
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let key = age::x25519::Identity::generate();
+        let mut environment = mise_util::testing::EnvVarGuard::new();
+        environment.set("MISE_AGE_KEY", key.to_string().expose_secret());
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        // a repository path, not a machine path: no home directory is read
+        let path = "tracked/home/secret"; // portable-home-ok
+        // What Git writes when it merges two envelopes as text: the magic line
+        // is common, and each side keeps its own envelope body.
+        let merged_record = |left: &[u8], right: &[u8]| -> Object {
+            let ours = encode(path, "100644", left, "scheme", &recipients).unwrap();
+            let theirs = encode(path, "100644", right, "scheme", &recipients).unwrap();
+            assert_ne!(ours, theirs, "encryption is randomized");
+            let mut merged = MAGIC.to_vec();
+            merged.extend_from_slice(OURS);
+            merged.extend_from_slice(b"left\n");
+            merged.extend_from_slice(&ours[MAGIC.len()..]);
+            merged.extend_from_slice(b"\n=======\n");
+            merged.extend_from_slice(&theirs[MAGIC.len()..]);
+            merged.extend_from_slice(b"\n>>>>>>> right\n");
+            ("100644".into(), repo.hash_blob(&merged).unwrap())
+        };
+
+        // The same content on both sides: the record reads as that content,
+        // nothing plaintext enters history through it, and a save rewrites it.
+        let same = merged_record(b"one saved version", b"one saved version");
+        let expected = (
+            "100644".into(),
+            repo.transient_blob_id(b"one saved version").unwrap(),
+        );
+        assert_eq!(decrypt(&repo, path, &same, false).unwrap(), expected);
+        assert!(!holds(
+            &repo,
+            path,
+            &same,
+            "100644",
+            b"one saved version",
+            "scheme"
+        ));
+        assert!(record_of_envelopes(&repo, &same).unwrap());
+
+        // Different content is a real conflict, not a record to adopt.
+        let conflict = merged_record(b"left version", b"right version");
+        let err = decrypt(&repo, path, &conflict, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("two different saved versions"),
+            "{err:#}"
+        );
+        match repair(&repo, path, &conflict, false).unwrap() {
+            Repair::Conflict { sides } => assert_eq!(sides.len(), 2),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        // and one equal record still yields an envelope a save can keep
+        match repair(&repo, path, &same, false).unwrap() {
+            Repair::Same { envelope, .. } => assert!(parse_envelope(&envelope).is_some()),
+            other => panic!("expected one side, got {other:?}"),
         }
     }
 

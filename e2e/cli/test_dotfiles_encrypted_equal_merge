@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Two machines save identical content with no shared encryption cache, then
+# sync. Encryption is randomized, so each side holds a different blob for the
+# same plaintext, and Git's line merge sees a conflict in the merged tree.
+# mise resolves such a path by its decrypted content: the content is equal, so
+# the local saved envelope stands and no conflict marker is ever committed.
+require_cmd git
+export MISE_HISTORY_NOTIFY=false
+# The key is read from the encrypted-capture test rather than repeated here:
+# the same fixture key, with no new secret written into this file.
+capture_test="${ROOT:?}/e2e/cli/test_dotfiles_encrypted_capture"
+MISE_AGE_KEY=$(sed -n 's/^export MISE_AGE_KEY=//p' "$capture_test" | head -1 | tr -d '"')
+[ -n "$MISE_AGE_KEY" ] || {
+  echo "no age key in $capture_test" >&2
+  exit 1
+}
+export MISE_AGE_KEY
+origin="$PWD/encrypted-equal-origin.git"
+git init -q --bare -b main "$origin"
+
+# Small files: a ciphertext long enough to hold a NUL byte is merged as binary
+# by Git and never marked, so the readable-enough envelopes are the ones that
+# used to leave markers behind.
+files=(a b c d e f g h i j k l m n o p q r s t)
+mkdir -p "$MISE_CONFIG_DIR" ~/.equal
+{
+  echo '[history.encryption]'
+  echo 'recipients = ["age1fuvsfq02qr5ju0nhh3rulrwracymjljlr5j49kres24ltd3fjq0s9z9d8l"]'
+  echo '[dotfiles]'
+  for f in "${files[@]}"; do
+    echo "\"~/.equal/$f\" = { mode = \"track\", encrypt = true }"
+  done
+} >"$MISE_CONFIG_DIR/config.toml"
+for f in "${files[@]}"; do echo "v1-$f" >~/.equal/"$f"; done
+assert_succeed "mise dot save"
+assert_succeed "mise dot origin set file://$origin --sync manual --yes"
+assert_succeed "mise dot sync"
+
+second="$(dirname "$HOME")/second"
+mkdir -p "$second"
+export second
+b() {
+  (
+    cd "$second" || exit
+    env HOME="$second" XDG_CONFIG_HOME="$second/.config" MISE_CONFIG_DIR="$second/.config/mise" \
+      MISE_STATE_DIR="$second/.local/state/mise" MISE_DATA_DIR="$second/.local/share/mise" \
+      MISE_CACHE_DIR="$second/.cache/mise" MISE_TRUSTED_CONFIG_PATHS="$second" mise "$@"
+  )
+}
+export -f b
+assert_succeed "b bootstrap --adopt file://$origin --yes"
+
+# Both machines write the same new content and encrypt it here: neither keeps
+# the other's ciphertext, so the two sides differ byte for byte.
+for f in "${files[@]}"; do echo "v2-$f" >~/.equal/"$f"; done
+assert_succeed "mise dot save"
+for f in "${files[@]}"; do echo "v2-$f" >"$second/.equal/$f"; done
+assert_succeed "b dot save"
+
+local_repo="$MISE_STATE_DIR/history/repo.git"
+second_repo="$second/.local/state/mise/history/repo.git"
+cipher_of_one_plaintext() {
+  local ours theirs
+  ours=$(git --git-dir="$1" rev-parse "main:home/.equal/a")
+  theirs=$(git --git-dir="$2" rev-parse "main:home/.equal/a")
+  if [ "$ours" = "$theirs" ]; then echo identical; else echo different; fi
+}
+export -f cipher_of_one_plaintext
+assert "cipher_of_one_plaintext $local_repo $second_repo" "different"
+
+# Paths whose blob holds a Git conflict marker anywhere in its text.
+marker_paths() {
+  local repo=$1 rev=$2 found=""
+  while read -r _mode type oid path; do
+    [ "$type" = blob ] || continue
+    if git --git-dir="$repo" cat-file -p "$oid" | grep -q '^<<<<<<< '; then
+      found="$found $path"
+    fi
+  done < <(git --git-dir="$repo" ls-tree -r "$rev")
+  printf '%s' "${found# }"
+}
+export -f marker_paths
+
+assert_succeed "mise dot sync"
+# B fetches on sync and records the incoming history on pull: the pull merges
+# B's divergent envelope against the published one for the same content.
+assert_succeed "b dot sync"
+assert_succeed "b dot pull --yes"
+
+merged_tree_is_clean() {
+  local found
+  found=$(marker_paths "$1" main)
+  if [ -z "$found" ]; then echo clean; else echo "marked: $found"; fi
+}
+export -f merged_tree_is_clean
+assert "merged_tree_is_clean $second_repo" "clean"
+assert "merged_tree_is_clean $origin" "clean"
+assert "merged_tree_is_clean $local_repo" "clean"
+assert "cat $second/.equal/a" "v2-a"
+# and publishing from the second machine is not blocked by the old records
+assert_succeed "b dot save"
+assert_succeed "b dot sync"
