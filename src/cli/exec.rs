@@ -292,6 +292,35 @@ impl Exec {
         wrapper_env: BTreeMap<String, String>,
         wrapper_dispatch: bool,
     ) -> eyre::Result<()> {
+        // A tool named on the command line is an explicit request: report a
+        // config-declared `os` that excludes this platform here, as `mise
+        // install` does, instead of resolving release assets for a platform
+        // the tool never publishes. The command-line request carries only its
+        // version, so the `os` option is read from the configuration.
+        if !self.tool.is_empty() {
+            let declared = config.get_tool_request_set().await?;
+            for ta in &self.tool {
+                let Some(requests) = declared.tools.get(ta.ba.as_ref()) else {
+                    continue;
+                };
+                let Some(tr) = requests.iter().find(|tr| !tr.is_os_option_supported()) else {
+                    continue;
+                };
+                let scoped_to = tr
+                    .os()
+                    .iter()
+                    .flatten()
+                    .map(|os| format!("{os:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                eyre::bail!(
+                    "{} is not available on {}: its configured os = [{}] excludes this platform",
+                    tr.ba().short,
+                    Settings::get().os(),
+                    scoped_to
+                );
+            }
+        }
         let opts = InstallOptions {
             force: false,
             jobs: self.jobs,
