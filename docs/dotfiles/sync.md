@@ -290,9 +290,13 @@ again.
 Invalid incoming configuration or an unsafe local path also blocks the whole
 batch; `mise dot status` and `mise doctor` name the paths and the last
 successful application. A few conflicts cannot be resolved with `pull`, such
-as changes to tracking or encryption settings, inactive platform variants, or
-histories with several Git merge bases. For those, `status` prints Git
-commands to run in a separate clone.
+as changes to tracking or encryption settings or inactive platform variants.
+Histories with several Git merge bases are merged from the enrollment those
+bases share, so an independent addition from any base is kept. A path both
+sides changed, including the bases themselves, stays a conflict that names
+the path. A history whose bases share no ancestry cannot be merged; `mise
+dot status` then prints the manual reconciliation. `mise dot conflicts`
+cannot recover that case, because it plans through the same merge.
 
 ### Conflict notifications {#conflict-notifications}
 

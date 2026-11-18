@@ -56,29 +56,29 @@ pub(crate) fn build(
         // Enrollment is a keyed inventory, not arbitrary JSON text. Git's
         // line merge can conflict on independent additions or combine policy
         // changes into invalid metadata. Validate its structured merge first.
-        if let Some(base) = &heads.base {
-            use crate::history::manifest::Manifest;
-            if let (Some(base), Some(ours), Some(theirs)) = (
-                Manifest::read(repo, base)?,
-                Manifest::read(repo, local)?,
-                Manifest::read(repo, remote)?,
-            ) {
-                merged = Manifest::merge(&base, &ours, &theirs)?.write(repo, &merged)?;
-                conflicts.retain(|path| path != crate::history::manifest::PATH);
-                // A conflicted encrypted path whose decrypted content is equal is not a
-                // conflict to resolve: the local saved envelope stands, and Git's
-                // version of that path is never published.
-                let settled = super::run::settle_conflicts(
-                    repo,
-                    heads.base.as_deref(),
-                    local,
-                    remote,
-                    &merged,
-                    conflicts,
-                )?;
-                merged = settled.0;
-                conflicts = settled.1;
-            }
+        // Several merge bases have no commit to read. Their enrollment is
+        // one virtual manifest, the same one sync applies; file conflicts
+        // still settle against a real commit, never that manifest.
+        let base = super::run::enrollment_base(repo, local, remote)?;
+        use crate::history::manifest::Manifest;
+        if let (Some(ours), Some(theirs)) =
+            (Manifest::read(repo, local)?, Manifest::read(repo, remote)?)
+        {
+            merged = Manifest::merge(&base, &ours, &theirs)?.write(repo, &merged)?;
+            conflicts.retain(|path| path != crate::history::manifest::PATH);
+            // A conflicted encrypted path whose decrypted content is equal is not a
+            // conflict to resolve: the local saved envelope stands, and Git's
+            // version of that path is never published.
+            let settled = super::run::settle_conflicts(
+                repo,
+                heads.base.as_deref(),
+                local,
+                remote,
+                &merged,
+                conflicts,
+            )?;
+            merged = settled.0;
+            conflicts = settled.1;
         }
         let unresolved: Vec<_> = conflicts
             .iter()
