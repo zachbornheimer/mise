@@ -1255,6 +1255,14 @@ Resolve every remaining conflict by keeping this machine's version
 Paths named by `--take-remote` take the origin's version; every other conflict keeps this machine's. Each kept path must already be saved.
 """#
             }
+            flag --wait help="Wait this long for a running sync or pull instead of failing" {
+                long_help #"""
+Wait this long for a running sync or pull instead of failing
+
+Accepts a duration such as `90s`, `5m` or `1h` (at most one hour). Without it the wait is `history.lock_wait`, 30 seconds by default; `0` fails at once. The refusal names the holder either way.
+"""#
+                arg <DURATION>
+            }
             flag "-h --help" help="Print help" action=help builtin=#true
             arg "[PATH]…" help="Not supported; a pull always applies every incoming change" required=#false var=#true hide=#true
             example "mise dot pull --dry-run" help="Show what would be written"
@@ -1366,6 +1374,14 @@ The watcher does this on its own in `sync` and `fetch-only` mode (the `history.s
             flag --fetch-only help="Fetch without pushing"
             flag --allow-plaintext-history help="Allow pushing older unencrypted versions of files that are now encrypted, and versions that look like they contain secrets"
             flag --best-effort help="Warn instead of failing when the origin is unreachable"
+            flag --wait help="Wait this long for a running sync or pull instead of failing" {
+                long_help #"""
+Wait this long for a running sync or pull instead of failing
+
+Accepts a duration such as `90s`, `5m` or `1h` (at most one hour). Without it the wait is `history.lock_wait`, 30 seconds by default; `0` fails at once. The refusal names the holder either way.
+"""#
+                arg <DURATION>
+            }
             flag "-h --help" help="Print help" action=help builtin=#true
             example "mise dot sync" help="Push and fetch now"
             example "mise dot sync --fetch-only" help="Fetch without pushing"
@@ -3471,6 +3487,14 @@ Resolve every remaining conflict by keeping this machine's version
 Paths named by `--take-remote` take the origin's version; every other conflict keeps this machine's. Each kept path must already be saved.
 """#
         }
+        flag --wait help="Wait this long for a running sync or pull instead of failing" {
+            long_help #"""
+Wait this long for a running sync or pull instead of failing
+
+Accepts a duration such as `90s`, `5m` or `1h` (at most one hour). Without it the wait is `history.lock_wait`, 30 seconds by default; `0` fails at once. The refusal names the holder either way.
+"""#
+            arg <DURATION>
+        }
         flag "-h --help" help="Print help" action=help builtin=#true
         arg "[PATH]…" help="Not supported; a pull always applies every incoming change" required=#false var=#true hide=#true
         example "mise dot pull --dry-run" help="Show what would be written"
@@ -3582,6 +3606,14 @@ The watcher does this on its own in `sync` and `fetch-only` mode (the `history.s
         flag --fetch-only help="Fetch without pushing"
         flag --allow-plaintext-history help="Allow pushing older unencrypted versions of files that are now encrypted, and versions that look like they contain secrets"
         flag --best-effort help="Warn instead of failing when the origin is unreachable"
+        flag --wait help="Wait this long for a running sync or pull instead of failing" {
+            long_help #"""
+Wait this long for a running sync or pull instead of failing
+
+Accepts a duration such as `90s`, `5m` or `1h` (at most one hour). Without it the wait is `history.lock_wait`, 30 seconds by default; `0` fails at once. The refusal names the holder either way.
+"""#
+            arg <DURATION>
+        }
         flag "-h --help" help="Print help" action=help builtin=#true
         example "mise dot sync" help="Push and fetch now"
         example "mise dot sync --fetch-only" help="Fetch without pushing"

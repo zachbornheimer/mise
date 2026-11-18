@@ -2381,6 +2381,11 @@
               "description": "How long a command waits for another history operation before failing.",
               "type": "string"
             },
+            "network_timeout": {
+              "default": "5m",
+              "description": "How long a history fetch, push, or remote listing may run before mise ends it.",
+              "type": "string"
+            },
             "notify": {
               "default": true,
               "description": "Show a desktop notification when a sync conflict pauses sharing.",

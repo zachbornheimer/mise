@@ -2400,12 +2400,14 @@ impl HistoryRepo {
         }
     }
 
-    /// Runs a network command with the user's git configuration.
+    /// Runs a network command with the user's git configuration, bounded
+    /// by `history.network_timeout`. `0` waits without a limit.
     pub(crate) fn network<'a>(
         &self,
         args: impl IntoIterator<Item = &'a str>,
     ) -> Result<std::process::Output> {
-        self.git.network_output(PlumbingCall::new(args))
+        self.git
+            .network_output(PlumbingCall::new(args), super::scope::network_timeout())
     }
 
     pub(crate) const ANNOTATION_TRAILER: &'static str = "Mise-Annotation: ";
