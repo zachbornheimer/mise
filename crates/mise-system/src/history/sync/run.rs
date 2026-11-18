@@ -26,6 +26,11 @@ use mise_util::file::display_path;
 
 const PUSH_RETRIES: usize = 5;
 
+/// How many times one sync re-plans because the local saved history moved
+/// while it planned. The watcher saves every edit, so a busy machine moves it
+/// often; a bound keeps a machine that never settles from looping forever.
+const REPLAN_LIMIT: usize = 20;
+
 /// An incoming change waiting for `mise dot pull` (or automatic
 /// application in `sync` mode).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -221,6 +226,14 @@ pub struct SyncRequest {
     /// A preview: nothing is announced (the caller puts the recorded state
     /// back afterwards).
     pub dry_run: bool,
+    /// Wait in line behind a running sync or pull (`history.lock_wait`)
+    /// instead of failing at once. Commands someone runs queue; the watcher
+    /// does not, because it retries a contended sync on its own schedule.
+    pub queue: bool,
+    /// How long a queued sync waits for the lock before giving up; `None`
+    /// uses `history.lock_wait`. This is `--wait`, so a caller can bound a
+    /// wait longer or shorter than the setting.
+    pub wait: Option<Duration>,
 }
 
 impl SyncRequest {
@@ -232,6 +245,8 @@ impl SyncRequest {
             origin: None,
             offline: false,
             dry_run: false,
+            queue: false,
+            wait: None,
         }
     }
 }
@@ -255,10 +270,137 @@ pub fn origin() -> Result<OriginTomlConfig> {
     bail!("no setup repository is connected; `mise dot origin set <url>` connects one")
 }
 
+/// Whether the saved history has moved since `shared` was read from it. The
+/// watcher saves a checkpoint on every edit, so this is how a sync finds out
+/// that the plans built from `shared` no longer describe what would be
+/// published.
+fn head_moved(
+    repo: &crate::history::shadow::HistoryRepo,
+    shared: &share::ShareReport,
+) -> Result<bool> {
+    Ok(repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)? != shared.checkpoint)
+}
+
 /// Runs one synchronization.
 pub fn sync(store: &Store, tracked: &TrackedSet, request: &SyncRequest) -> Result<SyncOutcome> {
-    let _sync_lock = lock(store)?;
+    let asked = chrono::Utc::now();
+    let _sync_lock = if request.queue {
+        match lock_in(store.state_dir()) {
+            Ok(lock) => lock,
+            Err(_) => match wait_in_line(store, tracked, request, asked)? {
+                Queued::Lock(lock) => lock,
+                Queued::Served(outcome) => return Ok(outcome),
+            },
+        }
+    } else {
+        lock(store)?
+    };
     sync_locked(store, tracked, request)
+}
+
+enum Queued {
+    Lock(fslock::LockFile),
+    Served(SyncOutcome),
+}
+
+/// Waits for the sync lock behind a running sync, and stops waiting as soon
+/// as a sync that began after this one was asked has published what this
+/// machine had saved when it was asked. The lock is not first come, first
+/// served: polling waiters race for it, and one could lose to newer syncs
+/// until its wait ran out although each of them had already done its work.
+/// Checking while waiting needs no lock: `sync.json` is replaced
+/// atomically, and a sync writes it once, when it is done.
+fn wait_in_line(
+    store: &Store,
+    tracked: &TrackedSet,
+    request: &SyncRequest,
+    asked: chrono::DateTime<chrono::Utc>,
+) -> Result<Queued> {
+    // a dry run, an offline sync and a sync to another origin are not the
+    // sync whose result another one reports, so they only wait
+    let may_be_covered = !request.dry_run && !request.offline && request.origin.is_none();
+    // what this sync must publish is what is saved now, so save the live
+    // files first, as the sync itself would (skipped while another write
+    // operation holds the files, exactly as the sync would skip it)
+    if may_be_covered && request.capture {
+        capture_now(store, tracked);
+    }
+    let pinned = store
+        .repo()
+        .map(|repo| repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF))
+        .transpose()?
+        .flatten();
+    let publishes = SyncMode::current()?.publishes() && !request.fetch_only;
+    let wait = request
+        .wait
+        .unwrap_or_else(crate::history::scope::operation_lock_wait);
+    let deadline = Instant::now() + wait;
+    let mut seen_fetch = None;
+    loop {
+        if let Some(lock) = mise_util::lock_file::LockFile::at(&lock_path(store.state_dir()))
+            .with_pid()
+            .try_lock()?
+        {
+            return Ok(Queued::Lock(lock));
+        }
+        let status = read_status(store.state_dir())?;
+        if may_be_covered && status.last_fetch != seen_fetch {
+            seen_fetch = status.last_fetch.clone();
+            if let Some(outcome) = covered(store, &status, asked, pinned.as_deref(), publishes)? {
+                debug!("history sync: a sync that began after this one covered it");
+                return Ok(Queued::Served(outcome));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(contended(store.state_dir(), Some(wait)));
+        }
+        std::thread::sleep(STATUS_LOCK_POLL);
+    }
+}
+
+/// Whether the sync that last wrote `status` did this sync's work: it
+/// fetched after this sync was asked, succeeded, and (when this sync would
+/// publish) the origin holds `pinned`, the newest checkpoint saved when this
+/// sync was asked.
+fn covered(
+    store: &Store,
+    status: &SyncStatus,
+    asked: chrono::DateTime<chrono::Utc>,
+    pinned: Option<&str>,
+    publishes: bool,
+) -> Result<Option<SyncOutcome>> {
+    let fetched_since_asked = status
+        .last_fetch
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|at| at >= asked);
+    if !fetched_since_asked || status.last_error.is_some() {
+        return Ok(None);
+    }
+    if publishes && let Some(pinned) = pinned {
+        let Some(repo) = store.repo() else {
+            return Ok(None);
+        };
+        let Some(upstream) = repo.ref_oid(UPSTREAM_REF)? else {
+            return Ok(None);
+        };
+        if upstream != pinned
+            && !repo
+                .merge_bases(pinned, &upstream)?
+                .iter()
+                .any(|base| base == pinned)
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(SyncOutcome {
+        published: None,
+        pending: status.pending_applications.len() + usize::from(status.pending_repository),
+        pending_repository: status.pending_repository,
+        pending_directories: status.pending_directories,
+        conflicts: status.conflicts.len(),
+        fetched_upstream: status.upstream_commit.clone(),
+    }))
 }
 
 /// Runs one synchronization while the caller holds the sync lock.
@@ -340,7 +482,7 @@ pub(crate) fn sync_locked(
             super::origin::discard_contentless_history(repo)?;
         }
         let mut shared = share::current(repo, tracked)?;
-        let unsaved = unsaved_paths(repo, tracked, &shared)?;
+        let mut unsaved = unsaved_paths(repo, tracked, &shared)?;
         let publish = mode.publishes() && !request.fetch_only && !request.offline;
         if publish
             && !allow_plaintext_history
@@ -350,8 +492,48 @@ pub(crate) fn sync_locked(
         }
         let mut plans;
         let mut attempts = 0;
+        let mut replans = 0;
         loop {
             attempts += 1;
+            // The plans below are built from `shared`, the saved history as it
+            // was when it was read. A checkpoint saved since then (autosave
+            // keeps saving while a sync runs) was never examined by them, so
+            // publishing past it is unsafe and failing wastes the whole sync.
+            // Read the history again and plan again instead. Re-planning is not
+            // a rejected push, so it does not spend the push retries.
+            if head_moved(repo, &shared)?
+                && !shared.checkpoint.as_deref().is_some_and(|pinned| {
+                    publish::fast_forwards(
+                        repo,
+                        pinned,
+                        repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)
+                            .ok()
+                            .flatten()
+                            .as_deref(),
+                        upstream_commit.as_deref(),
+                    )
+                    .unwrap_or(false)
+                })
+            {
+                replans += 1;
+                if replans > REPLAN_LIMIT {
+                    bail!(
+                        "local saved history kept changing while planning ({REPLAN_LIMIT} re-plans); retry shortly"
+                    );
+                }
+                debug!("history sync: saved history moved while planning, planning again");
+                attempts -= 1;
+                shared = share::current(repo, tracked)?;
+                unsaved = unsaved_paths(repo, tracked, &shared)?;
+                if publish
+                    && !allow_plaintext_history
+                    && let Some(head) =
+                        repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)?
+                {
+                    audit_publication(repo, &head, tracked)?;
+                }
+                continue;
+            }
             let upstream = reconcile::upstream_with_interaction(
                 repo,
                 upstream_commit.as_deref(),
@@ -514,6 +696,85 @@ fn lock_path(state_dir: &Path) -> PathBuf {
     hstore::store_dir_in(state_dir).join("sync.lock")
 }
 
+/// Who holds the sync lock, for a refusal to name: the pid the holder
+/// recorded, the command that pid runs, and how long it has held the lock.
+/// "Another sync is running" and "a watcher is parked on the lock" read the
+/// same without this, and only one of them is worth waiting for.
+fn describe_holder(state_dir: &Path) -> String {
+    let path = lock_path(state_dir);
+    let Some(pid) = mise_util::lock_file::read_holder_pid(&path) else {
+        return "the holder recorded no pid (a mise older than this one, or it released the lock as this was read)".to_string();
+    };
+    let command = process_command(pid)
+        .map(|command| format!(" running `{command}`"))
+        .unwrap_or_default();
+    let held = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|written| written.elapsed().ok())
+        .map(|held| format!(", holding the lock for {}", human_duration(held)))
+        .unwrap_or_default();
+    let liveness = if process_alive(pid) {
+        ""
+    } else {
+        ", and that process has exited (an older holder took the lock without recording a pid)"
+    };
+    format!("pid {pid}{command}{held}{liveness}")
+}
+
+/// The command line of `pid`, best effort. Another user's process, a process
+/// that exited, or a platform without the source of truth yields nothing and
+/// the refusal names the pid alone.
+#[cfg(target_os = "linux")]
+fn process_command(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let command = raw
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!command.is_empty()).then_some(command)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_command(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command.is_empty()).then_some(command)
+}
+
+/// Whether `pid` is still running. Unanswerable counts as running: a refusal
+/// that wrongly says the holder is gone would invite concurrent syncs.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
+/// A lock age in the units someone reads at a glance: seconds under a
+/// minute, then minutes, then hours and minutes.
+fn human_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m", seconds / 60),
+        _ => format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60),
+    }
+}
+
 /// The sync lock: every reader-then-writer of `sync.json` holds it. A sync
 /// or pull takes it for its whole duration and fails at once when another
 /// holds it.
@@ -521,10 +782,50 @@ pub fn lock(store: &Store) -> Result<fslock::LockFile> {
     lock_in(store.state_dir())
 }
 
+/// The sync lock for a command someone ran: it waits its turn behind a
+/// running sync or pull for `history.lock_wait`, as a save waits behind a
+/// running save, so syncs started together run one after another instead of
+/// all but one failing. The watcher keeps [`lock`]: waiting would stall its
+/// event loop, and it retries a contended sync on its own schedule.
+pub fn lock_queued(store: &Store, wait: Option<Duration>) -> Result<fslock::LockFile> {
+    lock_wait(
+        store.state_dir(),
+        wait.unwrap_or_else(crate::history::scope::operation_lock_wait),
+    )
+}
+
+/// The refusal for a sync that could not take the lock: who holds it, and
+/// what to do instead of retrying into the same wall. A command someone ran
+/// can pick a wait; the watcher can only be stopped or waited out.
+pub(crate) fn contended(state_dir: &Path, waited: Option<Duration>) -> eyre::Report {
+    let holder = describe_holder(state_dir);
+    match waited {
+        None => eyre::eyre!(
+            "another setup sync or pull is running: {holder}; pass `--wait <duration>` to queue behind it, or stop the holder"
+        ),
+        Some(waited) => eyre::eyre!(
+            "another setup sync or pull is running: {holder}; waited {} and gave up, so raise `history.lock_wait`, pass a longer `--wait`, or stop the holder",
+            human_duration(waited)
+        ),
+    }
+}
+
+/// Whether a sync or pull holds the sync lock right now. A reader that only
+/// looks at `sync.json` and the fetched objects takes no lock: the record is
+/// replaced atomically and the objects are immutable, so the worst a running
+/// sync does is make what the reader shows out of date. This lets the reader
+/// say so instead of queueing behind a network round trip.
+pub fn sync_running(store: &Store) -> bool {
+    matches!(
+        mise_util::lock_file::LockFile::at(&lock_path(store.state_dir())).try_lock(),
+        Ok(None)
+    )
+}
 pub(crate) fn lock_in(state_dir: &Path) -> Result<fslock::LockFile> {
     mise_util::lock_file::LockFile::at(&lock_path(state_dir))
+        .with_pid()
         .try_lock()?
-        .ok_or_else(|| eyre::eyre!("another setup sync or pull is running; retry shortly"))
+        .ok_or_else(|| contended(state_dir, None))
 }
 
 /// Changes one thing in `sync.json` under the sync lock, reading the record
@@ -545,11 +846,14 @@ pub(crate) fn update_status(
 pub(crate) fn lock_wait(state_dir: &Path, wait: Duration) -> Result<fslock::LockFile> {
     let deadline = Instant::now() + wait;
     loop {
-        if let Some(lock) = mise_util::lock_file::LockFile::at(&lock_path(state_dir)).try_lock()? {
+        if let Some(lock) = mise_util::lock_file::LockFile::at(&lock_path(state_dir))
+            .with_pid()
+            .try_lock()?
+        {
             return Ok(lock);
         }
         if Instant::now() >= deadline {
-            bail!("another setup sync or pull is running; retry shortly");
+            return Err(contended(state_dir, Some(wait)));
         }
         std::thread::sleep(STATUS_LOCK_POLL);
     }
@@ -801,6 +1105,10 @@ fn prepare(
                 })
                 .map(|(path, object)| (path.clone(), object.clone()))
                 .collect(),
+            // never filtered: an origin plaintext version of an encrypted
+            // path is reported for every such path the incoming config
+            // declares, whether or not this machine selects it
+            plaintext: upstream.plaintext.clone(),
         };
         let mut plans = reconcile::reconcile(repo, shared, &selected, &sync_state, unsaved)?;
         // Old acknowledgements are not authority to delete a path this
@@ -861,6 +1169,7 @@ fn prepare(
                         local: shared.get(&plan.branch_path).cloned(),
                         remote: upstream.files.get(&plan.branch_path).cloned(),
                         base: plan.next.acknowledged.clone(),
+                        detail: None,
                     });
                     plan.publish = None;
                 }
@@ -893,6 +1202,7 @@ fn repository_conflict(status: &mut SyncStatus, error: &eyre::Report) {
         local: None,
         remote: None,
         base: None,
+        detail: None,
     }];
 }
 
@@ -1065,6 +1375,7 @@ fn apply_resolutions(
                 local: shared.get(&plan.branch_path).cloned(),
                 remote: upstream.files.get(&plan.branch_path).cloned(),
                 base: plan.next.acknowledged.clone(),
+                detail: None,
             });
             plan.publish = None;
         }
@@ -1177,16 +1488,37 @@ pub(super) fn incoming_repository_tree(
         return Ok(None);
     }
     let (merged, conflicts) = repo.merge_tree(local, remote)?;
+    // Settling replaces Git's version of a conflicted path, so the merged tree
+    // can equal the saved one; the merge still happened, and its tree is the
+    // one to adopt.
+    let merged_conflicts = !conflicts.is_empty();
+    let (merged, conflicts) = settle_conflicts(
+        repo,
+        heads.base.as_deref(),
+        local,
+        remote,
+        &merged,
+        conflicts,
+    )?;
     let tree = tracked.manifest.write(repo, &merged)?;
     let roots = Roots::current();
     let exclude = tracked.exclude_set()?;
-    if repo.output_tree_of(local)? == tree && conflicts.is_empty() {
+    if repo.output_tree_of(local)? == tree && conflicts.is_empty() && !merged_conflicts {
         return Ok(None);
     }
+    // An eligible tracked file is decided per file, so its ordinary text
+    // conflict is not a repository conflict. An encrypted envelope is not
+    // text: dropping its conflict here is how a text-merged ciphertext was
+    // committed as "merge origin dotfiles". It stays a conflict the user resolves.
+    let encrypted = super::files::encrypted_paths(repo, Some(local))?
+        .union(&super::files::encrypted_paths(repo, Some(remote))?)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let unresolved: Vec<_> = conflicts
         .into_iter()
         .filter(|path| {
-            path != crate::history::manifest::PATH && !eligible(&roots, tracked, &exclude, path)
+            path != crate::history::manifest::PATH
+                && (!eligible(&roots, tracked, &exclude, path) || encrypted.contains(path))
         })
         .collect();
     if !unresolved.is_empty() {
@@ -1196,6 +1528,90 @@ pub(super) fn incoming_repository_tree(
         );
     }
     Ok(Some(tree))
+}
+
+/// Git merged the saved envelopes as text. Whatever it wrote for a conflicted
+/// path is not a saved version: when the decrypted content is equal, the local
+/// saved envelope stands, and every other path is replaced by the per-file
+/// plan before anything is adopted. A marker blob is never carried forward.
+pub(super) fn settle_conflicts(
+    repo: &crate::history::shadow::HistoryRepo,
+    base: Option<&str>,
+    local: &str,
+    remote: &str,
+    merged: &str,
+    conflicts: Vec<String>,
+) -> Result<(String, Vec<String>)> {
+    let mut overlays = vec![];
+    let mut settled = std::collections::BTreeSet::new();
+    for path in &conflicts {
+        if path == crate::history::manifest::PATH {
+            continue;
+        }
+        let Some(saved) = repo.object_at(local, path)? else {
+            continue;
+        };
+        let Some(merged_object) = repo.object_at(merged, path)? else {
+            continue;
+        };
+        // A record Git merged as text is repaired here: when its two sides
+        // hold the same content, one clean envelope replaces it.
+        let repaired = match super::files::repair(repo, path, &merged_object, false)? {
+            super::files::Repair::Same { envelope, .. } => {
+                Some(("100644".to_string(), repo.store_blob(&envelope)?))
+            }
+            _ => match super::files::repair(repo, path, &saved, false)? {
+                super::files::Repair::Same { envelope, .. } => {
+                    Some(("100644".to_string(), repo.store_blob(&envelope)?))
+                }
+                _ => None,
+            },
+        };
+        if let Some(object) = repaired {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some(object),
+            });
+            continue;
+        }
+        if super::files::same_content(repo, path, &saved, &merged_object, false) {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some(saved),
+            });
+            continue;
+        }
+        // Nothing here is -merge'd by Git, so a plaintext path whose two sides
+        // changed different lines is merged here exactly as Git used to.
+        let merged_text = match (base, repo.object_at(remote, path)?) {
+            (Some(base), Some(theirs)) => match repo.object_at(base, path)? {
+                Some(base) => repo.merge3(
+                    &repo.cat_object(&base.1)?,
+                    &repo.cat_object(&saved.1)?,
+                    &repo.cat_object(&theirs.1)?,
+                )?,
+                None => None,
+            },
+            _ => None,
+        };
+        if let Some(text) = merged_text {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some((saved.0.clone(), repo.store_blob(&text)?)),
+            });
+        }
+    }
+    let remaining = conflicts
+        .into_iter()
+        .filter(|path| !settled.contains(path))
+        .collect();
+    if overlays.is_empty() {
+        return Ok((merged.to_string(), remaining));
+    }
+    Ok((repo.compose(merged, &overlays)?, remaining))
 }
 
 /// A bootstrap finished: the declarations that arrived through sync are
@@ -1290,6 +1706,47 @@ mod capture_tests {
             ..Default::default()
         };
         assert!(audit_publication(repo, &head, &tracked).is_err());
+        Ok(())
+    }
+
+    /// The decision a sync makes before it publishes: has a checkpoint been
+    /// saved since the plans were built? A sync that publishes past one would
+    /// publish history its plans never examined; a sync that fails on it
+    /// never finishes while the watcher keeps saving.
+    #[test]
+    fn a_checkpoint_saved_after_the_snapshot_moves_the_head() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open_in(temp.path())?;
+        let repo = store.repo().ok_or_else(|| eyre::eyre!("git required"))?;
+        let tree = repo.empty_object("tree")?;
+        let first = repo.commit_tree(&tree, vec![], "first")?;
+        repo.update_ref(
+            crate::history::shadow::HistoryRepo::HISTORY_REF,
+            &first,
+            None,
+        )?;
+        let snapshot = share::current(repo, &TrackedSet::default())?;
+        assert!(
+            !head_moved(repo, &snapshot)?,
+            "nothing was saved since the snapshot"
+        );
+
+        let second = repo.commit_tree(&tree, vec![first.as_str()], "second")?;
+        repo.update_ref(
+            crate::history::shadow::HistoryRepo::HISTORY_REF,
+            &second,
+            Some(&first),
+        )?;
+        assert!(
+            head_moved(repo, &snapshot)?,
+            "a checkpoint saved after the snapshot must be noticed"
+        );
+
+        let fresh = share::current(repo, &TrackedSet::default())?;
+        assert!(
+            !head_moved(repo, &fresh)?,
+            "planning again from the new head settles it"
+        );
         Ok(())
     }
 
@@ -1410,6 +1867,7 @@ mod notification_tests {
             local: None,
             remote: None,
             base: None,
+            detail: None,
         }
     }
 
@@ -1478,6 +1936,7 @@ mod status_tests {
             local: None,
             remote: None,
             base: None,
+            detail: None,
         }
     }
 
@@ -1530,6 +1989,106 @@ mod status_tests {
             status.declarations_changed = false;
         })
         .unwrap();
+    }
+
+    /// A sync someone ran queues behind a running one instead of failing, and
+    /// the watcher's no-wait lock still fails at once on the same contention.
+    #[test]
+    fn a_queued_sync_waits_for_a_running_one_and_a_plain_one_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hstore::store_dir_in(&state_dir)).unwrap();
+        let held = lock_in(&state_dir).unwrap();
+        assert!(
+            lock_in(&state_dir)
+                .unwrap_err()
+                .to_string()
+                .contains("another setup sync or pull")
+        );
+        let waiter = {
+            let state_dir = state_dir.clone();
+            std::thread::spawn(move || lock_wait(&state_dir, Duration::from_secs(10)).is_ok())
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+        assert!(
+            waiter.join().unwrap(),
+            "the queued sync should take the lock once it is free"
+        );
+    }
+
+    /// A refusal names who holds the lock, so a permanent holder is visible
+    /// without `lsof`: waiting out `mise dot watch` is wasted time, and the
+    /// refusal is what an agent reads.
+    #[test]
+    fn a_refused_lock_names_the_holder_pid_and_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hstore::store_dir_in(&state_dir)).unwrap();
+        let held = lock_in(&state_dir).unwrap();
+        let err = lock_in(&state_dir).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("pid {}", std::process::id())),
+            "the refusal must name the holder: {err}"
+        );
+        assert!(
+            err.contains("holding the lock for"),
+            "the refusal must say how long it has been held: {err}"
+        );
+        assert!(
+            err.contains("--wait"),
+            "the refusal must point at the bounded wait: {err}"
+        );
+        drop(held);
+    }
+
+    /// A bounded wait that runs out says who it was waiting for and how long
+    /// it waited, rather than "retry shortly" about a process that may never
+    /// release the lock.
+    #[test]
+    fn an_expired_wait_names_the_holder_and_the_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hstore::store_dir_in(&state_dir)).unwrap();
+        let held = lock_in(&state_dir).unwrap();
+        let err = lock_wait(&state_dir, Duration::ZERO)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("pid {}", std::process::id())),
+            "the timeout must name the holder: {err}"
+        );
+        assert!(
+            err.contains("waited 0s and gave up"),
+            "the timeout must say how long it waited: {err}"
+        );
+        drop(held);
+    }
+
+    /// A holder from a mise that did not record a pid is a fact, not a panic:
+    /// the refusal says so instead of inventing a holder.
+    #[test]
+    fn a_holder_that_recorded_no_pid_is_reported_as_such() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hstore::store_dir_in(&state_dir)).unwrap();
+        let path = lock_path(&state_dir);
+        let mut older = fslock::LockFile::open(&path).unwrap();
+        assert!(older.try_lock().unwrap());
+        let err = lock_in(&state_dir).unwrap_err().to_string();
+        assert!(
+            err.contains("recorded no pid"),
+            "an unrecorded holder must be named as such: {err}"
+        );
+        drop(older);
+    }
+
+    #[test]
+    fn lock_ages_read_in_seconds_minutes_and_hours() {
+        assert_eq!(human_duration(Duration::ZERO), "0s");
+        assert_eq!(human_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(human_duration(Duration::from_secs(90)), "1m");
+        assert_eq!(human_duration(Duration::from_secs(3600 + 840)), "1h 14m");
     }
 }
 

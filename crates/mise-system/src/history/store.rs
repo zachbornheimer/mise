@@ -1236,6 +1236,49 @@ pub(crate) fn list_in(state_dir: &Path) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
+/// How many checkpoints [`list_in`] would return, without parsing any record:
+/// an indexed checkpoint whose record is missing is not listed, so it is not
+/// counted either.
+pub(crate) fn count_in(state_dir: &Path) -> Result<usize> {
+    Ok(load_index_in(state_dir)?
+        .entries
+        .iter()
+        .filter(|line| meta_cache_path_in(state_dir, &line.uuid).exists())
+        .count())
+}
+
+/// The newest checkpoint with a cached record, reading only as many records
+/// as it takes to find it. [`list_in`] reads every one, which grows with the
+/// history; a command that wants only the newest asks for it here.
+pub(crate) fn latest_in(state_dir: &Path) -> Result<Option<Entry>> {
+    newest_in(state_dir, |_| true)
+}
+
+/// The newest checkpoint holding a content snapshot: what the live files are
+/// compared against to find unsaved edits.
+pub(crate) fn latest_snapshot_entry_in(state_dir: &Path) -> Result<Option<Entry>> {
+    newest_in(state_dir, |checkpoint| checkpoint.tree.snapshot.is_some())
+}
+
+/// The newest indexed checkpoint that has a cached record and passes `wanted`.
+/// An entry without a record is skipped, as [`list_in`] skips it.
+fn newest_in(state_dir: &Path, wanted: impl Fn(&Checkpoint) -> bool) -> Result<Option<Entry>> {
+    let index = load_index_in(state_dir)?;
+    for line in index.entries.iter().rev() {
+        let Some(checkpoint) = read_meta_cache_in(state_dir, &line.uuid)? else {
+            continue;
+        };
+        if wanted(&checkpoint) {
+            return Ok(Some(Entry {
+                id: line.id,
+                commit: line.commit.clone(),
+                checkpoint,
+            }));
+        }
+    }
+    Ok(None)
+}
+
 /// Turns `ID`, `latest`, `latest~N`, or `commit:<sha>` into a checkpoint id,
 /// resolved against `entries` (oldest first).
 pub(crate) fn resolve_ref(spec: &str, entries: &[Entry]) -> Result<u64> {
@@ -1425,6 +1468,68 @@ mod commit_cache_tests {
 
         std::fs::write(&path, [0xff])?;
         assert!(read_commit_meta_cache_in(temp.path(), "abc123")?.is_none());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod newest_checkpoint_tests {
+    use super::*;
+    use crate::history::checkpoint::test_checkpoint;
+
+    fn index_line(id: u64, uuid: &str) -> IndexEntry {
+        IndexEntry {
+            id,
+            uuid: uuid.into(),
+            commit: format!("commit-{id}"),
+            created_at: now_rfc3339(),
+            trigger: Trigger::Save,
+        }
+    }
+
+    /// The newest-only readers answer as the full listing does: the newest
+    /// entry with a record, the newest with a snapshot, and a count that
+    /// leaves out an indexed checkpoint whose record is gone.
+    #[test]
+    fn newest_readers_agree_with_the_full_listing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        ensure_store_dir_in(temp.path())?;
+        write_meta_cache_in(
+            temp.path(),
+            &test_checkpoint("with-snapshot", Some("tree-1")),
+        )?;
+        write_meta_cache_in(temp.path(), &test_checkpoint("no-snapshot", None))?;
+        // the newest line has no record at all
+        write_index_in(
+            temp.path(),
+            &Index {
+                next_id: 4,
+                entries: vec![
+                    index_line(1, "with-snapshot"),
+                    index_line(2, "no-snapshot"),
+                    index_line(3, "lost-record"),
+                ],
+            },
+        )?;
+
+        let listed = list_in(temp.path())?;
+        assert_eq!(listed.len(), 2);
+        assert_eq!(count_in(temp.path())?, listed.len());
+        assert_eq!(latest_in(temp.path())?.map(|entry| entry.id), Some(2));
+        assert_eq!(
+            latest_snapshot_entry_in(temp.path())?.map(|entry| entry.id),
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn newest_readers_return_nothing_for_an_empty_history() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        ensure_store_dir_in(temp.path())?;
+        assert!(latest_in(temp.path())?.is_none());
+        assert!(latest_snapshot_entry_in(temp.path())?.is_none());
+        assert_eq!(count_in(temp.path())?, 0);
         Ok(())
     }
 }

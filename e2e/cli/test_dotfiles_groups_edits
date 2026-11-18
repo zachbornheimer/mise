@@ -34,7 +34,7 @@ target="$HOME/.config/mise/conf.d/private.local.toml"
 assert_succeed "mise dot apply --yes"
 assert "cat $HOME/.commonrc" "common rc"
 assert_contains "cat $target" "your_github_token"
-assert "stat -c %a $target" "600"
+assert "echo $(file_mode "$target")" "600"
 # the walk does not also deploy the tree's other files over the edit's file
 assert_fail "test -e $HOME/private.toml"
 assert_contains "mise dot status --verbose" "merge:seed"
@@ -42,12 +42,12 @@ assert_contains "mise dot status --verbose" "merge:seed"
 assert_fail "test -e $HOME/.workrc"
 
 # the user's value survives later applies
-sed -i 's/your_github_token/ghp_secret/' "$target"
+sed -i.bak 's/your_github_token/ghp_secret/' "$target"
 assert_succeed "mise dot apply --yes"
 assert_contains "cat $target" "ghp_secret"
 
 # selecting the other group applies its edit and stops applying the first's
-sed -i 's/dotfile_groups = \["common"\]/dotfile_groups = ["work"]/' mise.toml
+sed -i.bak 's/dotfile_groups = \["common"\]/dotfile_groups = ["work"]/' mise.toml
 rm "$target"
 assert_succeed "mise dot apply --yes"
 assert "cat $HOME/.workrc" "export WORK=1"
@@ -55,7 +55,7 @@ assert_fail "test -e $target"
 assert_not_contains "mise dot status --verbose" "merge:seed"
 
 # unapplying a group removes its files, never what its edits wrote
-sed -i 's/dotfile_groups = \["work"\]/dotfile_groups = ["common", "work"]/' mise.toml
+sed -i.bak 's/dotfile_groups = \["work"\]/dotfile_groups = ["common", "work"]/' mise.toml
 assert_succeed "mise dot apply --yes"
 assert_contains "cat $target" "your_github_token"
 assert_succeed "mise dot unapply --group common --yes"
