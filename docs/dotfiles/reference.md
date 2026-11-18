@@ -390,6 +390,16 @@ that long regardless of `history.lock_wait`; stop a watcher you do not want
 instead of waiting for it. A holder from a mise older than this one recorded no
 pid, and the refusal says so.
 
+A fetch, push, or remote listing holds that same sync lock while Git runs, so a
+stalled transfer holds it too.
+[`history.network_timeout`](/configuration/settings.html#history.network_timeout)
+bounds the transfer: the default is five minutes, `0` waits without a limit,
+and a value above `1h` counts as `1h`. When it elapses, mise ends Git and
+everything Git started, including `ssh` and `git-remote-https`, and the error
+names the Git command, how long it ran, and this setting. An HTTPS transfer
+that sends or receives nothing for 30 seconds ends on its own, whatever this
+is set to.
+
 A `mise bootstrap` with nothing tracked and no existing history touches the
 history store only when it first rewrites a dotfile or edit, to keep a private
 journal for recovering interrupted writes. If another mise process holds the

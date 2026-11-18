@@ -1456,7 +1456,14 @@ impl GitPlumbing {
     /// helpers, ssh settings, and URL rewrites apply, while hooks, filters,
     /// and aliases still cannot act on mise's repository because only
     /// plumbing runs here. Prompts are disabled when nobody is attending.
-    pub fn network_output(&self, call: PlumbingCall<'_>) -> Result<std::process::Output> {
+    ///
+    /// `deadline` bounds the whole process tree. `None` waits without a
+    /// limit, which is how a `history.network_timeout` of `0` is passed.
+    pub fn network_output(
+        &self,
+        call: PlumbingCall<'_>,
+        deadline: Option<std::time::Duration>,
+    ) -> Result<std::process::Output> {
         eyre::ensure!(
             call.work_tree.is_none()
                 && call.index_file.is_none()
@@ -1477,6 +1484,10 @@ impl GitPlumbing {
             "-c",
             &github_credential_config("github.com:443"),
         ]);
+        // A transfer that makes no progress for this long is a stall, not a
+        // slow link. Git checks it on HTTPS; SSH has no equivalent, so the
+        // deadline above is what ends that transport.
+        cmd.args(["-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=30"]);
         cmd.env("GIT_OPTIONAL_LOCKS", "0")
             .env("LC_ALL", "C")
             .stdin(std::process::Stdio::null());
@@ -1495,9 +1506,8 @@ impl GitPlumbing {
         if let Some(cwd) = call.cwd {
             cmd.current_dir(cwd);
         }
-        spawn_plumbing(cmd, None)
+        spawn_network(cmd, deadline)
     }
-
     fn base_command(&self) -> Result<std::process::Command> {
         let git =
             plumbing_binary().ok_or_else(|| eyre!("no unattended git executable is available"))?;
@@ -1599,6 +1609,190 @@ fn spawn_plumbing(
         .wrap_err_with(|| format!("failed to run {}", describe_plumbing(&cmd)))
 }
 
+/// How long a killed network command may take to exit before its pipes are
+/// abandoned. A process that received SIGKILL is normally gone at once; one
+/// that is not must not extend the deadline.
+const NETWORK_REAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Runs a network command, ending it and everything it started when
+/// `deadline` elapses. `None` waits without a limit.
+fn spawn_network(
+    mut cmd: std::process::Command,
+    deadline: Option<std::time::Duration>,
+) -> Result<std::process::Output> {
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let describe = describe_plumbing(&cmd);
+    let (mut child, tree) =
+        spawn_network_child(&mut cmd).wrap_err_with(|| format!("failed to spawn {describe}"))?;
+    let started = std::time::Instant::now();
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let (stdout_sender, stdout_receiver) = std::sync::mpsc::channel();
+    let (stderr_sender, stderr_receiver) = std::sync::mpsc::channel();
+    // The readers report when each pipe reaches EOF. That, not a process
+    // listing, is what says a grandchild is still part of the command: it
+    // holds a pipe open after the direct child has exited.
+    let pipes_open = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(2));
+    spawn_pipe_reader(stdout, stdout_sender, std::sync::Arc::clone(&pipes_open));
+    spawn_pipe_reader(stderr, stderr_sender, pipes_open.clone());
+    let status = wait_network(&mut child, &pipes_open, deadline, started)?;
+    let Some(status) = status else {
+        end_network(&mut child, &tree);
+        let limit = deadline.expect("a deadline that elapsed");
+        eyre::bail!(network_deadline_error(&cmd, started.elapsed(), limit));
+    };
+    let stdout = recv_pipe(&stdout_receiver, &describe, "stdout", &mut child, &tree)?;
+    let stderr = recv_pipe(&stderr_receiver, &describe, "stderr", &mut child, &tree)?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn spawn_pipe_reader(
+    mut pipe: impl std::io::Read + Send + 'static,
+    sender: std::sync::mpsc::Sender<std::io::Result<Vec<u8>>>,
+    pipes_open: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = pipe.read_to_end(&mut bytes).map(|_| bytes);
+        pipes_open.fetch_sub(1, std::sync::atomic::Ordering::Release);
+        let _ = sender.send(read);
+    });
+}
+
+fn network_subcommand(cmd: &std::process::Command) -> String {
+    cmd.get_args()
+        .map(|arg| arg.to_string_lossy())
+        .find(|arg| !arg.starts_with('-') && !arg.contains('='))
+        .unwrap_or_else(|| "network".into())
+        .into_owned()
+}
+
+fn network_deadline_error(
+    cmd: &std::process::Command,
+    elapsed: std::time::Duration,
+    limit: std::time::Duration,
+) -> String {
+    format!(
+        "git {} timed out after {elapsed:.0?} (history.network_timeout is {limit:.0?}); raise history.network_timeout or set it to 0 to wait without a limit",
+        network_subcommand(cmd)
+    )
+}
+
+fn wait_network(
+    child: &mut std::process::Child,
+    pipes_open: &std::sync::atomic::AtomicUsize,
+    deadline: Option<std::time::Duration>,
+    started: std::time::Instant,
+) -> Result<Option<std::process::ExitStatus>> {
+    let mut status = None;
+    loop {
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        // Pipes closing is the command finishing, including the case where
+        // the direct child already exited and a grandchild held them open.
+        if status.is_some() && pipes_open.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return Ok(status);
+        }
+        if deadline.is_some_and(|limit| started.elapsed() >= limit) {
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn recv_pipe(
+    receiver: &std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    describe: &str,
+    name: &str,
+    child: &mut std::process::Child,
+    tree: &NetworkTree,
+) -> Result<Vec<u8>> {
+    match receiver.recv_timeout(NETWORK_REAP) {
+        Ok(Ok(bytes)) => Ok(bytes),
+        Ok(Err(err)) => {
+            end_network(child, tree);
+            Err(err).wrap_err_with(|| format!("failed to read {describe} {name}"))
+        }
+        Err(_) => {
+            end_network(child, tree);
+            eyre::bail!("failed to read {describe} {name} after ending the command")
+        }
+    }
+}
+
+fn end_network(child: &mut std::process::Child, tree: &NetworkTree) {
+    tree.kill();
+    let _ = child.kill();
+    let _ = wait_reap(child);
+}
+
+fn wait_reap(child: &mut std::process::Child) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + NETWORK_REAP;
+    while std::time::Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+/// The process tree a network command starts, killed as one when the
+/// deadline elapses. On Unix the child's own process group is the tree,
+/// including a grandchild whose parent has already exited. On Windows the
+/// job object is that tree: it is created with kill-on-close and the child
+/// joins it before running, so ending the job ends members after the direct
+/// child is gone.
+struct NetworkTree {
+    #[cfg(unix)]
+    group: nix::unistd::Pid,
+    #[cfg(windows)]
+    job: crate::windows_job::Job,
+}
+
+impl NetworkTree {
+    fn kill(&self) {
+        #[cfg(unix)]
+        {
+            let _ = nix::sys::signal::killpg(self.group, nix::sys::signal::Signal::SIGKILL);
+        }
+        #[cfg(windows)]
+        self.job.kill();
+    }
+}
+
+#[cfg(unix)]
+fn spawn_network_child(
+    cmd: &mut std::process::Command,
+) -> Result<(std::process::Child, NetworkTree)> {
+    // process_group(0) makes the child's pid its process group id and fails
+    // the spawn if that cannot be done, so killpg reaches ssh and
+    // git-remote-https even after git itself has exited. A nested mise that
+    // owns process groups must not move this child into one of its own.
+    use std::os::unix::process::CommandExt;
+    cmd.env("MISE_TASK_PGID_MANAGED", "1");
+    cmd.process_group(0);
+    let child = cmd.spawn()?;
+    // process_group runs before exec and fails the spawn itself. Setting the
+    // group again from the parent races that exec.
+    let group = nix::unistd::Pid::from_raw(child.id() as i32);
+    Ok((child, NetworkTree { group }))
+}
+
+#[cfg(windows)]
+fn spawn_network_child(
+    cmd: &mut std::process::Command,
+) -> Result<(std::process::Child, NetworkTree)> {
+    let (child, job) = crate::windows_job::spawn(cmd, 0)?;
+    Ok((child, NetworkTree { job }))
+}
+
 fn run_plumbing(cmd: std::process::Command, stdin: Option<&[u8]>) -> Result<Vec<u8>> {
     let describe = describe_plumbing(&cmd);
     let output = spawn_plumbing(cmd, stdin)?;
@@ -1654,3 +1848,248 @@ mod tests;
 
 #[cfg(test)]
 mod plumbing_tests;
+
+#[cfg(test)]
+mod network_deadline {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn repo() -> (tempfile::TempDir, GitPlumbing) {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = GitPlumbing::new(temp.path().join("network.git"));
+        repo.init_bare().unwrap();
+        (temp, repo)
+    }
+
+    /// A shell Git execs through `ext::sh -c`, named in the URL rather than
+    /// found on `PATH`. The helper exits at once. Its child keeps both output
+    /// pipes open, records the process group, and ends itself after 30
+    /// seconds so a timeout regression cannot leave it running.
+    fn helper_url(dir: &std::path::Path, name: &str, body: &str) -> String {
+        let script = dir.join(name);
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&script, permissions).unwrap();
+        }
+        let path = script
+            .to_string_lossy()
+            .replace('%', "%25")
+            .replace(' ', "%20");
+        format!("ext::sh {path}")
+    }
+
+    fn stalled_url(dir: &std::path::Path) -> String {
+        let recorded = dir
+            .join("grandchild.pgid")
+            .to_string_lossy()
+            .replace(' ', "%20");
+        helper_url(
+            dir,
+            "stall.sh",
+            &format!(
+                "( exec 3>&1 4>&2; printf grandchild-out >&3; printf grandchild-err >&4; ps -o pid=,pgid= -p $$ > {recorded}; exec sleep 30 ) & exit 0"
+            ),
+        )
+    }
+
+    fn recorded_group(dir: &std::path::Path) -> Option<u32> {
+        let text = std::fs::read_to_string(dir.join("grandchild.pgid")).ok()?;
+        text.split_whitespace().nth(1)?.parse().ok()
+    }
+
+    fn group_alive(group: u32) -> bool {
+        let listed = std::process::Command::new("ps")
+            .args(["-o", "pid=,pgid=,stat=", "-ax"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&listed.stdout).lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next().and_then(|field| field.parse::<u32>().ok());
+            let pgid = fields.next().and_then(|field| field.parse::<u32>().ok());
+            let stat = fields.next().unwrap_or_default();
+            pgid == Some(group) && pid.is_some_and(|pid| pid > 1) && !stat.contains('Z')
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_ends_a_grandchild_holding_the_pipes() {
+        if plumbing_binary().is_none() {
+            return;
+        }
+        let (temp, repo) = repo();
+        let url = stalled_url(temp.path());
+        let deadline = Duration::from_millis(400);
+        let started = Instant::now();
+        let err = repo
+            .network_output(
+                PlumbingCall::new(["-c", "protocol.ext.allow=always", "fetch", &url, "main"]),
+                Some(deadline),
+            )
+            .unwrap_err()
+            .to_string();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < deadline + Duration::from_secs(1),
+            "returned {elapsed:?} after a {deadline:?} deadline"
+        );
+        assert!(
+            elapsed + Duration::from_millis(150) >= deadline,
+            "returned after only {elapsed:?}"
+        );
+        assert!(err.contains("git fetch timed out"), "{err}");
+        assert!(err.contains("history.network_timeout"), "{err}");
+        let group = recorded_group(temp.path()).expect("grandchild recorded its group");
+        assert!(
+            !group_alive(group),
+            "process group {group} still has a live process"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_command_returns_both_pipes() {
+        if plumbing_binary().is_none() {
+            return;
+        }
+        let (temp, repo) = repo();
+        let shell = std::process::Command::new("sh");
+        let mut shell = shell;
+        shell
+            .args(["-c", "printf out; printf err >&2; exit 7"])
+            .current_dir(temp.path());
+        let output = spawn_network(shell, Some(Duration::from_secs(30))).unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+
+        let origin = GitPlumbing::new(temp.path().join("origin.git"));
+        origin.init_bare().unwrap();
+        let tree = origin
+            .output_unchecked(
+                PlumbingCall::new(["hash-object", "-t", "tree", "--stdin"]).stdin(b""),
+            )
+            .unwrap();
+        assert!(
+            tree.status.success(),
+            "{}",
+            String::from_utf8_lossy(&tree.stderr)
+        );
+        let tree = String::from_utf8(tree.stdout).unwrap();
+        let commit = origin
+            .output_unchecked(PlumbingCall::new([
+                "commit-tree",
+                tree.trim(),
+                "-m",
+                "listed",
+            ]))
+            .unwrap();
+        assert!(
+            commit.status.success(),
+            "{}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        let commit = String::from_utf8(commit.stdout).unwrap();
+        origin
+            .run(PlumbingCall::new([
+                "update-ref",
+                "refs/heads/main",
+                commit.trim(),
+            ]))
+            .unwrap();
+        let url = origin.git_dir().to_string_lossy().into_owned();
+        let listed = repo
+            .network_output(
+                PlumbingCall::new(["ls-remote", &url]),
+                Some(Duration::from_secs(30)),
+            )
+            .unwrap();
+        let baseline = repo
+            .output_unchecked(PlumbingCall::new(["ls-remote", &url]))
+            .unwrap();
+        assert!(
+            listed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        assert!(
+            listed
+                .stdout
+                .windows(commit.trim().len())
+                .any(|window| window == commit.trim().as_bytes())
+        );
+        assert_eq!(listed.status, baseline.status);
+        assert_eq!(listed.stdout, baseline.stdout);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_deadline_does_not_end_a_running_command() {
+        if plumbing_binary().is_none() {
+            return;
+        }
+        let (temp, repo) = repo();
+        let origin = temp.path().join("origin.git");
+        std::process::Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&origin)
+            .status()
+            .unwrap();
+        let output = repo
+            .network_output(
+                PlumbingCall::new(["ls-remote", &origin.to_string_lossy()]),
+                None,
+            )
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty());
+        let url = helper_url(
+            temp.path(),
+            "slow.sh",
+            "sleep 0.3; printf waited >&2; exit 0",
+        );
+        let started = Instant::now();
+        let slow = repo
+            .network_output(
+                PlumbingCall::new(["-c", "protocol.ext.allow=always", "ls-remote", &url]),
+                None,
+            )
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(
+            slow.stderr.windows(6).any(|window| window == b"waited"),
+            "{:?}",
+            slow.stderr
+        );
+    }
+
+    #[test]
+    fn a_timeout_names_the_subcommand_elapsed_time_and_setting() {
+        let mut fetch = std::process::Command::new("git");
+        fetch.args(["-c", "core.hooksPath=/tmp", "fetch", "--", "origin"]);
+        let mut push = std::process::Command::new("git");
+        push.args(["--git-dir=/tmp/repo.git", "-c", "a=b", "push"]);
+        let mut listed = std::process::Command::new("git");
+        listed.args(["ls-remote", "--quiet"]);
+        let elapsed = Duration::from_millis(400);
+        let limit = Duration::from_secs(5 * 60);
+        for (command, name) in [(&fetch, "fetch"), (&push, "push"), (&listed, "ls-remote")] {
+            let err = network_deadline_error(command, elapsed, limit);
+            assert!(err.contains(&format!("git {name} timed out")), "{err}");
+            assert!(err.contains(&format!("{elapsed:.0?}")), "{err}");
+            assert!(
+                err.contains(&format!("history.network_timeout is {limit:.0?}")),
+                "{err}"
+            );
+            assert!(err.contains("set it to 0"), "{err}");
+        }
+    }
+}
