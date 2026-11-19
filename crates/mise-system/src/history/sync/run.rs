@@ -553,7 +553,7 @@ fn sync_locked_waiting(
             && !allow_plaintext_history
             && let Some(head) = repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)?
         {
-            audit_publication(repo, &head, tracked)?;
+            audit_publication(repo, &head, upstream_commit.as_deref(), tracked)?;
         }
         let mut plans;
         let mut attempts = 0;
@@ -598,7 +598,7 @@ fn sync_locked_waiting(
                     && let Some(head) =
                         repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)?
                 {
-                    audit_publication(repo, &head, tracked)?;
+                    audit_publication(repo, &head, upstream_commit.as_deref(), tracked)?;
                 }
                 continue;
             }
@@ -756,9 +756,15 @@ const STATUS_LOCK_POLL: Duration = Duration::from_millis(100);
 fn audit_publication(
     repo: &crate::history::shadow::HistoryRepo,
     head: &str,
+    published: Option<&str>,
     tracked: &TrackedSet,
 ) -> Result<()> {
-    super::files::audit_history(repo, head, &publication_protected(repo, head, tracked)?)
+    super::files::audit_history(
+        repo,
+        head,
+        published,
+        &publication_protected(repo, head, tracked)?,
+    )
 }
 
 /// The encrypted paths the publish audit covers: the live tracked set plus
@@ -810,7 +816,7 @@ fn rerecord_unpublished(
         return Ok(false);
     };
     let protected = publication_protected(repo, &head, tracked)?;
-    if super::files::plaintext_versions(repo, &head, &protected)?.is_empty() {
+    if super::files::plaintext_versions(repo, &head, Some(upstream), &protected)?.is_empty() {
         return Ok(false);
     }
     let bases = repo.merge_bases(&head, upstream)?;
@@ -835,7 +841,7 @@ fn rerecord_unpublished(
     // Audited before anything moves. A commit the origin already has that is
     // refused, or a tip that fails itself, fails here too and is left as it is.
     let after = publication_protected(repo, &new, tracked)?;
-    if !super::files::plaintext_versions(repo, &new, &after)?.is_empty() {
+    if !super::files::plaintext_versions(repo, &new, Some(upstream), &after)?.is_empty() {
         return Ok(false);
     }
     repo.update_ref(&backup_name, &head, None)?;
@@ -2178,7 +2184,7 @@ mod capture_tests {
             entries: vec![entry],
             ..Default::default()
         };
-        assert!(audit_publication(repo, &head, &tracked).is_err());
+        assert!(audit_publication(repo, &head, None, &tracked).is_err());
         Ok(())
     }
 

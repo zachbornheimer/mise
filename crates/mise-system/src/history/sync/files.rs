@@ -79,14 +79,19 @@ impl<'de> Deserialize<'de> for Bytes {
     }
 }
 
-/// Audit the complete proposed ancestry, not just the latest tree. A newly
-/// encrypted path cannot make its previously committed plaintext safe to push.
+/// Audit every version the origin does not hold yet, not just the latest
+/// tree: a newly encrypted path cannot make its earlier plaintext safe to push.
+/// `published` is the origin's head. History the origin already holds is out
+/// and no sync can take it back, so refusing to publish over it only stops
+/// every machine for good (a path encrypted after a plaintext version was
+/// published). Removing that plaintext is a history rewrite, not a sync.
 pub(crate) fn audit_history(
     repo: &HistoryRepo,
     head: &str,
+    published: Option<&str>,
     protected: &BTreeSet<String>,
 ) -> Result<()> {
-    let found = plaintext_versions(repo, head, protected)?;
+    let found = plaintext_versions(repo, head, published, protected)?;
     if let Some(first) = found.first() {
         bail!(
             "cannot publish: encrypted path {path} has an unencrypted or invalid version in commit {commit}; encrypting the latest version does not erase earlier plaintext. Remove that history before pushing, or use `mise dot sync --allow-plaintext-history` to publish it anyway",
@@ -124,15 +129,44 @@ pub(crate) struct UnpublishedPlaintext {
 
 /// Every version [`audit_history`] refuses, not just the first. Collecting
 /// them does not pass the audit: a caller that cannot re-record every one
-/// still cannot publish.
+/// still cannot publish. `published` bounds it the same way: only the
+/// versions the origin lacks are listed.
 pub(crate) fn plaintext_versions(
     repo: &HistoryRepo,
     head: &str,
+    published: Option<&str>,
     protected: &BTreeSet<String>,
 ) -> Result<Vec<UnpublishedPlaintext>> {
     let mut found = Vec::new();
-    audit_history_cached(repo, head, protected, &mut found)?;
+    match published {
+        Some(published) => {
+            audit_unpublished_history(repo, head, published, protected, &mut found)?
+        }
+        None => {
+            audit_history_cached(repo, head, protected, &mut found)?;
+        }
+    }
     Ok(found)
+}
+
+fn audit_unpublished_history(
+    repo: &HistoryRepo,
+    head: &str,
+    published: &str,
+    protected: &BTreeSet<String>,
+    found: &mut Vec<UnpublishedPlaintext>,
+) -> Result<()> {
+    let commits = repo.rev_list_after(head, published)?;
+    if commits.is_empty() {
+        return Ok(());
+    }
+    let objects = repo.gix()?;
+    let mut protected = protected.clone();
+    // A path the origin left in plaintext but a new commit encrypts is
+    // protected from that commit on; a merge parent the origin lacks is
+    // walked like any other unpublished commit.
+    enrolled_paths(&objects, &commits, &mut protected)?;
+    check_versions(repo, &objects, &commits, &protected, found)
 }
 
 fn audit_history_cached(
@@ -173,33 +207,48 @@ fn audit_history_cached(
         enrolled_paths(&objects, &commits, &mut protected)?;
     }
     let inspected = commits.len();
-    let mut checked = BTreeSet::new();
-    let mut verdicts = EnvelopeVerdicts::load(repo);
-    if !protected.is_empty() {
-        repo.visit_paths_in_open(&objects, &commits, &protected, |commit, entry| {
-            if !checked.insert((entry.path.clone(), entry.mode.clone(), entry.oid.clone())) {
-                return Ok(());
-            }
-            let path = entry.path;
-            let object = (entry.mode, entry.oid);
-            let valid = verdicts.accepted(&path, &object.0, &object.1, || {
-                valid_envelope(repo, &objects, &path, &object)
-            })?;
-            if !valid {
-                found.push(UnpublishedPlaintext {
-                    commit: commit.to_string(),
-                    path,
-                });
-            }
-            Ok(())
-        })?;
-    }
-    verdicts.save();
+    check_versions(repo, &objects, &commits, &protected, found)?;
     // A walk that found a refused version proves nothing about this head.
     if found.is_empty() {
         remember_ancestry(repo, head, protected);
     }
     Ok(inspected)
+}
+
+/// Collect every version of a protected path in `commits` that is not a valid
+/// encrypted envelope of that path. A verdict is decided once per blob, path
+/// and mode, and remembered across audits.
+fn check_versions(
+    repo: &HistoryRepo,
+    objects: &gix::Repository,
+    commits: &[String],
+    protected: &BTreeSet<String>,
+    found: &mut Vec<UnpublishedPlaintext>,
+) -> Result<()> {
+    if protected.is_empty() {
+        return Ok(());
+    }
+    let mut checked = BTreeSet::new();
+    let mut verdicts = EnvelopeVerdicts::load(repo);
+    repo.visit_paths_in_open(objects, commits, protected, |commit, entry| {
+        if !checked.insert((entry.path.clone(), entry.mode.clone(), entry.oid.clone())) {
+            return Ok(());
+        }
+        let path = entry.path;
+        let object = (entry.mode, entry.oid);
+        let valid = verdicts.accepted(&path, &object.0, &object.1, || {
+            valid_envelope(repo, objects, &path, &object)
+        })?;
+        if !valid {
+            found.push(UnpublishedPlaintext {
+                commit: commit.to_string(),
+                path,
+            });
+        }
+        Ok(())
+    })?;
+    verdicts.save();
+    Ok(())
 }
 
 /// The proof this process already checked, or the one the repository's own
@@ -1354,7 +1403,7 @@ mod tests {
         let resolved = repo
             .commit_tree(&clean, vec![&original], "explicit resolution")
             .unwrap();
-        audit_history(&repo, &resolved, &BTreeSet::from([path.into()])).unwrap();
+        audit_history(&repo, &resolved, None, &BTreeSet::from([path.into()])).unwrap();
         assert_eq!(repo.cat_object(&object.1).unwrap(), sealed);
         assert!(decrypt(&repo, path, &object, false).is_err());
         for unsafe_record in [
@@ -1375,7 +1424,7 @@ mod tests {
             let head = repo
                 .commit_tree(&tree, vec![], "must remain refused")
                 .unwrap();
-            assert!(audit_history(&repo, &head, &BTreeSet::from([path.into()])).is_err());
+            assert!(audit_history(&repo, &head, None, &BTreeSet::from([path.into()])).is_err());
         }
     }
 
@@ -1477,7 +1526,7 @@ mod tests {
             .unwrap();
         // No caller-supplied policy is needed: the new manifest expands the
         // protected set and forces the earlier plaintext commits to be checked.
-        assert!(audit_history(&repo, &encrypted, &BTreeSet::new()).is_err());
+        assert!(audit_history(&repo, &encrypted, None, &BTreeSet::new()).is_err());
 
         // An unrelated branch cannot reuse proof about the previous branch.
         let other = repo.commit_tree(&tree, vec![], "unrelated").unwrap();
@@ -1486,7 +1535,15 @@ mod tests {
             1
         );
         // A live policy change at the same head also invalidates the proof.
-        assert!(audit_history(&repo, &other, &BTreeSet::from(["home/secret".into()])).is_err());
+        assert!(
+            audit_history(
+                &repo,
+                &other,
+                None,
+                &BTreeSet::from(["home/secret".into()])
+            )
+            .is_err()
+        );
     }
 
     /// A verified ancestry written beside the history repository must skip
@@ -1534,7 +1591,7 @@ mod tests {
             .commit_tree(&exposed, vec![&head], "plaintext after encryption")
             .unwrap();
         assert!(
-            audit_history(&repo, &exposed, &protected).is_err(),
+            audit_history(&repo, &exposed, None, &protected).is_err(),
             "a new protected plaintext version must still be refused"
         );
     }
@@ -1611,7 +1668,7 @@ mod tests {
             .unwrap();
         AUDITS.lock().unwrap().remove(repo.dir());
         assert!(
-            audit_history(&repo, &exposed, &grown).is_err(),
+            audit_history(&repo, &exposed, None, &grown).is_err(),
             "older plaintext on a newly protected path must be refused"
         );
 
@@ -1629,7 +1686,7 @@ mod tests {
             .unwrap();
         AUDITS.lock().unwrap().remove(repo.dir());
         assert!(
-            audit_history(&repo, &malformed_head, &protected).is_err(),
+            audit_history(&repo, &malformed_head, None, &protected).is_err(),
             "a malformed envelope must be refused"
         );
 
@@ -1710,15 +1767,67 @@ mod tests {
             .commit_tree(&encrypted_tree, vec![&exposed], "encrypted now")
             .unwrap();
         let protected = BTreeSet::from([path.into()]);
-        assert!(audit_history(&repo, &encrypted, &protected).is_err());
+        assert!(audit_history(&repo, &encrypted, None, &protected).is_err());
         let clean = repo
             .commit_tree(&encrypted_tree, vec![], "encrypted from first commit")
             .unwrap();
-        audit_history(&repo, &clean, &protected).unwrap();
+        audit_history(&repo, &clean, None, &protected).unwrap();
         let merge = repo
             .commit_tree(&encrypted_tree, vec![&clean, &exposed], "merge")
             .unwrap();
-        assert!(audit_history(&repo, &merge, &protected).is_err());
+        assert!(audit_history(&repo, &merge, None, &protected).is_err());
+    }
+
+    #[test]
+    fn plaintext_the_origin_already_holds_does_not_block_publishing_over_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let key = age::x25519::Identity::generate();
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        let path = "home/secret";
+        let tree = |oid: String| {
+            let empty = repo.empty_object("tree").unwrap();
+            repo.compose(
+                &empty,
+                &[crate::history::shadow::Overlay {
+                    path: path.into(),
+                    object: Some(("100644".into(), oid)),
+                }],
+            )
+            .unwrap()
+        };
+        let plain = tree(repo.hash_blob(b"private").unwrap());
+        let cipher = tree(
+            repo.hash_blob(&encode(path, "100644", b"private", "test", &recipients).unwrap())
+                .unwrap(),
+        );
+        let protected = BTreeSet::from([path.into()]);
+        // The origin published the plaintext before the path was encrypted.
+        let published = repo
+            .commit_tree(&plain, vec![], "published plaintext")
+            .unwrap();
+        let encrypted = repo
+            .commit_tree(&cipher, vec![&published], "encrypted now")
+            .unwrap();
+        audit_history(&repo, &encrypted, Some(&published), &protected).unwrap();
+        // Without an origin, the whole ancestry is still this machine's to publish.
+        assert!(audit_history(&repo, &encrypted, None, &protected).is_err());
+        // Plaintext this machine adds on top of the origin is still refused,
+        // on the line or on a merge parent the origin lacks.
+        let leaked = repo
+            .commit_tree(&plain, vec![&encrypted], "plaintext again")
+            .unwrap();
+        let after = repo
+            .commit_tree(&cipher, vec![&leaked], "re-encrypted")
+            .unwrap();
+        assert!(audit_history(&repo, &after, Some(&published), &protected).is_err());
+        let side = repo
+            .commit_tree(&plain, vec![], "unpublished side")
+            .unwrap();
+        let merge = repo
+            .commit_tree(&cipher, vec![&encrypted, &side], "merge")
+            .unwrap();
+        assert!(audit_history(&repo, &merge, Some(&published), &protected).is_err());
     }
 
     #[test]
