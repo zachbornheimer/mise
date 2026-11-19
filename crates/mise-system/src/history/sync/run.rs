@@ -544,11 +544,15 @@ fn sync_locked_waiting(
         let mut shared = share::current(repo, tracked)?;
         let mut unsaved = unsaved_paths(repo, tracked, &shared)?;
         let publish = mode.publishes() && !request.fetch_only && !request.offline;
-        if publish
-            && !allow_plaintext_history
-            && let Some(head) = repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)?
-        {
-            audit_publication(repo, &head, tracked)?;
+        if publish && !allow_plaintext_history {
+            // An unpublished checkpoint that fails the audit blocks every later
+            // sync. Re-record those checkpoints from the current encrypted
+            // version first. A commit the origin already has is never rewritten,
+            // and the audit below still runs on whatever remains.
+            rerecord_unpublished(repo, tracked, upstream_commit.as_deref())?;
+            if let Some(head) = repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)? {
+                audit_publication(repo, &head, tracked)?;
+            }
         }
         let mut plans;
         let mut attempts = 0;
@@ -585,12 +589,13 @@ fn sync_locked_waiting(
                 attempts -= 1;
                 shared = share::current(repo, tracked)?;
                 unsaved = unsaved_paths(repo, tracked, &shared)?;
-                if publish
-                    && !allow_plaintext_history
-                    && let Some(head) =
+                if publish && !allow_plaintext_history {
+                    rerecord_unpublished(repo, tracked, upstream_commit.as_deref())?;
+                    if let Some(head) =
                         repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)?
-                {
-                    audit_publication(repo, &head, tracked)?;
+                    {
+                        audit_publication(repo, &head, tracked)?;
+                    }
                 }
                 continue;
             }
@@ -750,13 +755,160 @@ fn audit_publication(
     head: &str,
     tracked: &TrackedSet,
 ) -> Result<()> {
-    let protected = tracked
+    super::files::audit_history(repo, head, &publication_protected(repo, head, tracked)?)
+}
+
+/// The encrypted paths the publish audit covers: the live tracked set plus
+/// every enrollment the proposed ancestry itself recorded. A path encrypted
+/// only in an unpublished checkpoint is still protected.
+fn publication_protected(
+    repo: &crate::history::shadow::HistoryRepo,
+    head: &str,
+    tracked: &TrackedSet,
+) -> Result<BTreeSet<String>> {
+    let mut protected = tracked
         .entries
         .iter()
         .filter(|entry| entry.policy.encrypt)
         .map(|entry| entry.tree_path(&entry.path))
-        .collect::<Result<_>>()?;
-    super::files::audit_history(repo, head, &protected)
+        .collect::<Result<BTreeSet<_>>>()?;
+    let objects = repo.gix()?;
+    let commits = repo.rev_list(head, usize::MAX)?;
+    super::files::enrolled_paths(&objects, &commits, &mut protected)?;
+    Ok(protected)
+}
+
+/// Re-records unpublished checkpoints that fail the publish audit.
+///
+/// A checkpoint saved before its path was marked for encryption holds that
+/// path in plaintext. While the checkpoint is only on this machine, sync
+/// writes a new commit with the same parents, message, and author, and the
+/// current encrypted object in place of the plaintext. The origin's commits
+/// are never rewritten: one of them failing the audit is still the audit's
+/// refusal. A checkpoint that cannot be repaired, because no later encrypted
+/// version of that path exists, is left for the audit to refuse.
+fn rerecord_unpublished(
+    repo: &crate::history::shadow::HistoryRepo,
+    tracked: &TrackedSet,
+    upstream: Option<&str>,
+) -> Result<bool> {
+    let Some(head) = repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)? else {
+        return Ok(false);
+    };
+    let protected = publication_protected(repo, &head, tracked)?;
+    let failing = super::files::plaintext_versions(repo, &head, &protected)?;
+    if failing.is_empty() {
+        return Ok(false);
+    }
+    let published: BTreeSet<String> = match upstream {
+        Some(upstream) => repo.rev_list(upstream, usize::MAX)?.into_iter().collect(),
+        None => BTreeSet::new(),
+    };
+    // A published commit is the audit's to refuse. Re-recording it would
+    // rewrite history the origin already has.
+    let repairable: Vec<_> = failing
+        .iter()
+        .filter(|version| !published.contains(&version.commit))
+        .cloned()
+        .collect();
+    if repairable.is_empty() {
+        return Ok(false);
+    }
+    let objects = repo.gix()?;
+    let mut replacements: BTreeMap<String, Vec<crate::history::shadow::Overlay>> = BTreeMap::new();
+    for version in &repairable {
+        let Some(object) = encrypted_replacement(repo, &objects, &head, &version.path)? else {
+            continue;
+        };
+        replacements
+            .entry(version.commit.clone())
+            .or_default()
+            .push(crate::history::shadow::Overlay {
+                path: version.path.clone(),
+                object: Some(object),
+            });
+    }
+    if replacements.is_empty() {
+        return Ok(false);
+    }
+    // Oldest first, so a rewritten parent is what its children record.
+    let commits: Vec<String> = repo
+        .rev_list(&head, usize::MAX)?
+        .into_iter()
+        .rev()
+        .collect();
+    let mut rewritten: BTreeMap<String, String> = BTreeMap::new();
+    for commit in &commits {
+        let parents = repo.parents_of(commit)?;
+        let parent_moved = parents.iter().any(|parent| rewritten.contains_key(parent));
+        if !replacements.contains_key(commit) && !parent_moved {
+            continue;
+        }
+        let object = objects
+            .find_commit(gix::ObjectId::from_hex(commit.as_bytes())?)
+            .wrap_err_with(|| format!("reading {commit}"))?;
+        let tree = if let Some(overlays) = replacements.get(commit) {
+            repo.compose(&object.tree_id()?.to_string(), overlays)?
+        } else {
+            object.tree_id()?.to_string()
+        };
+        let new_parents: Vec<String> = parents
+            .iter()
+            .map(|parent| {
+                rewritten
+                    .get(parent)
+                    .cloned()
+                    .unwrap_or_else(|| parent.clone())
+            })
+            .collect();
+        let author = object.author()?;
+        let committer = object.committer()?;
+        let new = repo.commit_tree_as(
+            &tree,
+            new_parents.iter().map(String::as_str).collect(),
+            object.message_raw()?.as_ref(),
+            &commit_signature(&author),
+            &commit_signature(&committer),
+        )?;
+        rewritten.insert(commit.clone(), new);
+    }
+    // A rewritten ancestor rewrites every descendant, so the head is in the
+    // map whenever anything was.
+    let Some(new_head) = rewritten.get(&head).cloned() else {
+        return Ok(false);
+    };
+    repo.update_history_head(&new_head, Some(&head))?;
+    Ok(true)
+}
+
+/// The current encrypted object of `path` in `head`'s ancestry: the newest
+/// commit that holds a valid envelope there. None when the path was never
+/// saved encrypted, which the audit then refuses rather than this guessing.
+fn encrypted_replacement(
+    repo: &crate::history::shadow::HistoryRepo,
+    objects: &gix::Repository,
+    head: &str,
+    path: &str,
+) -> Result<Option<(String, String)>> {
+    for commit in repo.rev_list(head, usize::MAX)? {
+        let Some(object) = repo.object_at(&commit, path)? else {
+            continue;
+        };
+        // A clean envelope only. A marker record holds no plaintext, so the
+        // audit allows it, but copying it forward would publish the markers.
+        if super::files::clean_envelope(repo, objects, path, &object)? {
+            return Ok(Some(object));
+        }
+    }
+    Ok(None)
+}
+
+fn commit_signature(signature: &gix::actor::SignatureRef<'_>) -> [String; 3] {
+    [
+        signature.name.to_string(),
+        signature.email.to_string(),
+        signature.time.to_string(),
+    ]
 }
 
 fn lock_path(state_dir: &Path) -> PathBuf {
@@ -3014,6 +3166,127 @@ mod rejection_backoff_tests {
             .unwrap()
             .expect("the sibling edit was not published");
         assert_eq!(repo.cat_object(&sibling_oid).unwrap(), b"after");
+    }
+
+    /// An unpublished checkpoint saved a file in plaintext, and a later one
+    /// marked that path for encryption. Sync must re-record the unpublished
+    /// plaintext so the publish audit can pass. A version the origin already
+    /// has is never rewritten, and the audit itself is not skipped.
+    #[test]
+    fn unpublished_plaintext_checkpoints_are_rerecorded() {
+        let (_root, store, origin, local) = ahead("unpublished-plaintext");
+        let repo = store.repo().unwrap();
+        let published = repo.ref_oid(UPSTREAM_REF).unwrap().unwrap();
+        // a repository path, not a machine path: no home directory is read
+        let path = "home/x"; // portable-home-ok
+        let marker = repo
+            .object_at(&published, crate::history::sync::layout::MARKER_PATH)
+            .unwrap()
+            .expect("the published base carries the mise marker");
+        let plain = repo.hash_blob(b"saved in the clear").unwrap();
+        let plain_tree = repo
+            .write_tree(&[
+                (
+                    marker.0.clone(),
+                    marker.1.clone(),
+                    crate::history::sync::layout::MARKER_PATH.into(),
+                ),
+                ("100644".into(), plain, path.into()),
+            ])
+            .unwrap();
+        let unpublished = repo
+            .commit_tree(&plain_tree, vec![&published], "plaintext checkpoint")
+            .unwrap();
+
+        let key = age::x25519::Identity::generate();
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        let cipher = repo
+            .hash_blob(
+                &super::super::files::encode(path, "100644", b"now encrypted", "test", &recipients)
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut manifest = Manifest::default();
+        manifest
+            .enrollment
+            .push(crate::history::manifest::Enrollment {
+                path: path.into(),
+                autosave: true,
+                encrypt: true,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            });
+        let encrypted_tree = repo
+            .write_tree(&[
+                (
+                    marker.0,
+                    marker.1,
+                    crate::history::sync::layout::MARKER_PATH.into(),
+                ),
+                ("100644".into(), cipher, path.into()),
+            ])
+            .unwrap();
+        let encrypted_tree = manifest.write(repo, &encrypted_tree).unwrap();
+        let head = repo
+            .commit_tree(&encrypted_tree, vec![&unpublished], "encrypt now")
+            .unwrap();
+        // `ahead` left the branch at `local`. The plaintext checkpoint is a
+        // new unpublished child of the origin, so the branch moves from `local`.
+        repo.update_history_head(&head, Some(&local)).unwrap();
+
+        // The encrypted path is enrolled in the unpublished checkpoint, not
+        // as a live entry: a live entry needs a path under the real home.
+        let tracked = TrackedSet {
+            manifest,
+            ..Default::default()
+        };
+        use age::secrecy::ExposeSecret;
+        let mut environment = mise_util::testing::EnvVarGuard::new();
+        environment.set("MISE_AGE_KEY", key.to_string().expose_secret());
+        let published_after = sync_locked(&store, &tracked, &publishing_strict(&origin))
+            .expect("an unpublished plaintext checkpoint must be re-recorded, not fail the sync forever")
+            .published
+            .expect("the re-recorded history was not published");
+
+        let ancestry = repo.rev_list(&published_after, usize::MAX).unwrap();
+        assert!(
+            !ancestry.contains(&unpublished),
+            "the unpublished plaintext commit was published instead of re-recorded"
+        );
+        assert!(
+            ancestry.contains(&published),
+            "re-recording changed a commit the origin already had"
+        );
+        let origin_head = std::process::Command::new("git")
+            .args(["rev-parse", "refs/heads/mise"])
+            .current_dir(&origin)
+            .output()
+            .unwrap();
+        assert!(
+            origin_head.status.success(),
+            "{}",
+            String::from_utf8_lossy(&origin_head.stderr)
+        );
+        let origin_head = String::from_utf8(origin_head.stdout).unwrap();
+        assert_eq!(origin_head.trim(), published_after);
+        let (_, oid) = repo
+            .object_at(&published_after, path)
+            .unwrap()
+            .expect("the encrypted path was dropped");
+        assert!(
+            repo.blob_starts_with(&oid, super::super::files::MAGIC)
+                .unwrap(),
+            "the published version is not an encrypted envelope"
+        );
+    }
+
+    /// [`publishing`] with the plaintext override off, so the audit runs.
+    fn publishing_strict(origin: &std::path::Path) -> SyncRequest {
+        let mut request = publishing(origin);
+        request.allow_plaintext_history = false;
+        request
     }
 
     #[test]
