@@ -351,15 +351,25 @@ fn enrolled_paths(
 
 /// Resolve encrypted files from the same committed enrollment metadata.
 pub fn encrypted_paths(repo: &HistoryRepo, commit: Option<&str>) -> Result<BTreeSet<String>> {
+    encrypted_paths_in(repo, &repo.gix()?, commit)
+}
+
+/// [`encrypted_paths`] through one open repository, so a listing does not
+/// open it again to read the enrollment and the tree.
+pub(crate) fn encrypted_paths_in(
+    repo: &HistoryRepo,
+    objects: &gix::Repository,
+    commit: Option<&str>,
+) -> Result<BTreeSet<String>> {
     let Some(commit) = commit else {
         return Ok(BTreeSet::new());
     };
-    let Some(manifest) = crate::history::manifest::Manifest::read(repo, commit)? else {
+    let Some(manifest) = crate::history::manifest::Manifest::read_in(objects, commit)? else {
         return Ok(BTreeSet::new());
     };
     let protected = manifest.encrypted_paths();
     Ok(repo
-        .ls_tree(commit)?
+        .ls_tree_in(objects, commit)?
         .into_iter()
         .filter(|entry| {
             protected.iter().any(|prefix| {
@@ -871,17 +881,32 @@ pub fn decrypt(
     object: &Object,
     interactive: bool,
 ) -> Result<Object> {
-    let envelope = envelope(repo, object, agecrypt::MAX_ENCRYPTED_BYTES)?;
+    decrypt_in(repo, &repo.gix()?, path, object, interactive)
+}
+
+/// [`decrypt`] through one open repository, so a listing of many encrypted
+/// files does not scan every pack index once per file.
+pub(crate) fn decrypt_in(
+    repo: &HistoryRepo,
+    objects: &gix::Repository,
+    path: &str,
+    object: &Object,
+    interactive: bool,
+) -> Result<Object> {
+    // An envelope is bound to one path: a cached decryption of the same blob
+    // must not stand in for another path, so a hit is answered only for the
+    // path it was opened for. Another path still reads the envelope.
+    if let Some((opened_for, decrypted)) = repo.decrypted_object(&object.1)
+        && opened_for == path
+    {
+        return Ok(decrypted);
+    }
+    let envelope = envelope_in(repo, objects, object, agecrypt::MAX_ENCRYPTED_BYTES)?;
     if control_file(path) {
         bail!("setup configuration itself cannot be encrypted: {path}");
     }
-    // An envelope is bound to one path: a cached decryption of the same blob
-    // must not stand in for another path.
     if envelope.as_ref().is_some_and(|outer| outer.path != path) {
         bail!("encrypted file does not match its path: {path}");
-    }
-    if let Some(decrypted) = repo.decrypted_object(&object.1) {
-        return Ok(decrypted);
     }
     let Some(outer) = envelope else {
         // the only other thing mise saves at an encrypted path is a record
@@ -890,7 +915,7 @@ pub fn decrypt(
             Repair::Same {
                 object: decrypted, ..
             } => {
-                repo.remember_decrypted(&object.1, decrypted.clone());
+                repo.remember_decrypted(&object.1, path, decrypted.clone());
                 Ok(decrypted)
             }
             Repair::Conflict { sides } => bail!(
@@ -910,7 +935,7 @@ pub fn decrypt(
         };
     };
     let decrypted = open(repo, path, &outer, interactive)?;
-    repo.remember_decrypted(&object.1, decrypted.clone());
+    repo.remember_decrypted(&object.1, path, decrypted.clone());
     Ok(decrypted)
 }
 
@@ -960,7 +985,7 @@ fn encrypt(
     let content = repo.cat_object_bounded(&object.1, agecrypt::MAX_PLAINTEXT_BYTES)?;
     let encoded = encode(path, &object.0, &content, scheme, recipients)?;
     let encrypted = ("100644".into(), repo.hash_blob(&encoded)?);
-    repo.remember_decrypted(&encrypted.1, object.clone());
+    repo.remember_decrypted(&encrypted.1, path, object.clone());
     Ok(encrypted)
 }
 

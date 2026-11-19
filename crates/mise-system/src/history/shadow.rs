@@ -31,6 +31,7 @@ pub(crate) const MAX_BYTES: u64 = 1024 * 1024 * 1024;
 #[cfg(test)]
 thread_local! {
     static READ_META_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GIX_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -41,6 +42,16 @@ pub(crate) fn reset_read_meta_calls() {
 #[cfg(test)]
 pub(crate) fn read_meta_calls() -> usize {
     READ_META_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_gix_opens() {
+    GIX_OPENS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn gix_opens() -> usize {
+    GIX_OPENS.with(std::cell::Cell::get)
 }
 
 /// One top-level root of a snapshot tree and the files to add under it,
@@ -115,12 +126,17 @@ pub struct HistoryRepo {
     /// Comparison and decrypted bytes live only for this process. They must
     /// never become objects merely because a preflight or diff read them.
     transient: std::sync::Mutex<TransientObjects>,
+    /// Learned on the first open and reused: a blob id computed from bytes
+    /// does not need the object database open again.
+    object_hash: std::sync::Mutex<Option<gix::hash::Kind>>,
 }
 
 #[derive(Default)]
 struct TransientObjects {
     blobs: BTreeMap<String, Vec<u8>>,
-    decrypted: BTreeMap<String, (String, String)>,
+    /// Ciphertext object -> the path it was opened for, and what it opened to.
+    /// The path is part of the key: the same blob under another path is not a hit.
+    decrypted: BTreeMap<String, (String, (String, String))>,
 }
 
 impl std::fmt::Debug for TransientObjects {
@@ -410,6 +426,7 @@ impl HistoryRepo {
         let repo = Self {
             git,
             transient: Default::default(),
+            object_hash: Default::default(),
         };
         if !repo.list_refs("refs/checkpoints/")?.is_empty() {
             bail!(
@@ -1015,6 +1032,8 @@ impl HistoryRepo {
     /// Git process per commit. Open it for each walk so objects and refs
     /// written by Git are always visible.
     pub(crate) fn gix(&self) -> Result<gix::Repository> {
+        #[cfg(test)]
+        GIX_OPENS.with(|count| count.set(count.get() + 1));
         gix::open_opts(self.dir(), gix::open::Options::isolated())
             .wrap_err_with(|| format!("opening {} with gix", display_path(self.dir())))
     }
@@ -1415,6 +1434,23 @@ impl HistoryRepo {
         Ok(())
     }
 
+    /// [`Self::ls_tree`] through an already open repository. A walk over a
+    /// tree's files opens it once and passes it here, not once per file.
+    pub(crate) fn ls_tree_in(
+        &self,
+        objects: &gix::Repository,
+        spec: &str,
+    ) -> Result<Vec<TreeEntry>> {
+        if let Some(id) = Self::object_id(spec) {
+            let tree = objects
+                .find_object(id)
+                .wrap_err_with(|| format!("reading {spec}"))?
+                .peel_to_tree()?;
+            return Self::gix_tree_entries(objects, &tree);
+        }
+        self.ls_tree(spec)
+    }
+
     /// Recursive listing of a tree (or a path inside it).
     pub fn ls_tree(&self, spec: &str) -> Result<Vec<TreeEntry>> {
         if let Some(id) = Self::object_id(spec) {
@@ -1635,9 +1671,8 @@ impl HistoryRepo {
     /// Compute the normal Git identity without writing an object. Read APIs
     /// can resolve it in memory until this repository handle is dropped.
     pub(crate) fn transient_blob_id(&self, bytes: &[u8]) -> Result<String> {
-        let oid =
-            gix::objs::compute_hash(self.gix()?.object_hash(), gix::object::Kind::Blob, bytes)?
-                .to_string();
+        let oid = gix::objs::compute_hash(self.object_hash()?, gix::object::Kind::Blob, bytes)?
+            .to_string();
         self.transient
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1655,7 +1690,7 @@ impl HistoryRepo {
             .cloned()
     }
 
-    pub(crate) fn decrypted_object(&self, ciphertext: &str) -> Option<(String, String)> {
+    pub(crate) fn decrypted_object(&self, ciphertext: &str) -> Option<(String, (String, String))> {
         self.transient
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1664,12 +1699,35 @@ impl HistoryRepo {
             .cloned()
     }
 
-    pub(crate) fn remember_decrypted(&self, ciphertext: &str, object: (String, String)) {
+    pub(crate) fn remember_decrypted(
+        &self,
+        ciphertext: &str,
+        path: &str,
+        object: (String, String),
+    ) {
         self.transient
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .decrypted
-            .insert(ciphertext.into(), object);
+            .insert(ciphertext.into(), (path.into(), object));
+    }
+
+    /// The hash kind of this repository, learned once. Computing a blob id
+    /// from bytes does not need the object database open.
+    pub(crate) fn object_hash(&self) -> Result<gix::hash::Kind> {
+        if let Some(kind) = *self
+            .object_hash
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+        {
+            return Ok(kind);
+        }
+        let kind = self.gix()?.object_hash();
+        *self
+            .object_hash
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(kind);
+        Ok(kind)
     }
 
     /// Compares two trees, from `a` to `b`. With `paths`, a path that exists
@@ -2677,6 +2735,7 @@ mod tests {
         let repo = super::HistoryRepo {
             git: mise_util::git::GitPlumbing::new(path),
             transient: Default::default(),
+            object_hash: Default::default(),
         };
         let tree = repo.empty_object("tree").unwrap();
         let commit = repo.commit_tree(&tree, vec![], "sha256 history").unwrap();
@@ -2705,6 +2764,7 @@ mod tests {
         let repo = super::HistoryRepo {
             git: mise_util::git::GitPlumbing::new(path),
             transient: Default::default(),
+            object_hash: Default::default(),
         };
         let tree = repo.empty_object("tree").unwrap();
         let message = format!("apply\n\n{}", "x".repeat(200 * 1024));
@@ -2748,6 +2808,7 @@ mod tests {
             let repo = super::HistoryRepo {
                 git: mise_util::git::GitPlumbing::new(path),
                 transient: Default::default(),
+                object_hash: Default::default(),
             };
             for bytes in contents {
                 let expected = repo

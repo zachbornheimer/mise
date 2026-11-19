@@ -48,7 +48,10 @@ pub(crate) fn upstream_with_interaction(
     interactive: bool,
 ) -> Result<Upstream> {
     let mut files = BTreeMap::new();
-    let encrypted = super::files::encrypted_paths(repo, commit)?;
+    // Opened once for the listing: opening it scans every pack index, so
+    // doing it per encrypted file is most of a sync's cost.
+    let objects = repo.gix()?;
+    let encrypted = super::files::encrypted_paths_in(repo, &objects, commit)?;
     // every file this machine cannot unlock is named at once, so a stale
     // recipient list is fixed in one pass rather than one file per retry.
     // Each is tried as the caller asked, prompting included: a hardware
@@ -60,10 +63,10 @@ pub(crate) fn upstream_with_interaction(
     if let Some(commit) = commit {
         // the listing already holds each entry's mode and object: looking
         // every path up again cost a tree walk per file
-        for entry in repo.ls_tree(commit)? {
+        for entry in repo.ls_tree_in(&objects, commit)? {
             let listed = (entry.mode, entry.oid);
             let object = if encrypted.contains(&entry.path) {
-                match super::files::decrypt(repo, &entry.path, &listed, interactive) {
+                match super::files::decrypt_in(repo, &objects, &entry.path, &listed, interactive) {
                     Ok(object) => object,
                     Err(err) if err.downcast_ref::<super::files::Locked>().is_some() => {
                         locked.push(entry.path);
@@ -1169,6 +1172,116 @@ mod tests {
         assert_eq!(
             plans[0].conflict.as_ref().map(|c| c.kind),
             Some(ConflictKind::DeleteModify)
+        );
+    }
+    use crate::history::manifest::{Enrollment, Manifest};
+    use crate::history::sync::files::{self, decrypt};
+
+    const ENCRYPTED_FILES: usize = 40;
+
+    /// A history of encrypted files, each sealed to one identity this
+    /// process holds, plus the commit that records them.
+    fn encrypted_history() -> (
+        tempfile::TempDir,
+        HistoryRepo,
+        age::x25519::Identity,
+        String,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let key = age::x25519::Identity::generate();
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        let entries: Vec<(String, String, String)> = (0..ENCRYPTED_FILES)
+            .map(|index| {
+                let path = format!("home/files/file-{index}"); // portable-home-ok
+                let encoded = files::encode(
+                    &path,
+                    "100644",
+                    format!("contents {index}").as_bytes(),
+                    "test",
+                    &recipients,
+                )
+                .unwrap();
+                ("100644".into(), repo.hash_blob(&encoded).unwrap(), path)
+            })
+            .collect();
+        let tree = repo.write_tree(&entries).unwrap();
+        let tree = Manifest {
+            enrollment: vec![Enrollment {
+                path: "home/files".into(), // portable-home-ok
+                autosave: true,
+                encrypt: true,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            }],
+            recipients: vec![key.to_public().to_string()],
+            ..Default::default()
+        }
+        .write(&repo, &tree)
+        .unwrap();
+        let commit = repo.commit_tree(&tree, vec![], "encrypted files").unwrap();
+        (tmp, repo, key, commit)
+    }
+
+    /// Reading one upstream listing opens the repository a handful of times,
+    /// not once per encrypted file, and a second read of the same head
+    /// decrypts nothing again.
+    #[test]
+    fn upstream_read_opens_the_repository_once() {
+        use age::secrecy::ExposeSecret;
+        let (_tmp, repo, key, commit) = encrypted_history();
+        let mut environment = mise_util::testing::EnvVarGuard::new();
+        environment.set("MISE_AGE_KEY", key.to_string().expose_secret());
+
+        crate::history::shadow::reset_gix_opens();
+        let first = upstream(&repo, Some(&commit)).unwrap();
+        let first_opens = crate::history::shadow::gix_opens();
+        assert_eq!(
+            first
+                .files
+                .keys()
+                .filter(|path| path.starts_with("home/files/"))
+                .count(),
+            ENCRYPTED_FILES,
+            "{first:?}"
+        );
+        assert!(
+            first_opens <= 4,
+            "one listing of {ENCRYPTED_FILES} encrypted files opened the repository {first_opens} times"
+        );
+
+        crate::history::shadow::reset_gix_opens();
+        let second = upstream(&repo, Some(&commit)).unwrap();
+        let second_opens = crate::history::shadow::gix_opens();
+        assert_eq!(second.files, first.files);
+        assert!(
+            second_opens <= 4,
+            "a second listing opened the repository {second_opens} times and decrypted again"
+        );
+    }
+
+    /// A cached decryption answers only the path it was opened for. The
+    /// same ciphertext under another path is still read, and refused.
+    #[test]
+    fn a_cached_decryption_is_refused_under_another_path() {
+        use age::secrecy::ExposeSecret;
+        let (_tmp, repo, key, commit) = encrypted_history();
+        let mut environment = mise_util::testing::EnvVarGuard::new();
+        environment.set("MISE_AGE_KEY", key.to_string().expose_secret());
+        let listing = upstream(&repo, Some(&commit)).unwrap();
+        let (path, decrypted) = listing
+            .files
+            .iter()
+            .find(|(path, _)| path.starts_with("home/files/")) // portable-home-ok
+            .unwrap();
+        let sealed = repo.object_at(&commit, path).unwrap().unwrap();
+        assert_eq!(&decrypt(&repo, path, &sealed, false).unwrap(), decrypted);
+        let err = decrypt(&repo, "home/files/other", &sealed, false).unwrap_err(); // portable-home-ok
+        assert!(
+            err.to_string().contains("does not match its path"),
+            "{err:#}"
         );
     }
 }
