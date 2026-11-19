@@ -194,6 +194,17 @@ intermediate saves and merge parents, against your encryption settings. An
 earlier plaintext version blocks the push even if the newest version is
 encrypted. To push, remove that history or explicitly allow it.
 
+The first check reads every saved version of every encrypted file. mise then
+records, beside the history repository on this machine, the commit it checked
+and the paths it covered, so a later check reads only the commits added since.
+mise runs the full check again when that record is missing, unreadable,
+damaged, or written under different check rules, when the recorded commit is
+not an ancestor of the one being pushed, and when more paths are encrypted
+than the record covered. The record belongs to the one repository it was
+written for, so a copy of it has no effect on another. It only shortens a
+check that already passed: there is no command to clear it, and it never lets
+a push skip the check.
+
 ### Secrets in saved versions {#secrets-in-saved-versions}
 
 The credential filter looks at file names, so a tracked `~/.bashrc` is saved

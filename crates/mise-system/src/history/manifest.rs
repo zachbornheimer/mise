@@ -659,7 +659,7 @@ impl Manifest {
         Ok(())
     }
 
-    fn read_gix_entry(entry: &gix::object::tree::Entry<'_>) -> Result<Self> {
+    pub(crate) fn read_gix_entry(entry: &gix::object::tree::Entry<'_>) -> Result<Self> {
         if entry.mode().value() != 0o100644 {
             bail!("dotfile enrollment metadata must be a regular file");
         }
