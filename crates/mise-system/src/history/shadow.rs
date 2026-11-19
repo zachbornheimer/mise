@@ -11,8 +11,9 @@
 //! repositories are untouched, and nested repositories become gitlinks
 //! rather than content. The user's checkouts and indexes are never touched.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Serialize};
@@ -32,6 +33,9 @@ pub(crate) const MAX_BYTES: u64 = 1024 * 1024 * 1024;
 thread_local! {
     static READ_META_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GIX_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CAPTURE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STATS_WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BLOB_HEADER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -52,6 +56,35 @@ pub(crate) fn reset_gix_opens() {
 #[cfg(test)]
 pub(crate) fn gix_opens() -> usize {
     GIX_OPENS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_capture_reads() {
+    CAPTURE_READS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn capture_reads() -> usize {
+    CAPTURE_READS.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+pub(crate) fn reset_stats_writes() {
+    STATS_WRITES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn stats_writes() -> usize {
+    STATS_WRITES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_blob_header_reads() {
+    BLOB_HEADER_READS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn blob_header_reads() -> usize {
+    BLOB_HEADER_READS.with(std::cell::Cell::get)
 }
 
 /// One top-level root of a snapshot tree and the files to add under it,
@@ -157,6 +190,180 @@ struct EncryptionCacheEntry {
     mode: String,
     scheme: String,
     oid: String,
+}
+
+/// A replaceable index, not history: the size, mode and modification time
+/// every tracked file had when this history last captured it, so a file that
+/// has not changed is not read, hashed and compressed again. It lives beside
+/// `encryption.json` in this machine's own `index/`, and is never published.
+#[derive(Default, Deserialize, Serialize)]
+struct CaptureStats {
+    /// The second this cache was written. `git`'s racy-timestamp rule: a file
+    /// whose recorded time is at or after this moment can have changed since
+    /// without its time moving, so it is read again rather than reused.
+    #[serde(default)]
+    written: i64,
+    #[serde(default)]
+    files: BTreeMap<String, CaptureStat>,
+    /// Whether anything above changed since the load: a capture that changed
+    /// nothing must not rewrite and fsync this file.
+    #[serde(skip)]
+    dirty: bool,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
+struct CaptureStat {
+    size: u64,
+    mtime_ns: i64,
+    /// The inode and status-change time: a copy that keeps a file's size and
+    /// modification time still gets a new inode, and writing it (or setting
+    /// its time back) moves the status-change time. Zero where the platform
+    /// does not report them, and then not compared.
+    #[serde(default)]
+    ino: u64,
+    #[serde(default)]
+    ctime_ns: i64,
+    mode: String,
+    oid: String,
+    /// The recipient set an encrypted entry's `oid` was made for; empty for a
+    /// plain file.
+    #[serde(default)]
+    scheme: String,
+    /// Whether `oid` is a ciphertext. A path whose policy changed is never
+    /// reused across that change: a plaintext blob must not stand in for an
+    /// envelope, nor the reverse.
+    #[serde(default)]
+    encrypted: bool,
+}
+
+/// The modification time of `meta` in nanoseconds since the epoch, or -1 when
+/// the platform cannot say: a file whose time is unknown is always read.
+fn modification_ns(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|since| i64::try_from(since.as_nanos()).ok())
+        .unwrap_or(-1)
+}
+
+/// The inode and status-change time of `meta`, or zero where the platform
+/// cannot say them (they are then not compared).
+#[cfg(unix)]
+fn identity_of(meta: &std::fs::Metadata) -> (u64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    (
+        meta.ino(),
+        meta.ctime()
+            .saturating_mul(1_000_000_000)
+            .saturating_add(meta.ctime_nsec()),
+    )
+}
+
+#[cfg(not(unix))]
+fn identity_of(_meta: &std::fs::Metadata) -> (u64, i64) {
+    (0, 0)
+}
+
+fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The tree mode of `meta`: a symlink, or a file with its executable bit.
+/// `None` for anything a capture must ask git about instead (a submodule).
+fn tree_mode(meta: &std::fs::Metadata) -> Option<&'static str> {
+    if meta.file_type().is_symlink() {
+        return Some("120000");
+    }
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(if meta.permissions().mode() & 0o100 != 0 {
+            "100755"
+        } else {
+            "100644"
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Some("100644")
+    }
+}
+
+impl CaptureStats {
+    /// The entry recorded for `live`, when its size, mode and time say its
+    /// content has not changed since this history last captured it.
+    fn recorded(
+        &self,
+        live: &Path,
+        meta: &std::fs::Metadata,
+        mode: &str,
+        scheme: &str,
+        encrypted: bool,
+    ) -> Option<&CaptureStat> {
+        let entry = self.files.get(live.to_str()?)?;
+        if entry.encrypted != encrypted
+            || entry.mode != mode
+            || entry.scheme != scheme
+            || entry.size != meta.len()
+            || entry.mtime_ns != modification_ns(meta)
+        {
+            return None;
+        }
+        let (ino, ctime_ns) = identity_of(meta);
+        if (ino != 0 || ctime_ns != 0) && (entry.ino != ino || entry.ctime_ns != ctime_ns) {
+            return None;
+        }
+        if self.written <= 0
+            || entry.mtime_ns < 0
+            || entry.mtime_ns / 1_000_000_000 + 2 > self.written
+        {
+            return None;
+        }
+        Some(entry)
+    }
+
+    fn remember(
+        &mut self,
+        live: &Path,
+        meta: &std::fs::Metadata,
+        mode: &str,
+        scheme: &str,
+        encrypted: bool,
+        oid: &str,
+    ) {
+        let Some(key) = live.to_str() else {
+            return;
+        };
+        let mtime_ns = modification_ns(meta);
+        if mtime_ns < 0 {
+            return;
+        }
+        let (ino, ctime_ns) = identity_of(meta);
+        let entry = CaptureStat {
+            size: meta.len(),
+            mtime_ns,
+            ino,
+            ctime_ns,
+            mode: mode.into(),
+            oid: oid.into(),
+            scheme: scheme.into(),
+            encrypted,
+        };
+        // An entry that already says this needs no write: rewriting and
+        // fsyncing this file for a capture that changed nothing cost the
+        // concurrent case, ten saves took 8.80 s against 6.08 s without this
+        // cache (2026-11-20).
+        if self.files.get(key) != Some(&entry) {
+            self.files.insert(key.to_string(), entry);
+            self.dirty = true;
+        }
+    }
 }
 
 /// A scratch git index belonging to one call, removed when that call ends.
@@ -464,7 +671,7 @@ impl HistoryRepo {
         recipient_strings: &[String],
         interactive: bool,
     ) -> Result<CaptureResult> {
-        self.capture_walk(walk, recipient_strings, interactive, true)
+        self.capture_walk(walk, recipient_strings, interactive, true, true)
     }
 
     /// The tracked set as it is on disk, to compare against. A local-only
@@ -476,7 +683,7 @@ impl HistoryRepo {
         recipient_strings: &[String],
         interactive: bool,
     ) -> Result<CaptureResult> {
-        self.capture_walk(walk, recipient_strings, interactive, false)
+        self.capture_walk(walk, recipient_strings, interactive, false, false)
     }
 
     fn capture_walk(
@@ -485,6 +692,7 @@ impl HistoryRepo {
         recipient_strings: &[String],
         interactive: bool,
         carry_local: bool,
+        write_stats: bool,
     ) -> Result<CaptureResult> {
         let mut manifest = walk.manifest.clone();
         manifest.recipients = recipient_strings.to_vec();
@@ -497,12 +705,17 @@ impl HistoryRepo {
         }
         manifest.recipients.sort();
         manifest.recipients.dedup();
-        let mut result = self.capture_tracked_files(walk, &manifest.recipients, interactive)?;
+        let mut stats = self.load_capture_stats();
+        let mut result =
+            self.capture_tracked_files(walk, &manifest.recipients, interactive, &mut stats)?;
         result.tree = manifest.preserve_other_files(self, &result.tree)?;
         if carry_local {
             result.tree = self.carry_local(walk, &result.tree)?;
         }
         result.tree = manifest.write(self, &result.tree)?;
+        if write_stats {
+            self.save_capture_stats(&mut stats)?;
+        }
         Ok(result)
     }
 
@@ -536,14 +749,79 @@ impl HistoryRepo {
         self.compose(tree, &overlays)
     }
 
+    /// Where this machine's capture-time file stats live: beside
+    /// `encryption.json` in the store's own `index/`, never inside the
+    /// history, and never published.
+    fn capture_stats_path(&self) -> PathBuf {
+        self.dir()
+            .parent()
+            .map(|store| store.join("index/capture-stats.json"))
+            .unwrap_or_else(|| PathBuf::from("capture-stats.json"))
+    }
+
+    fn load_capture_stats(&self) -> CaptureStats {
+        std::fs::read(self.capture_stats_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Writes the stats back, stamped with now, so the racy rule above can
+    /// tell a file that changed in this same second from one that did not.
+    fn save_capture_stats(&self, stats: &mut CaptureStats) -> Result<()> {
+        if stats.files.is_empty() || !stats.dirty {
+            return Ok(());
+        }
+        #[cfg(test)]
+        STATS_WRITES.with(|count| count.set(count.get() + 1));
+        stats.written = now_seconds();
+        // this load is done, and the write below carries what changed
+        stats.dirty = false;
+        let path = self.capture_stats_path();
+        let Some(dir) = path.parent() else {
+            return Ok(());
+        };
+        super::store::create_private_dir(dir)?;
+        // `NamedTempFile` starts private, and a half-written cache must never
+        // be read back as a capture's evidence.
+        let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
+        serde_json::to_writer(temporary.as_file_mut(), stats)?;
+        temporary.as_file().sync_all()?;
+        mise_util::file::persist_atomic(temporary, &path)?;
+        Ok(())
+    }
+
+    /// The blob a live file already has, when this machine's own stats say its
+    /// content has not changed since the last capture. The object must still be
+    /// in this store: a cache outliving a pruned object would otherwise make a
+    /// capture fail.
+    #[allow(clippy::too_many_arguments)]
+    fn reused_blob(
+        &self,
+        gix: &gix::Repository,
+        live: &Path,
+        meta: &std::fs::Metadata,
+        mode: &str,
+        scheme: &str,
+        encrypted: bool,
+        stats: &CaptureStats,
+    ) -> Option<String> {
+        let entry = stats.recorded(live, meta, mode, scheme, encrypted)?;
+        if !self.holds_blob(gix, &entry.oid) {
+            return None;
+        }
+        Some(entry.oid.clone())
+    }
+
     fn capture_tracked_files(
         &self,
         walk: &super::tracked::Walk,
         recipient_strings: &[String],
         interactive: bool,
+        stats: &mut CaptureStats,
     ) -> Result<CaptureResult> {
         if !walk.files.values().any(|(_, policy)| policy.encrypt) {
-            return self.capture(&walk.roots);
+            return self.capture_with(&walk.roots, stats);
         }
         if recipient_strings.is_empty() {
             bail!(
@@ -620,6 +898,26 @@ impl HistoryRepo {
                     }
                     Err(error) => return Err(error.into()),
                 };
+                let path = history_path(&root.label, &rel)?;
+                let previous = in_history.remove(&path);
+                // Unchanged since the last capture: reuse the ciphertext this
+                // machine already made for it, without reading the file, let
+                // alone decrypting it. The head must still hold that
+                // ciphertext: a merge that took another machine's envelope for
+                // the same plaintext must not be replaced by ours.
+                if let Some(mode) = tree_mode(&metadata)
+                    && let Some(oid) =
+                        self.reused_blob(&gix, &live, &metadata, mode, &scheme, true, stats)
+                    && previous.as_ref().is_some_and(|(_, head)| *head == oid)
+                {
+                    overlays.push(Overlay {
+                        path,
+                        object: Some(("100644".into(), oid)),
+                    });
+                    continue;
+                }
+                #[cfg(test)]
+                CAPTURE_READS.with(|count| count.set(count.get() + 1));
                 let read = Self::read_encrypted(&live, &metadata);
                 let (mode, bytes) = match read {
                     Ok(read) => read,
@@ -637,7 +935,6 @@ impl HistoryRepo {
                     }
                     Err(error) => return Err(error),
                 };
-                let path = history_path(&root.label, &rel)?;
                 let fingerprint = blake3::keyed_hash(&cache_key, &bytes).to_hex().to_string();
                 let cached = cache
                     .get(&path)
@@ -650,7 +947,6 @@ impl HistoryRepo {
                         self.blob_starts_with_in(&gix, &entry.oid, b"mise-encrypted-file-v1\n")
                             .unwrap_or(false)
                     });
-                let previous = in_history.remove(&path);
                 let oid = match cached {
                     Some(entry) if previous.as_ref().is_none_or(|(_, oid)| *oid == entry.oid) => {
                         entry.oid.clone()
@@ -702,6 +998,7 @@ impl HistoryRepo {
                         oid
                     }
                 };
+                stats.remember(&live, &metadata, mode, &scheme, true, &oid);
                 overlays.push(Overlay {
                     path,
                     object: Some(("100644".into(), oid)),
@@ -709,7 +1006,7 @@ impl HistoryRepo {
             }
         }
         // No encrypted input is ever handed to git add or hash-object.
-        let mut captured = self.capture(&roots)?;
+        let mut captured = self.capture_with(&roots, stats)?;
         for denial in denied {
             if !captured
                 .permission_denied
@@ -743,7 +1040,20 @@ impl HistoryRepo {
 
     /// Builds the snapshot tree for `roots`: one subtree per root holding
     /// exactly the listed files.
+    /// The snapshot tree for `roots` with a fresh cache: the entry point tests
+    /// use, where a capture has no earlier capture to reuse from.
+    #[cfg(test)]
     pub(crate) fn capture(&self, roots: &[CaptureRoot]) -> Result<CaptureResult> {
+        self.capture_with(roots, &mut CaptureStats::default())
+    }
+
+    /// Builds the snapshot tree for `roots`, reusing the blob every file whose
+    /// recorded stat says it has not changed already has.
+    fn capture_with(
+        &self,
+        roots: &[CaptureRoot],
+        stats: &mut CaptureStats,
+    ) -> Result<CaptureResult> {
         let mut omitted = vec![];
         let mut denied = vec![];
         let mut entries: Vec<(String, String)> = vec![]; // (oid, name)
@@ -760,7 +1070,7 @@ impl HistoryRepo {
                 continue;
             }
             let tree = self
-                .tree_for_root(root, &mut omitted, &mut denied)
+                .tree_for_root(root, &mut omitted, &mut denied, stats)
                 .wrap_err_with(|| format!("snapshotting {}", display_path(&root.path)))?;
             entries.push((tree, root.label.clone()));
             records.push(record);
@@ -789,6 +1099,7 @@ impl HistoryRepo {
         root: &CaptureRoot,
         omitted: &mut Vec<super::store::PathReason>,
         denied: &mut Vec<super::store::PathReason>,
+        stats: &mut CaptureStats,
     ) -> Result<String> {
         // opening a repository scans every pack index: one open serves every
         // file of the root, not one per file
@@ -798,6 +1109,20 @@ impl HistoryRepo {
             let live = root.path.join(rel);
             let captured = (|| -> Result<Overlay> {
                 let meta = std::fs::symlink_metadata(&live)?;
+                let overlay_path = rel
+                    .to_str()
+                    .ok_or_else(|| eyre::eyre!("non-UTF-8 tracked path"))?
+                    .replace('\\', "/");
+                if let Some(mode) = tree_mode(&meta)
+                    && let Some(oid) = self.reused_blob(&gix, &live, &meta, mode, "", false, stats)
+                {
+                    return Ok(Overlay {
+                        path: overlay_path,
+                        object: Some((mode.into(), oid)),
+                    });
+                }
+                #[cfg(test)]
+                CAPTURE_READS.with(|count| count.set(count.get() + 1));
                 let (mode, oid) = if meta.file_type().is_symlink() {
                     (
                         "120000",
@@ -824,11 +1149,11 @@ impl HistoryRepo {
                 } else {
                     bail!("cannot capture non-file {}", display_path(&live));
                 };
+                if let Some(mode) = tree_mode(&meta) {
+                    stats.remember(&live, &meta, mode, "", false, &oid);
+                }
                 Ok(Overlay {
-                    path: rel
-                        .to_str()
-                        .ok_or_else(|| eyre::eyre!("non-UTF-8 tracked path"))?
-                        .replace('\\', "/"),
+                    path: overlay_path,
                     object: Some((mode.into(), oid)),
                 })
             })();
@@ -1088,7 +1413,7 @@ impl HistoryRepo {
                     let mut bytes = [0; 6];
                     let size = mode
                         .is_blob_or_symlink()
-                        .then(|| repo.find_header(entry.object_id()).map(|h| h.size()))
+                        .then(|| Self::blob_size_in(repo, entry.object_id()))
                         .transpose()?;
                     visit(
                         commit,
@@ -1345,6 +1670,32 @@ impl HistoryRepo {
         Ok(record)
     }
 
+    /// The size of a blob, read from its header at most once per process.
+    ///
+    /// An object id is its content, so a size never changes and nothing has
+    /// to invalidate this. It matters because a published tree repeats the
+    /// same blobs in every commit: auditing 401 commits of 7,800 files asked
+    /// for the same header 3 million times, 35 s of a 44 s sync.
+    fn blob_size_in(repo: &gix::Repository, oid: gix::ObjectId) -> Result<u64> {
+        static SIZES: LazyLock<Mutex<HashMap<gix::ObjectId, u64>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+        // A cap keeps a long-lived process (the watcher) from growing
+        // without bound. Past it the cache stops filling; lookups fall
+        // through to a header read, which is the behavior without a cache.
+        const MAX_ENTRIES: usize = 1 << 20;
+        if let Some(size) = SIZES.lock().expect("blob size cache").get(&oid).copied() {
+            return Ok(size);
+        }
+        #[cfg(test)]
+        BLOB_HEADER_READS.with(|count| count.set(count.get() + 1));
+        let size = repo.find_header(oid)?.size();
+        let mut sizes = SIZES.lock().expect("blob size cache");
+        if sizes.len() < MAX_ENTRIES {
+            sizes.insert(oid, size);
+        }
+        Ok(size)
+    }
+
     fn gix_tree_entries(repo: &gix::Repository, tree: &gix::Tree<'_>) -> Result<Vec<TreeEntry>> {
         let mut entries = tree
             .traverse()
@@ -1361,7 +1712,7 @@ impl HistoryRepo {
                 let size = entry
                     .mode
                     .is_blob_or_symlink()
-                    .then(|| repo.find_header(entry.oid).map(|header| header.size()))
+                    .then(|| Self::blob_size_in(repo, entry.oid))
                     .transpose()?;
                 Ok(TreeEntry {
                     mode,
@@ -1568,6 +1919,21 @@ impl HistoryRepo {
     /// [`Self::blob_starts_with`] through an already open repository. Opening
     /// one scans every pack index, so a walk that asks about many blobs opens
     /// it once and passes it here, not once per blob.
+    /// Whether this store already holds `oid` as a blob. Only the object
+    /// header is read: reusing a cached id must not decompress the file.
+    fn holds_blob(&self, gix: &gix::Repository, oid: &str) -> bool {
+        if self.transient_blob(oid).is_some() {
+            return true;
+        }
+        let Some(id) = Self::object_id(oid) else {
+            return false;
+        };
+        match gix.find_header(id) {
+            Ok(header) => header.kind() == gix::object::Kind::Blob,
+            Err(_) => false,
+        }
+    }
+
     pub(crate) fn blob_starts_with_in(
         &self,
         repo: &gix::Repository,
@@ -1976,26 +2342,45 @@ impl HistoryRepo {
 
     /// The object at `path` inside `tree_ish`: its mode and oid.
     pub fn object_at(&self, tree_ish: &str, path: &str) -> Result<Option<(String, String)>> {
-        if let Some(id) = Self::object_id(tree_ish) {
-            let repo = self.gix()?;
-            // a missing object holds nothing, as `ls-tree` reports it
-            let Some(object) = repo.try_find_object(id)? else {
-                return Ok(None);
-            };
-            // a blob holds no paths; any other failure to reach a tree is
-            // the repository's, not an absence
-            if object.kind == gix::object::Kind::Blob {
-                return Ok(None);
-            }
-            let tree = object.peel_to_tree()?;
-            // as `ls-tree` prints it: six octal digits, so a tree is 040000
-            return Ok(tree.lookup_entry_by_path(path)?.map(|entry| {
-                (
-                    format!("{:06o}", entry.mode().value()),
-                    entry.object_id().to_string(),
-                )
-            }));
+        if Self::object_id(tree_ish).is_some() {
+            return self.object_at_in(&self.gix()?, tree_ish, path);
         }
+        self.object_at_by_git(tree_ish, path)
+    }
+
+    /// [`Self::object_at`] through an already open repository. Opening this
+    /// repository scans every pack index, so a walk that looks up many paths
+    /// opens it once and passes it here, not once per path.
+    pub(crate) fn object_at_in(
+        &self,
+        objects: &gix::Repository,
+        tree_ish: &str,
+        path: &str,
+    ) -> Result<Option<(String, String)>> {
+        let Some(id) = Self::object_id(tree_ish) else {
+            return self.object_at_by_git(tree_ish, path);
+        };
+        // a missing object holds nothing, as `ls-tree` reports it
+        let Some(object) = objects.try_find_object(id)? else {
+            return Ok(None);
+        };
+        // a blob holds no paths; any other failure to reach a tree is
+        // the repository's, not an absence
+        if object.kind == gix::object::Kind::Blob {
+            return Ok(None);
+        }
+        let tree = object.peel_to_tree()?;
+        // as `ls-tree` prints it: six octal digits, so a tree is 040000
+        Ok(tree.lookup_entry_by_path(path)?.map(|entry| {
+            (
+                format!("{:06o}", entry.mode().value()),
+                entry.object_id().to_string(),
+            )
+        }))
+    }
+
+    /// [`Self::object_at`] for a revision only Git resolves.
+    fn object_at_by_git(&self, tree_ish: &str, path: &str) -> Result<Option<(String, String)>> {
         let output = self
             .git
             .output_unchecked(PlumbingCall::new(["ls-tree", "-z", tree_ish, "--", path]))?;
@@ -2075,7 +2460,16 @@ impl HistoryRepo {
     /// The encrypted streams `tree` declares, read once for a walk over its
     /// files ([`Self::restored`]) instead of once per file.
     pub(crate) fn encrypted_paths_of(&self, tree: &str) -> Result<BTreeSet<String>> {
-        Ok(super::manifest::Manifest::read(self, tree)?
+        self.encrypted_paths_of_in(&self.gix()?, tree)
+    }
+
+    /// [`Self::encrypted_paths_of`] through an already open repository.
+    pub(crate) fn encrypted_paths_of_in(
+        &self,
+        objects: &gix::Repository,
+        tree: &str,
+    ) -> Result<BTreeSet<String>> {
+        Ok(super::manifest::Manifest::read_in(objects, tree)?
             .map(|manifest| manifest.encrypted_paths())
             .unwrap_or_default())
     }
@@ -2085,6 +2479,24 @@ impl HistoryRepo {
     /// every saved file then reads the manifest once, not once per file.
     pub(crate) fn restored(
         &self,
+        encrypted_paths: &BTreeSet<String>,
+        path: &str,
+        object: (String, String),
+    ) -> Result<(String, String)> {
+        // a tree or a gitlink is not a file to restore, so this never opens
+        // the repository to answer it
+        if matches!(object.0.as_str(), "040000" | "160000") {
+            return Ok(object);
+        }
+        self.restored_in(&self.gix()?, encrypted_paths, path, object)
+    }
+
+    /// [`Self::restored`] through an already open repository. A walk that
+    /// restores many saved files decrypts them through one open repository
+    /// instead of opening it again for each file.
+    pub(crate) fn restored_in(
+        &self,
+        objects: &gix::Repository,
         encrypted_paths: &BTreeSet<String>,
         path: &str,
         object: (String, String),
@@ -2099,8 +2511,9 @@ impl HistoryRepo {
                     .is_some_and(|rest| rest.starts_with('/'))
         });
         if encrypted {
-            return super::sync::files::decrypt(
+            return super::sync::files::decrypt_in(
                 self,
+                objects,
                 path,
                 &object,
                 console::user_attended_stderr(),
@@ -2483,17 +2896,23 @@ impl HistoryRepo {
         conflicts: &mut Vec<String>,
     ) -> Result<String> {
         let magic: &[u8] = b"mise-encrypted-file-v1\n";
+        // One open for the whole walk. Opening this repository scans every
+        // pack index, so the per-entry `blob_starts_with` and `object_at` this
+        // loop used to call opened it once per entry, and a merge of a few
+        // thousand saved files spent seconds scanning indexes.
+        let objects = self.gix()?;
         let mut overlays = Vec::new();
-        for entry in self.ls_tree(tree)? {
-            if !self.blob_starts_with(&entry.oid, magic)? {
+        for entry in self.ls_tree_in(&objects, tree)? {
+            if !self.blob_starts_with_in(&objects, &entry.oid, magic)? {
                 continue;
             }
-            let ours = self.object_at(local, &entry.path)?;
-            let theirs = self.object_at(remote, &entry.path)?;
+            let ours = self.object_at_in(&objects, local, &entry.path)?;
+            let theirs = self.object_at_in(&objects, remote, &entry.path)?;
             let is_envelope = |object: &Option<(String, String)>| {
-                object
-                    .as_ref()
-                    .is_some_and(|object| self.blob_starts_with(&object.1, magic).unwrap_or(false))
+                object.as_ref().is_some_and(|object| {
+                    self.blob_starts_with_in(&objects, &object.1, magic)
+                        .unwrap_or(false)
+                })
             };
             if !is_envelope(&ours) && !is_envelope(&theirs) {
                 continue;
@@ -3460,6 +3879,58 @@ mod tests {
         );
     }
 
+    /// The count that matters is on the second walk: the cache is per
+    /// process, so the content is unique to this test and no other test's
+    /// blob can answer for it.
+    #[test]
+    fn a_second_walk_of_the_same_tree_reads_no_blob_header_again() {
+        if mise_util::git::plumbing_binary().is_none() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = repo(tmp.path());
+        let content: &[u8] = b"a second walk reads no header: 8d80680c";
+        let oid = repo.hash_blob(content).unwrap();
+        let tree = repo
+            .compose(
+                &repo.empty_object("tree").unwrap(),
+                &[Overlay {
+                    path: "home/memo".into(),
+                    object: Some(("100644".into(), oid.clone())),
+                }],
+            )
+            .unwrap();
+        let gix = gix::open_opts(repo.dir(), gix::open::Options::isolated()).unwrap();
+        let tree = gix
+            .find_tree(gix::ObjectId::from_hex(tree.as_bytes()).unwrap())
+            .unwrap();
+
+        reset_blob_header_reads();
+        let first = HistoryRepo::gix_tree_entries(&gix, &tree).unwrap();
+        assert_eq!(
+            first,
+            vec![TreeEntry {
+                mode: "100644".into(),
+                oid,
+                size: Some(content.len() as u64),
+                path: "home/memo".into(),
+            }]
+        );
+        assert!(
+            blob_header_reads() >= 1,
+            "the first walk must read the header"
+        );
+
+        reset_blob_header_reads();
+        let second = HistoryRepo::gix_tree_entries(&gix, &tree).unwrap();
+        assert_eq!(second, first);
+        assert_eq!(
+            blob_header_reads(),
+            0,
+            "the second walk read a header it already had"
+        );
+    }
+
     /// A checkpoint records a directory's mode only under the key that
     /// governs it on this machine: another platform's containing record for
     /// a directory whose own stream has no record (the default) is not this
@@ -4190,5 +4661,274 @@ mod tests {
             object.1,
             repo.object_at(&local, "home/secret").unwrap().unwrap().1
         );
+    }
+
+    /// Merging a tree that holds many encrypted files opens the repository
+    /// once, not once per entry: the per-entry magic check and the per-entry
+    /// parent lookups each opened it, so one incoming merge scanned every
+    /// pack index thousands of times.
+    #[test]
+    fn merging_encrypted_files_opens_the_repository_once() {
+        const FILES: usize = 40;
+        let temp = tempfile::tempdir().unwrap();
+        let repo = super::HistoryRepo::open_or_init_in(temp.path())
+            .unwrap()
+            .unwrap();
+        let blobs = |side: &str| -> Vec<(String, String, String)> {
+            (0..FILES)
+                .map(|index| {
+                    let path = format!("home/encrypted/file-{index}"); // portable-home-ok
+                    let bytes = format!("mise-encrypted-file-v1\n{side} {index}");
+                    (
+                        "100644".to_string(),
+                        repo.hash_blob(bytes.as_bytes()).unwrap(),
+                        path,
+                    )
+                })
+                .collect()
+        };
+        let commit = |side: &str, parents: Vec<&str>| {
+            let tree = repo.write_tree(&blobs(side)).unwrap();
+            repo.commit_tree(&tree, parents, side).unwrap()
+        };
+        let base = commit("base", vec![]);
+        let local = commit("local", vec![&base]);
+        let remote = commit("remote", vec![&base]);
+
+        super::reset_gix_opens();
+        let (_tree, conflicts) = repo.merge_tree(&local, &remote).unwrap();
+        let opens = super::gix_opens();
+        assert_eq!(conflicts.len(), FILES, "{conflicts:?}");
+        assert!(
+            opens <= 8,
+            "merging {FILES} encrypted files opened the repository {opens} times"
+        );
+    }
+
+    #[test]
+    fn a_second_capture_reads_no_plain_file_whose_stats_are_unchanged() {
+        if mise_util::git::plumbing_binary().is_none() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        for name in [".zshrc", ".gitconfig"] {
+            std::fs::write(home.join(name), format!("{name}\n")).unwrap();
+        }
+        // Times older than the cache a capture writes: a file changed in that
+        // same second is read again by design, so it cannot show reuse.
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(30);
+        for name in [".zshrc", ".gitconfig"] {
+            std::fs::File::options()
+                .write(true)
+                .open(home.join(name))
+                .unwrap()
+                .set_modified(earlier)
+                .unwrap();
+        }
+        let repo = repo(tmp.path());
+        let walk = super::super::tracked::Walk {
+            roots: vec![root("home", &home, &[".zshrc", ".gitconfig"])],
+            ..Default::default()
+        };
+        super::reset_capture_reads();
+        let first = repo.capture_tracked(&walk, &[], false).unwrap();
+        assert_eq!(super::capture_reads(), 2);
+        super::reset_capture_reads();
+        let second = repo.capture_tracked(&walk, &[], false).unwrap();
+        assert_eq!(second.tree, first.tree);
+        assert_eq!(
+            super::capture_reads(),
+            0,
+            "a second capture read a file whose size and time had not changed"
+        );
+    }
+
+    #[test]
+    fn a_capture_that_changed_nothing_does_not_rewrite_the_stats_file() {
+        if mise_util::git::plumbing_binary().is_none() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        for name in [".zshrc", ".gitconfig"] {
+            std::fs::write(home.join(name), format!("{name}\n")).unwrap();
+        }
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(30);
+        for name in [".zshrc", ".gitconfig"] {
+            std::fs::File::options()
+                .write(true)
+                .open(home.join(name))
+                .unwrap()
+                .set_modified(earlier)
+                .unwrap();
+        }
+        let repo = repo(tmp.path());
+        let walk = super::super::tracked::Walk {
+            roots: vec![root("home", &home, &[".zshrc", ".gitconfig"])],
+            ..Default::default()
+        };
+        super::reset_stats_writes();
+        repo.capture_tracked(&walk, &[], false).unwrap();
+        assert_eq!(
+            super::stats_writes(),
+            1,
+            "the first capture must record every file it saw"
+        );
+        repo.capture_tracked(&walk, &[], false).unwrap();
+        assert_eq!(
+            super::stats_writes(),
+            1,
+            "a capture that changed nothing rewrote the stats file"
+        );
+        // A file whose contents changed gets a new entry, and that must reach disk
+        std::fs::write(home.join(".zshrc"), "changed\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(home.join(".zshrc"))
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+        repo.capture_tracked(&walk, &[], false).unwrap();
+        assert_eq!(
+            super::stats_writes(),
+            2,
+            "a changed file must be written back"
+        );
+    }
+
+    #[test]
+    fn a_file_modified_in_the_caches_own_second_is_read_again() {
+        if mise_util::git::plumbing_binary().is_none() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".zshrc"), "one\n").unwrap();
+        let repo = repo(tmp.path());
+        let walk = super::super::tracked::Walk {
+            roots: vec![root("home", &home, &[".zshrc"])],
+            ..Default::default()
+        };
+        repo.capture_tracked(&walk, &[], false).unwrap();
+        super::reset_capture_reads();
+        repo.capture_tracked(&walk, &[], false).unwrap();
+        assert_eq!(
+            super::capture_reads(),
+            1,
+            "a file whose recorded time is the cache's own second must be read again"
+        );
+    }
+
+    #[test]
+    fn a_second_capture_reads_no_unchanged_encrypted_file() {
+        if mise_util::git::plumbing_binary().is_none() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join("secret");
+        std::fs::write(&path, b"never-store-this-plaintext-in-git").unwrap();
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(30);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+        let repo = repo(tmp.path());
+        let identity = age::x25519::Identity::generate();
+        let recipients = vec![identity.to_public().to_string()];
+        let mut walk = super::super::tracked::Walk {
+            roots: vec![root("home", &home, &["secret"])],
+            ..Default::default()
+        };
+        let mut policy = crate::files::FilePolicy::for_mode(crate::files::FileMode::Track);
+        policy.encrypt = true;
+        walk.files.insert(path.clone(), (0, policy));
+        let first = repo.capture_tracked(&walk, &recipients, false).unwrap();
+        let checkpoint = crate::history::checkpoint::test_checkpoint("reuse", Some(&first.tree));
+        repo.write_checkpoint(Some(&first.tree), &checkpoint)
+            .unwrap();
+        super::reset_capture_reads();
+        let second = repo.capture_tracked(&walk, &recipients, false).unwrap();
+        assert_eq!(second.tree, first.tree);
+        assert_eq!(
+            super::capture_reads(),
+            0,
+            "a second capture read an encrypted file that had not changed"
+        );
+    }
+
+    #[test]
+    fn recorded_stats_never_reuse_across_a_policy_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("secret");
+        std::fs::write(&file, b"x").unwrap();
+        let meta = std::fs::symlink_metadata(&file).unwrap();
+        let mut stats = CaptureStats {
+            written: now_seconds() + 3_600,
+            ..Default::default()
+        };
+        stats.remember(&file, &meta, "100644", "", false, "plaintext-blob");
+        assert!(stats.recorded(&file, &meta, "100644", "", false).is_some());
+        assert!(
+            stats.recorded(&file, &meta, "100644", "", true).is_none(),
+            "a plaintext blob must never stand in for an envelope"
+        );
+        assert!(stats.recorded(&file, &meta, "100755", "", false).is_none());
+        assert!(
+            stats
+                .recorded(&file, &meta, "100644", "other-recipients", false)
+                .is_none()
+        );
+        std::fs::write(&file, b"yy").unwrap();
+        let grown = std::fs::symlink_metadata(&file).unwrap();
+        assert!(stats.recorded(&file, &grown, "100644", "", false).is_none());
+    }
+    #[test]
+    fn a_replaced_file_with_the_same_size_and_time_is_read_again() {
+        if mise_util::git::plumbing_binary().is_none() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let file = home.join(".zshrc");
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(30);
+        std::fs::write(&file, "aaa\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+        let repo = repo(tmp.path());
+        let walk = super::super::tracked::Walk {
+            roots: vec![root("home", &home, &[".zshrc"])],
+            ..Default::default()
+        };
+        let first = repo.capture_tracked(&walk, &[], false).unwrap();
+        // Same size, same modification time: only the status-change time and
+        // the inode can tell this from the file the capture recorded.
+        std::fs::write(&file, "bbb\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+        super::reset_capture_reads();
+        let second = repo.capture_tracked(&walk, &[], false).unwrap();
+        assert_eq!(
+            super::capture_reads(),
+            1,
+            "a file written after the capture must be read again"
+        );
+        assert_ne!(second.tree, first.tree);
     }
 }

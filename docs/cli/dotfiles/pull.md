@@ -30,7 +30,7 @@ In `sync` mode the watcher pulls on its own when there are no conflicts. When in
   Paths named by `--take-remote` take the origin's version; every other conflict keeps this machine's. Each kept path must already be saved.
 - **`--wait <DURATION>`** — Wait this long for a running sync or pull instead of failing
 
-  Accepts a duration such as `90s`, `5m` or `1h` (at most one hour). Without it the wait is `history.lock_wait`, 30 seconds by default; `0` fails at once. The refusal names the holder either way.
+  Accepts a duration such as `90s`, `5m` or `1h` (at most one hour). Without it the wait is `history.lock_wait`, 5 minutes by default; `0` fails at once. The refusal names the holder either way.
 - **`-h --help`** — Print help
 
 ## Examples
