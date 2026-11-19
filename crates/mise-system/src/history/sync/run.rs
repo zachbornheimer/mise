@@ -428,6 +428,9 @@ fn covered(
         pending_directories: status.pending_directories,
         conflicts: status.conflicts.len(),
         fetched_upstream: status.upstream_commit.clone(),
+        // The mirror adds fields to this outcome (`publish_skipped`); a sync
+        // another one covered skipped nothing of its own.
+        ..Default::default()
     }))
 }
 
