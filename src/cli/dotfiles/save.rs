@@ -197,6 +197,16 @@ impl DotfilesSave {
             for path in &self.paths {
                 let path = normalize_target(path);
                 let captured = walk.files.keys().any(|file| file.starts_with(&path));
+                let denied = tracked.would_capture(&path)?
+                    && (walk.permission_denied.iter().any(|denial| {
+                        let denied = mise_util::file::replace_path(&denial.path);
+                        path == denied || path.starts_with(&denied)
+                    }) || std::fs::symlink_metadata(&path).is_err_and(|error| {
+                        crate::system::history::health::is_permission_denied(&error)
+                    }));
+                if denied {
+                    continue;
+                }
                 if !captured {
                     // saving a deleted manual-save path saves the deletion,
                     // provided the path was captured before (a path that

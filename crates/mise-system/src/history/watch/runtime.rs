@@ -144,7 +144,11 @@ pub async fn run(opts: WatchOptions) -> Result<i32> {
     if opts.once {
         // A one-shot capture has no installed filesystem watches. Failures
         // from a previous watch installation do not describe this run.
-        capture.health.watcher.degraded.clear();
+        capture
+            .health
+            .watcher
+            .degraded
+            .retain(|line| line.starts_with(crate::history::health::PERMISSION_DEGRADED_PREFIX));
         // the restored schedule applies to this capture too: a throttled
         // file whose save is not due is held, not read live
         let outcome = capture.reconcile(&state.tracked, "startup reconcile");
@@ -1520,7 +1524,11 @@ fn install(
     capture: &mut Capture,
 ) -> Result<Vec<Anchor>> {
     let mut current: Vec<Anchor> = vec![];
-    capture.health.watcher.degraded.clear();
+    capture
+        .health
+        .watcher
+        .degraded
+        .retain(|line| line.starts_with(crate::history::health::PERMISSION_DEGRADED_PREFIX));
     for anchor in installed {
         if wanted.contains(anchor) {
             current.push(anchor.clone());
@@ -1861,6 +1869,19 @@ impl Capture {
     }
 
     fn write_health(&mut self) {
+        // The store's capture is the authority on which paths are denied:
+        // its permission subset replaces the one in memory, so a denial it
+        // recorded after this watcher loaded appears and one it cleared does
+        // not return. Every other degraded reason stays as it is in memory.
+        if let Some(stored) = health::read(self.store.state_dir()) {
+            let stored: Vec<String> = stored
+                .watcher
+                .degraded
+                .into_iter()
+                .filter(|line| health::permission_report_path(line).is_some())
+                .collect();
+            health::replace_permission_denials(&mut self.health.watcher.degraded, &stored);
+        }
         let now = Instant::now();
         self.health.throttled = self
             .schedule
@@ -2788,6 +2809,51 @@ mod sync_pacing {
         assert!(
             message_of(error).contains("origin refused the push"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn write_health_takes_the_stores_denials_and_keeps_in_memory_watch_failures() {
+        let mut fixture = capture(900);
+        let capture = &mut fixture.capture;
+        let state_dir = capture.store.state_dir().to_path_buf();
+        let watch_failure = "cannot watch ~/other: limit reached".to_string();
+        let denial =
+            crate::history::health::permission_report("~/notes.toml", "Operation not permitted");
+        capture.health.watcher.degraded = vec![watch_failure.clone()];
+
+        // a capture recorded a denial after this watcher loaded its health
+        let mut stored = crate::history::health::Health::default();
+        stored.watcher.degraded = vec![denial.clone()];
+        crate::history::health::write(&state_dir, &mut stored).unwrap();
+        capture.write_health();
+        let written = crate::history::health::read(&state_dir).unwrap();
+        assert!(
+            written.watcher.degraded.contains(&denial),
+            "a denial recorded after the load was dropped: {written:?}"
+        );
+        assert!(
+            written.watcher.degraded.contains(&watch_failure),
+            "an in-memory watch failure was replaced: {written:?}"
+        );
+
+        // a later capture cleared it: the stale in-memory copy must not return
+        let mut cleared = crate::history::health::Health::default();
+        cleared.watcher.degraded = vec![];
+        crate::history::health::write(&state_dir, &mut cleared).unwrap();
+        capture.write_health();
+        let after = crate::history::health::read(&state_dir).unwrap();
+        assert!(
+            after
+                .watcher
+                .degraded
+                .iter()
+                .all(|line| crate::history::health::permission_report_path(line).is_none()),
+            "a cleared denial returned from memory: {after:?}"
+        );
+        assert!(
+            after.watcher.degraded.contains(&watch_failure),
+            "an in-memory watch failure was lost: {after:?}"
         );
     }
 

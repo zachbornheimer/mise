@@ -2434,8 +2434,10 @@ mod nested_repository_tests {
 #[cfg(all(test, unix))]
 mod rejection_backoff_tests {
     use super::*;
+    use crate::files::{FileMode, FilePolicy};
     use crate::history::manifest::Manifest;
     use crate::history::shadow::HistoryRepo;
+    use crate::history::tracked::TrackedEntry;
 
     /// A marked history whose saved manifest matches an empty tracked set, so
     /// publication is not held for an incoming repository change.
@@ -2648,6 +2650,104 @@ mod rejection_backoff_tests {
         );
         assert!(err.contains("the origin branch changed"), "{err}");
         assert_eq!(delays.len(), PUSH_ATTEMPTS - 1);
+    }
+
+    /// Publishing a store whose saved file cannot be read does not publish
+    /// that unreadability as a deletion. The origin keeps the saved object,
+    /// and a readable sibling edit is published beside it.
+    #[test]
+    fn publishing_keeps_a_denied_saved_object_and_publishes_the_sibling_edit() {
+        use crate::history::checkpoint::{Draft, Outcome};
+        use crate::history::manifest::Enrollment;
+        use crate::history::store::Trigger;
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore(std::path::PathBuf, u32);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+            }
+        }
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let (_root, store, origin, _local) = ahead("denied-publish");
+        // portable-home-ok: history maps paths under the real home
+        let live = tempfile::tempdir_in(*mise_util::dirs::HOME).unwrap();
+        let denied = live.path().join("notes.toml");
+        let sibling = live.path().join("settings.toml");
+        std::fs::write(&denied, "saved-notes").unwrap();
+        std::fs::write(&sibling, "before").unwrap();
+        let policy = FilePolicy::for_mode(FileMode::Track);
+        let denied_entry = TrackedEntry::new(denied.clone(), "track", policy);
+        let sibling_entry = TrackedEntry::new(sibling.clone(), "track", policy);
+        let enroll = |entry: &TrackedEntry, path: &std::path::Path| Enrollment {
+            path: entry.tree_path(path).unwrap(),
+            autosave: true,
+            encrypt: false,
+            allow_plaintext: None,
+            variants: vec![],
+            exclude: None,
+            include: None,
+        };
+        let tracked = TrackedSet {
+            manifest: Manifest {
+                enrollment: vec![
+                    enroll(&denied_entry, &denied),
+                    enroll(&sibling_entry, &sibling),
+                ],
+                ..Default::default()
+            },
+            entries: vec![denied_entry, sibling_entry],
+            ..Default::default()
+        };
+        let Outcome::Created(_) = store.attempt(&tracked, Draft::new(Trigger::Save)).unwrap()
+        else {
+            panic!("the baseline recorded nothing");
+        };
+        let repo = store.repo().unwrap();
+        let head = repo.ref_oid(HistoryRepo::HISTORY_REF).unwrap().unwrap();
+        let denied_tree = tracked
+            .entry_for(&denied)
+            .unwrap()
+            .tree_path(&denied)
+            .unwrap();
+        let (_, saved_oid) = repo.object_at(&head, &denied_tree).unwrap().unwrap();
+
+        let mode = std::fs::symlink_metadata(&denied)
+            .unwrap()
+            .permissions()
+            .mode();
+        let _restore = Restore(denied.clone(), mode);
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = std::fs::File::open(&denied).expect_err("a non-root denial was readable");
+        assert_eq!(probe.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::write(&sibling, "after").unwrap();
+        // The watcher's save stores the sibling edit; the denied path keeps
+        // its saved object. Sync then publishes that saved history.
+        let Outcome::Created(_) = store.attempt(&tracked, Draft::new(Trigger::Save)).unwrap()
+        else {
+            panic!("the sibling edit was not saved");
+        };
+
+        let published = sync_locked(&store, &tracked, &publishing(&origin))
+            .unwrap()
+            .published
+            .expect("the saved history was not published");
+        let (_, kept_oid) = repo
+            .object_at(&published, &denied_tree)
+            .unwrap()
+            .expect("unreadability was published as a deletion");
+        assert_eq!(kept_oid, saved_oid, "the denied path lost its saved object");
+        let sibling_tree = tracked
+            .entry_for(&sibling)
+            .unwrap()
+            .tree_path(&sibling)
+            .unwrap();
+        let (_, sibling_oid) = repo
+            .object_at(&published, &sibling_tree)
+            .unwrap()
+            .expect("the sibling edit was not published");
+        assert_eq!(repo.cat_object(&sibling_oid).unwrap(), b"after");
     }
 
     #[test]
