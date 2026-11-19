@@ -1324,7 +1324,7 @@ mod tests {
         // new path. Restore that original proof first; a proof signed for the
         // grown set would legitimately skip it.
         forget_and_replace(&repo, &proof);
-        let grown = BTreeSet::from(["tracked/home/secret".into(), "tracked/home/other".into()]);
+        let grown = BTreeSet::from(["tracked/home/secret".into(), "tracked/home/other".into()]); // portable-home-ok
         assert!(
             audit_history_cached(&repo, &head, &grown).unwrap() > 0,
             "a grown protected set must be audited again"
@@ -1335,13 +1335,13 @@ mod tests {
             .write_tree(&[
                 (
                     "100644".into(),
-                    repo.object_at(&head, "tracked/home/secret")
+                    repo.object_at(&head, "tracked/home/secret") // portable-home-ok
                         .unwrap()
                         .unwrap()
                         .1,
-                    "tracked/home/secret".into(),
+                    "tracked/home/secret".into(), // portable-home-ok
                 ),
-                ("100644".into(), other, "tracked/home/other".into()),
+                ("100644".into(), other, "tracked/home/other".into()), // portable-home-ok
             ])
             .unwrap();
         let exposed = repo
@@ -1360,7 +1360,7 @@ mod tests {
             .hash_blob(b"mise-encrypted-file-v1\nnot-an-envelope")
             .unwrap();
         let malformed_tree = repo
-            .write_tree(&[("100644".into(), malformed, "tracked/home/secret".into())])
+            .write_tree(&[("100644".into(), malformed, "tracked/home/secret".into())]) // portable-home-ok
             .unwrap();
         let malformed_head = repo
             .commit_tree(&malformed_tree, vec![&head], "malformed envelope")

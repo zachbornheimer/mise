@@ -321,7 +321,7 @@ fn encrypted_keeps_local(base: &[u8], local: &[u8], remote: &[u8]) {
 fn crlf_and_lf_settle_and_keep_the_local_object() {
     // The base is neither side: both machines changed it, in ways that normalize equal.
     keeps_local_object(
-        "tracked/home/.zshrc",
+        "tracked/home/.zshrc", // portable-home-ok
         b"one\ntwo",
         b"one\r\ntwo\r\n",
         b"one\ntwo\n",
@@ -331,7 +331,7 @@ fn crlf_and_lf_settle_and_keep_the_local_object() {
 #[test]
 fn trailing_spaces_and_tabs_settle_and_keep_the_local_object() {
     keeps_local_object(
-        "tracked/home/.gitconfig",
+        "tracked/home/.gitconfig", // portable-home-ok
         b"name = ada",
         b"name = ada  \n\temail = a@b\t\n",
         b"name = ada\n\temail = a@b\n",
@@ -341,7 +341,7 @@ fn trailing_spaces_and_tabs_settle_and_keep_the_local_object() {
 #[test]
 fn a_missing_final_newline_settles_and_keeps_the_local_object() {
     keeps_local_object(
-        "tracked/home/.vimrc",
+        "tracked/home/.vimrc", // portable-home-ok
         b"older\n",
         b"set nocompatible\nset hidden",
         b"set nocompatible\nset hidden\n",
@@ -351,7 +351,7 @@ fn a_missing_final_newline_settles_and_keeps_the_local_object() {
 #[test]
 fn combined_line_ending_trailing_whitespace_and_final_newline_settle() {
     keeps_local_object(
-        "tracked/home/.profile",
+        "tracked/home/.profile", // portable-home-ok
         b"export A=1\nexport B=2",
         b"export A=1\r\nexport B=2  ",
         b"export A=1\nexport B=2\t\n",
@@ -361,7 +361,7 @@ fn combined_line_ending_trailing_whitespace_and_final_newline_settle() {
 #[test]
 fn a_changed_non_whitespace_byte_stays_a_conflict() {
     stays_conflict(
-        "tracked/home/.zshrc",
+        "tracked/home/.zshrc", // portable-home-ok
         b"alpha\n",
         b"alpha beta\n",
         b"alpha gamma\n",
@@ -370,13 +370,13 @@ fn a_changed_non_whitespace_byte_stays_a_conflict() {
 
 #[test]
 fn leading_whitespace_stays_a_conflict() {
-    stays_conflict("tracked/home/.zshrc", b"alpha\n", b" alpha\n", b"\talpha\n");
+    stays_conflict("tracked/home/.zshrc", b"alpha\n", b" alpha\n", b"\talpha\n"); // portable-home-ok
 }
 
 #[test]
 fn a_mode_difference_stays_a_conflict_even_when_bytes_match() {
     let (_dir, repo) = open();
-    let path = "tracked/home/tool";
+    let path = "tracked/home/tool"; // portable-home-ok
     let base = blob(&repo, b"#!/bin/sh\necho base\n");
     let local = executable(&repo, b"#!/bin/sh\necho changed\n");
     let remote = blob(&repo, b"#!/bin/sh\necho changed\r\n");
@@ -391,11 +391,11 @@ fn a_mode_difference_stays_a_conflict_even_when_bytes_match() {
 
 #[test]
 fn a_binary_file_is_equal_only_byte_for_byte() {
-    stays_conflict("tracked/home/icon", b"a\0base\n", b"a\0b\n", b"a\0b\r\n");
+    stays_conflict("tracked/home/icon", b"a\0base\n", b"a\0b\n", b"a\0b\r\n"); // portable-home-ok
 
     // Identical bytes are not a conflict to invent, even with a NUL.
     let (_dir, repo) = open();
-    let path = "tracked/home/icon";
+    let path = "tracked/home/icon"; // portable-home-ok
     let bytes = b"a\0b\r\n  ";
     let base = blob(&repo, b"a\0older\n");
     let local = blob(&repo, bytes);
@@ -415,7 +415,7 @@ fn a_binary_file_is_equal_only_byte_for_byte() {
 #[test]
 fn a_symlink_is_equal_only_byte_for_byte() {
     let (_dir, repo) = open();
-    let path = "tracked/home/link";
+    let path = "tracked/home/link"; // portable-home-ok
     let base = link(&repo, b"../old");
     let local = link(&repo, b"../new");
     let remote = link(&repo, b"../new\n");
@@ -436,7 +436,7 @@ fn a_symlink_is_equal_only_byte_for_byte() {
 #[test]
 fn invalid_utf8_is_equal_only_byte_for_byte() {
     stays_conflict(
-        "tracked/home/data",
+        "tracked/home/data", // portable-home-ok
         b"older\n",
         b"caf\xff\n",
         b"caf\xff\r\n",
@@ -446,7 +446,7 @@ fn invalid_utf8_is_equal_only_byte_for_byte() {
 #[test]
 fn listing_reports_no_conflict_when_normalization_settles_the_path() {
     let (_dir, repo) = open();
-    let path = "tracked/home/.zshrc";
+    let path = "tracked/home/.zshrc"; // portable-home-ok
     let base = blob(&repo, b"one");
     let local = blob(&repo, b"one\r\n");
     let remote = blob(&repo, b"one \n");
@@ -521,7 +521,7 @@ fn encrypted_missing_final_newline_settles_without_rewriting_ciphertext() {
 #[test]
 fn a_lone_cr_is_not_a_line_ending_to_ignore() {
     stays_conflict(
-        "tracked/home/.zshrc",
+        "tracked/home/.zshrc", // portable-home-ok
         b"older\n",
         b"one\r\ntwo\r\n",
         b"one\rtwo\n",
@@ -531,7 +531,7 @@ fn a_lone_cr_is_not_a_line_ending_to_ignore() {
 #[test]
 fn trailing_unicode_whitespace_stays_a_conflict() {
     stays_conflict(
-        "tracked/home/.zshrc",
+        "tracked/home/.zshrc", // portable-home-ok
         b"older\n",
         "name = ada\n".as_bytes(),
         "name = ada\u{00a0}\n".as_bytes(),
@@ -541,7 +541,7 @@ fn trailing_unicode_whitespace_stays_a_conflict() {
 #[test]
 fn an_extra_blank_line_stays_a_conflict() {
     stays_conflict(
-        "tracked/home/.zshrc",
+        "tracked/home/.zshrc", // portable-home-ok
         b"older\n",
         b"one\ntwo\n",
         b"one\ntwo\n\n",
@@ -630,7 +630,7 @@ fn a_decryption_failure_is_not_treated_as_equality() {
 #[test]
 fn status_rows_follow_the_conflicts_reconcile_recorded() {
     let (_dir, repo) = open();
-    let path = "tracked/home/.zshrc";
+    let path = "tracked/home/.zshrc"; // portable-home-ok
     let base = blob(&repo, b"older\n");
     let local = blob(&repo, b"one\r\n");
     let remote = blob(&repo, b"one\n");
