@@ -20,6 +20,7 @@ pub mod onboard;
 pub mod origin;
 mod preflight;
 pub(crate) mod publish;
+pub(crate) mod publish_skip_reason;
 pub mod reconcile;
 pub mod run;
 pub(crate) mod secrets;

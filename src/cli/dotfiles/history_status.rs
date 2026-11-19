@@ -51,6 +51,9 @@ pub(crate) struct SyncReport {
     pub branch: String,
     pub mode: String,
     pub last_publish: Option<String>,
+    /// Why the latest sync did not publish; a skip is not an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publish_skipped: Option<crate::system::history::sync::publish_skip_reason::PublishSkip>,
     pub last_fetch: Option<String>,
     pub last_apply: Option<String>,
     pub pending_applications: Vec<String>,
@@ -86,6 +89,7 @@ pub(crate) fn sync_report(
         branch: origin.branch,
         mode: SyncMode::current()?.as_str().to_string(),
         last_publish: status.last_publish.clone(),
+        publish_skipped: status.publish_skipped.clone(),
         last_fetch: status.last_fetch.clone(),
         last_apply: status.last_apply.clone(),
         pending_applications: status
@@ -388,6 +392,9 @@ fn print_repository(
             sync.pending_applications.join(", ")
         );
         push_step(next, "mise dot pull");
+    }
+    if let Some(skip) = &sync.publish_skipped {
+        miseprintln!("  {WARN} {}", skip.sentence());
     }
     if let Some(error) = &sync.last_error {
         match &sync.failing_since {
