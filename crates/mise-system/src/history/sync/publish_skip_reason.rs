@@ -61,9 +61,9 @@ impl PublishSkip {
         match self {
             Self::FetchOnly => "publish skipped: fetch-only, nothing is pushed".into(),
             Self::Offline => "publish skipped: offline, nothing is pushed".into(),
-            Self::PendingApplications { count } => format!(
-                "publish skipped: {count} incoming change(s) pending, run `mise dot pull`"
-            ),
+            Self::PendingApplications { count } => {
+                format!("publish skipped: {count} incoming change(s) pending, run `mise dot pull`")
+            }
             Self::PendingRepository => {
                 "publish skipped: incoming history not yet recorded here, run `mise dot pull`"
                     .into()
@@ -133,6 +133,7 @@ mod tests {
                 local: None,
                 remote: None,
                 base: None,
+                detail: None,
             }),
             ..Default::default()
         };

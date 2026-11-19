@@ -770,6 +770,68 @@ fn bounded_blob(repo: &HistoryRepo, oid: &str) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// Three-way merge of the decrypted text of three sides, sealed again when
+/// the sides are envelopes.
+///
+/// `merge_by_key` owns `.json`, `.toml`, `.yaml` and `.yml`. Every other text
+/// path reaches `Inapplicable`, and an envelope must never reach `merge3`: a
+/// line merge of ciphertext commits conflict markers inside it. This is the
+/// merge for those paths, encrypted or not. `None` means the sides are not
+/// mergeable text — a mode change, a symlink, a binary body, an oversized
+/// blob, or a real clash — and the caller keeps the conflict.
+pub(crate) fn merge_lines(
+    repo: &HistoryRepo,
+    path: &str,
+    base: &Object,
+    local: &Object,
+    remote: &Object,
+    interactive: bool,
+    manifest_tree: &str,
+) -> Result<Option<Object>> {
+    let (base_mode, Some(base_bytes)) = bounded_body(repo, path, base, interactive)? else {
+        return Ok(None);
+    };
+    let (local_mode, Some(local_bytes)) = bounded_body(repo, path, local, interactive)? else {
+        return Ok(None);
+    };
+    let (remote_mode, Some(remote_bytes)) = bounded_body(repo, path, remote, interactive)? else {
+        return Ok(None);
+    };
+    if base_mode != local_mode || local_mode != remote_mode {
+        return Ok(None);
+    }
+    if !matches!(local_mode.as_str(), "100644" | "100755") {
+        return Ok(None);
+    }
+    if !utf8_text(&base_bytes) || !utf8_text(&local_bytes) || !utf8_text(&remote_bytes) {
+        return Ok(None);
+    }
+    // All three sides must stand on the same side of encryption: a plaintext
+    // sibling would have to be re-sealed into a shape the others do not share.
+    let encrypted = repo.blob_starts_with(&local.1, MAGIC)?;
+    if encrypted != repo.blob_starts_with(&remote.1, MAGIC)?
+        || encrypted != repo.blob_starts_with(&base.1, MAGIC)?
+    {
+        return Ok(None);
+    }
+    let Some(merged) = repo.merge3(&base_bytes, &local_bytes, &remote_bytes)? else {
+        return Ok(None);
+    };
+    if !encrypted {
+        return Ok(Some((local_mode, repo.store_blob(&merged)?)));
+    }
+    let scheme = scheme_of(repo, local)?;
+    let recipients = recipients_of(repo, manifest_tree, path, local)?;
+    Ok(Some(seal(
+        repo,
+        path,
+        &local_mode,
+        &merged,
+        &scheme,
+        &recipients,
+    )?))
+}
+
 /// Lines with CRLF reduced to LF, trailing ASCII spaces and tabs removed,
 /// and one missing final newline supplied. No allocation when the line
 /// already has that shape.
