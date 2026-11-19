@@ -417,7 +417,7 @@ pub(crate) fn reconcile(
                     }
                     continue;
                 }
-                let merged = merge(repo, a.as_ref(), s, t)?;
+                let merged = structured_or_line_merge(repo, branch_path, a.as_ref(), s, t)?;
                 match merged {
                     Merged::Clean(object) => {
                         let object_version = version(object.as_ref());
@@ -493,7 +493,7 @@ pub(crate) fn skip_pointer_applications(plans: &mut [PathPlan], shared: &BTreeMa
 /// An encrypted envelope is text, so a line merge would commit conflict
 /// markers inside the ciphertext. It is never a candidate for `merge3`.
 fn is_encrypted_blob(repo: &HistoryRepo, oid: &str) -> Result<bool> {
-    repo.blob_starts_with(oid, b"mise-encrypted-file-v1\n")
+    repo.blob_starts_with(oid, super::files::MAGIC)
 }
 
 enum Merged {
@@ -502,6 +502,36 @@ enum Merged {
 }
 
 /// Three-way merge of two changed sides against the acknowledged base.
+fn structured_or_line_merge(
+    repo: &HistoryRepo,
+    path: &str,
+    base: Option<&Object>,
+    ours: Option<&Object>,
+    theirs: Option<&Object>,
+) -> Result<Merged> {
+    if let (Some(base), Some(ours), Some(theirs)) = (base, ours, theirs) {
+        if is_encrypted_blob(repo, &base.1)?
+            || is_encrypted_blob(repo, &ours.1)?
+            || is_encrypted_blob(repo, &theirs.1)?
+        {
+            return merge(repo, Some(base), Some(ours), Some(theirs));
+        }
+        match super::files::merge_by_key(repo, path, base, ours, theirs, false)? {
+            super::files::KeyMerge::KeepLocal => {
+                return Ok(Merged::Clean(Some(ours.clone())));
+            }
+            super::files::KeyMerge::Merged { mode, text } => {
+                let oid = repo.transient_blob_id(&text)?;
+                return Ok(Merged::Clean(Some((mode, oid))));
+            }
+            super::files::KeyMerge::Clash => {
+                return Ok(Merged::Conflict(ConflictKind::SameHunk));
+            }
+            super::files::KeyMerge::Inapplicable => {}
+        }
+    }
+    merge(repo, base, ours, theirs)
+}
 fn merge(
     repo: &HistoryRepo,
     base: Option<&Object>,

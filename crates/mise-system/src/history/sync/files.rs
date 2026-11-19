@@ -660,6 +660,98 @@ fn body(
 pub(crate) fn utf8_text(bytes: &[u8]) -> bool {
     !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
 }
+/// A structured three-way merge, or the reason one was not made.
+#[derive(Debug)]
+pub(crate) enum KeyMerge {
+    /// Local and remote parse to the same value: keep the local object.
+    KeepLocal,
+    /// The merged text, in the mode the file was saved with.
+    Merged { mode: String, text: Vec<u8> },
+    /// The three sides parse, and a key was changed differently on both.
+    Clash,
+    /// Not a structured path, or a side that this tier must not parse.
+    Inapplicable,
+}
+
+const STRUCTURED_LIMIT: u64 = 1024 * 1024;
+
+/// Merge a `.json`, `.toml`, `.yaml`, or `.yml` conflict by key.
+///
+/// Called only for a path the cheaper tiers left unsettled. A side that is
+/// not a regular file, is larger than 1 MiB, or does not parse leaves the
+/// path to those tiers. Equal parsed values keep the local object. A key
+/// changed differently on both sides, including a deletion against an edit,
+/// is a clash: the caller must not hide it with a line merge.
+pub(crate) fn merge_by_key(
+    repo: &HistoryRepo,
+    path: &str,
+    base: &Object,
+    local: &Object,
+    remote: &Object,
+    interactive: bool,
+) -> Result<KeyMerge> {
+    let Some(format) = structured_format(path) else {
+        return Ok(KeyMerge::Inapplicable);
+    };
+    let (base_mode, base_bytes) = bounded_body(repo, path, base, interactive)?;
+    let (local_mode, local_bytes) = bounded_body(repo, path, local, interactive)?;
+    let (remote_mode, remote_bytes) = bounded_body(repo, path, remote, interactive)?;
+    let (Some(base_bytes), Some(local_bytes), Some(remote_bytes)) =
+        (base_bytes, local_bytes, remote_bytes)
+    else {
+        return Ok(KeyMerge::Inapplicable);
+    };
+    if base_mode != local_mode || local_mode != remote_mode {
+        return Ok(KeyMerge::Inapplicable);
+    }
+    if !matches!(local_mode.as_str(), "100644" | "100755") {
+        return Ok(KeyMerge::Inapplicable);
+    }
+    let (Some(base_text), Some(local_text), Some(remote_text)) = (
+        std::str::from_utf8(&base_bytes).ok(),
+        std::str::from_utf8(&local_bytes).ok(),
+        std::str::from_utf8(&remote_bytes).ok(),
+    ) else {
+        return Ok(KeyMerge::Inapplicable);
+    };
+    super::key_merge::merge(format, local_mode, base_text, local_text, remote_text)
+        .map(|merged| merged.unwrap_or(KeyMerge::Inapplicable))
+}
+
+fn structured_format(path: &str) -> Option<super::key_merge::Format> {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let extension = name.rsplit_once('.')?.1;
+    match extension {
+        "json" => Some(super::key_merge::Format::Json),
+        "toml" => Some(super::key_merge::Format::Toml),
+        "yaml" | "yml" => Some(super::key_merge::Format::Yaml),
+        _ => None,
+    }
+}
+
+/// The saved mode and bytes, or `None` when the object is not a readable
+/// blob within the structured-file limit. An envelope is decrypted first.
+fn bounded_body(
+    repo: &HistoryRepo,
+    path: &str,
+    object: &Object,
+    interactive: bool,
+) -> Result<(String, Option<Vec<u8>>)> {
+    if repo.blob_starts_with(&object.1, MAGIC)? {
+        let decrypted = decrypt(repo, path, object, interactive)?;
+        let bytes = bounded_blob(repo, &decrypted.1)?;
+        return Ok((decrypted.0, bytes));
+    }
+    Ok((object.0.clone(), bounded_blob(repo, &object.1)?))
+}
+
+fn bounded_blob(repo: &HistoryRepo, oid: &str) -> Result<Option<Vec<u8>>> {
+    match repo.cat_object_bounded(oid, STRUCTURED_LIMIT) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.to_string().contains("exceeds") => Ok(None),
+        Err(err) => Err(err),
+    }
+}
 
 /// Lines with CRLF reduced to LF, trailing ASCII spaces and tabs removed,
 /// and one missing final newline supplied. No allocation when the line
@@ -867,6 +959,38 @@ fn encrypt(
     let encrypted = ("100644".into(), repo.hash_blob(&encoded)?);
     repo.remember_decrypted(&encrypted.1, object.clone());
     Ok(encrypted)
+}
+
+pub(crate) fn seal(
+    repo: &HistoryRepo,
+    path: &str,
+    mode: &str,
+    content: &[u8],
+    scheme: &str,
+    recipients: &[Box<dyn age::Recipient + Send>],
+) -> Result<Object> {
+    let plain = (mode.to_string(), repo.hash_blob(content)?);
+    encrypt(repo, path, &plain, scheme, recipients)
+}
+
+pub(crate) fn scheme_of(repo: &HistoryRepo, object: &Object) -> Result<String> {
+    envelope(repo, object, agecrypt::MAX_ENCRYPTED_BYTES)?
+        .map(|outer| outer.scheme)
+        .ok_or_else(|| eyre::eyre!("saved object is not an encrypted envelope"))
+}
+
+pub(crate) fn recipients_of(
+    repo: &HistoryRepo,
+    tree: &str,
+    path: &str,
+    object: &Object,
+) -> Result<Vec<Box<dyn age::Recipient + Send>>> {
+    let _ = envelope(repo, object, agecrypt::MAX_ENCRYPTED_BYTES)?
+        .ok_or_else(|| eyre::eyre!("{path} is not an encrypted envelope"))?;
+    let manifest = crate::history::manifest::Manifest::read(repo, tree)?
+        .ok_or_else(|| eyre::eyre!("{path} has no encryption recipients"))?;
+    let (strings, _) = scheme(&manifest.recipients);
+    parse_recipients(&strings, false)
 }
 
 /// Turn a reconciled process-local object into its committed representation.
