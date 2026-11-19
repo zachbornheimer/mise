@@ -61,6 +61,8 @@ pub(crate) struct CaptureResult {
     pub warnings: Vec<String>,
     /// Files which were discovered but could not be read. They are not deletions.
     pub omitted: Vec<super::store::PathReason>,
+    /// Content reads the operating system refused. A subset of `omitted`.
+    pub permission_denied: Vec<super::store::PathReason>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -527,31 +529,35 @@ impl HistoryRepo {
         // opened once: every cached entry below asks whether its blob is an
         // encrypted envelope, and opening a repository scans every pack index
         let gix = self.gix()?;
+        let mut denied = vec![];
         for (root, encrypted) in roots.iter_mut().zip(encrypted_by_root) {
             root.files.retain(|rel| !encrypted.contains(rel));
             for rel in encrypted {
                 let live = root.path.join(&rel);
-                let metadata = std::fs::symlink_metadata(&live)?;
-                let (mode, bytes) = if metadata.file_type().is_symlink() {
-                    (
-                        "120000",
-                        path_bytes(&std::fs::read_link(&live)?).into_owned(),
-                    )
-                } else if metadata.is_file() {
-                    #[cfg(unix)]
-                    let executable = {
-                        use std::os::unix::fs::PermissionsExt;
-                        metadata.permissions().mode() & 0o100 != 0
-                    };
-                    #[cfg(not(unix))]
-                    let executable = false;
-                    let bytes = mise_util::agecrypt::read_bounded(
-                        std::fs::File::open(&live)?,
-                        mise_util::agecrypt::MAX_PLAINTEXT_BYTES,
-                    )?;
-                    (if executable { "100755" } else { "100644" }, bytes)
-                } else {
-                    bail!("cannot encrypt non-file {}", display_path(&live));
+                let metadata = match std::fs::symlink_metadata(&live) {
+                    Ok(metadata) => metadata,
+                    Err(error) if super::health::is_permission_denied(&error) => {
+                        Self::push_denial(&mut denied, &live, &error);
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let read = Self::read_encrypted(&live, &metadata);
+                let (mode, bytes) = match read {
+                    Ok(read) => read,
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(super::health::is_permission_denied) =>
+                    {
+                        Self::push_denial(
+                            &mut denied,
+                            &live,
+                            error.downcast_ref::<std::io::Error>().unwrap(),
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 };
                 let path = history_path(&root.label, &rel)?;
                 let fingerprint = blake3::keyed_hash(&cache_key, &bytes).to_hex().to_string();
@@ -626,6 +632,16 @@ impl HistoryRepo {
         }
         // No encrypted input is ever handed to git add or hash-object.
         let mut captured = self.capture(&roots)?;
+        for denial in denied {
+            if !captured
+                .permission_denied
+                .iter()
+                .any(|found| found.path == denial.path)
+            {
+                captured.omitted.push(denial.clone());
+                captured.permission_denied.push(denial);
+            }
+        }
         captured.tree = self.compose(&captured.tree, &overlays)?;
         captured.roots = walk
             .roots
@@ -651,6 +667,7 @@ impl HistoryRepo {
     /// exactly the listed files.
     pub(crate) fn capture(&self, roots: &[CaptureRoot]) -> Result<CaptureResult> {
         let mut omitted = vec![];
+        let mut denied = vec![];
         let mut entries: Vec<(String, String)> = vec![]; // (oid, name)
         let mut records = vec![];
         for root in roots {
@@ -665,7 +682,7 @@ impl HistoryRepo {
                 continue;
             }
             let tree = self
-                .tree_for_root(root, &mut omitted)
+                .tree_for_root(root, &mut omitted, &mut denied)
                 .wrap_err_with(|| format!("snapshotting {}", display_path(&root.path)))?;
             entries.push((tree, root.label.clone()));
             records.push(record);
@@ -684,6 +701,7 @@ impl HistoryRepo {
                 .map(|failure| format!("{} was not captured: {}", failure.path, failure.reason))
                 .collect(),
             omitted,
+            permission_denied: denied,
         })
     }
 
@@ -692,6 +710,7 @@ impl HistoryRepo {
         &self,
         root: &CaptureRoot,
         omitted: &mut Vec<super::store::PathReason>,
+        denied: &mut Vec<super::store::PathReason>,
     ) -> Result<String> {
         // opening a repository scans every pack index: one open serves every
         // file of the root, not one per file
@@ -737,13 +756,72 @@ impl HistoryRepo {
             })();
             match captured {
                 Ok(overlay) => overlays.push(overlay),
-                Err(error) => omitted.push(super::store::PathReason {
-                    path: display_path(&live),
-                    reason: format!("unreadable: {error:#}"),
-                }),
+                Err(error) => {
+                    let path = display_path(&live);
+                    if let Some(io) = error.downcast_ref::<std::io::Error>()
+                        && super::health::is_permission_denied(io)
+                        && !denied.iter().any(|found| found.path == path)
+                    {
+                        denied.push(super::store::PathReason {
+                            path: path.clone(),
+                            reason: format!("unreadable: {io}"),
+                        });
+                    }
+                    omitted.push(super::store::PathReason {
+                        path,
+                        reason: format!("unreadable: {error:#}"),
+                    });
+                }
             }
         }
         self.compose(&self.empty_object("tree")?, &overlays)
+    }
+
+    /// The bytes of an encrypted file, or why they could not be read.
+    /// A permission denial is omitted by the caller; every other error fails
+    /// the snapshot, as an encrypted read did before.
+    fn read_encrypted(
+        live: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> Result<(&'static str, Vec<u8>)> {
+        if metadata.file_type().is_symlink() {
+            return Ok((
+                "120000",
+                path_bytes(&std::fs::read_link(live)?).into_owned(),
+            ));
+        }
+        if metadata.is_file() {
+            #[cfg(unix)]
+            let executable = {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode() & 0o100 != 0
+            };
+            #[cfg(not(unix))]
+            let executable = false;
+            let bytes = mise_util::agecrypt::read_bounded(
+                std::fs::File::open(live)?,
+                mise_util::agecrypt::MAX_PLAINTEXT_BYTES,
+            )?;
+            return Ok((if executable { "100755" } else { "100644" }, bytes));
+        }
+        bail!("cannot encrypt non-file {}", display_path(live))
+    }
+
+    /// Names a permission denial once. The reason keeps the operating-system
+    /// error and nothing else, so a report can render it without parsing.
+    fn push_denial(
+        denied: &mut Vec<super::store::PathReason>,
+        path: &Path,
+        error: &std::io::Error,
+    ) {
+        let path = display_path(path);
+        if denied.iter().any(|found| found.path == path) {
+            return;
+        }
+        denied.push(super::store::PathReason {
+            path,
+            reason: error.to_string(),
+        });
     }
 
     /// One level of tree from an `ls-tree`-style listing.
