@@ -570,6 +570,34 @@ fn an_encrypted_content_change_stays_a_conflict() {
 }
 
 #[test]
+fn a_reencrypted_unchanged_origin_keeps_the_local_change() {
+    // Another machine saved the same content again, which writes a new
+    // envelope. This machine edited the file. Only one side changed it.
+    let (_dir, repo) = open();
+    let (_environment, key) = age_key();
+    let path = "home/secret";
+    let (base_commit, base_sealed) = encrypted_commit(&repo, None, path, b"base\n", &key);
+    let (local_commit, local_sealed) =
+        encrypted_commit(&repo, Some(&base_commit), path, b"edited here\n", &key);
+    let (remote_commit, remote_sealed) =
+        encrypted_commit(&repo, Some(&base_commit), path, b"base\n", &key);
+    assert_ne!(base_sealed, remote_sealed);
+    let (merged, conflicts) = repo.merge_tree(&local_commit, &remote_commit).unwrap();
+    assert_eq!(conflicts, vec![path.to_string()]);
+    let (tree, remaining) = settle_conflicts(
+        &repo,
+        Some(&base_commit),
+        &local_commit,
+        &remote_commit,
+        &merged,
+        conflicts,
+    )
+    .unwrap();
+    assert_eq!(remaining, Vec::<String>::new());
+    assert_eq!(object_of(&repo, &tree, path), local_sealed);
+}
+
+#[test]
 fn a_decryption_failure_is_not_treated_as_equality() {
     let (_dir, repo) = open();
     let (_environment, key) = age_key();

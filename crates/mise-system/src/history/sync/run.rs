@@ -1858,6 +1858,24 @@ pub(super) fn settle_conflicts(
             });
             continue;
         }
+        // The origin still holds the base's content: only this machine changed
+        // the file. A machine that re-encrypts a file it did not edit writes a
+        // new envelope, and a new envelope is not a change to merge. A base that
+        // cannot be read proves nothing, so the path stays a conflict.
+        if let Some(base) = base
+            && let Some(base_object) = repo.object_at(base, path)?
+            && matches!(
+                super::files::normalized_equal(repo, path, &base_object, &theirs, false),
+                Ok(true)
+            )
+        {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some(saved),
+            });
+            continue;
+        }
         // A structured file is merged by key before any line merge. A
         // parsed clash must stay a conflict: a clean line merge would hide it.
         if let Some(base) = base
