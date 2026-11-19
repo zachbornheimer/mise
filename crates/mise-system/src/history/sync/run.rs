@@ -421,15 +421,14 @@ fn covered(
             return Ok(None);
         }
     }
+    // Nothing was published and nothing was skipped by this sync: those
+    // fields, and any the mirror adds to the outcome, keep their defaults.
     Ok(Some(SyncOutcome {
-        published: None,
         pending: status.pending_applications.len() + usize::from(status.pending_repository),
         pending_repository: status.pending_repository,
         pending_directories: status.pending_directories,
         conflicts: status.conflicts.len(),
         fetched_upstream: status.upstream_commit.clone(),
-        // The mirror adds fields to this outcome (`publish_skipped`); a sync
-        // another one covered skipped nothing of its own.
         ..Default::default()
     }))
 }
