@@ -1,0 +1,654 @@
+use super::*;
+
+#[test]
+fn test_tera_contrib_helpers() {
+    assert_eq!(render("{{ 'hello' | b64_encode | b64_decode }}"), "hello");
+    assert_eq!(
+        render("{{ '2026-07-13' | date(format='%Y/%m/%d') }}"),
+        "2026/07/13"
+    );
+    assert_eq!(render("{{ now() | date(format='%Y') | length }}"), "4");
+    assert_eq!(
+        render("{{ '2026-01-01' is before(other='2026-02-01') }}"),
+        "true"
+    );
+    assert_eq!(
+        render("{{ '2026-02-01' is after(other='2026-01-01') }}"),
+        "true"
+    );
+    assert_eq!(render("{{ 1024 | filesize_format }}"), "1 KiB");
+    assert_eq!(render("{{ 1024 | filesizeformat }}"), "1 KiB");
+    assert_eq!(render("{{ 42 | format(spec='05') }}"), "00042");
+    assert_eq!(render("{{ {'ok': true} | json_encode }}"), r#"{"ok":true}"#);
+    let random = render("{{ get_random(start=10, end=20, seed='mise') }}")
+        .parse::<i64>()
+        .unwrap();
+    assert!((10..20).contains(&random));
+    assert_eq!(
+        render("{{ [1, 2, 3] | shuffle(seed='mise') | length }}"),
+        "3"
+    );
+    assert_eq!(
+        render("{{ 'abc123' | regex_replace(pattern='[0-9]+', rep='') }}"),
+        "abc"
+    );
+    assert_eq!(render("{{ 'abc123' is matching(pat='[0-9]+$') }}"), "true");
+    assert_eq!(render("{{ '<b>x</b>' | striptags }}"), "x");
+    assert_eq!(render("{{ '<p> </p>' | spaceless }}"), "<p></p>");
+    assert_eq!(render("{{ 'Hello World' | slug }}"), "hello-world");
+    assert_eq!(render("{{ 'Hello World' | slugify }}"), "hello-world");
+    assert_eq!(render("{{ 'a/b c' | urlencode }}"), "a/b%20c");
+    assert_eq!(render("{{ 'a/b c' | urlencode_strict }}"), "a%2Fb%20c");
+}
+
+#[tokio::test]
+async fn test_config_root() {
+    assert_eq!(render("{{config_root}}"), "/");
+}
+#[tokio::test]
+async fn test_mise_env() {
+    assert_eq!(render("{% if mise_env %}{{mise_env}}{% endif %}"), "");
+}
+#[tokio::test]
+async fn test_cwd() {
+    assert_eq!(render("{{cwd}}"), "/");
+}
+#[tokio::test]
+async fn test_mise_bin() {
+    assert_eq!(
+        render("{{mise_bin}}"),
+        env::current_exe()
+            .unwrap()
+            .into_os_string()
+            .into_string()
+            .unwrap()
+    );
+}
+#[tokio::test]
+async fn test_mise_pid() {
+    let s = render("{{mise_pid}}");
+    let pid = s.trim().parse::<u32>().unwrap();
+    assert!(pid > 0);
+}
+#[tokio::test]
+async fn test_xdg_cache_home() {
+    let s = render("{{xdg_cache_home}}");
+    assert_str_eq!(s, env::XDG_CACHE_HOME.to_string_lossy());
+}
+#[tokio::test]
+#[cfg(unix)]
+async fn test_xdg_config_home() {
+    let s = render("{{xdg_config_home}}");
+    assert!(s.ends_with("/.config")); // test dir is not deterministic
+}
+#[tokio::test]
+async fn test_mise_config_dir() {
+    let s = render("{{mise_config_dir}}");
+    assert_eq!(s, env::MISE_CONFIG_DIR.to_string_lossy());
+}
+#[tokio::test]
+#[cfg(unix)]
+async fn test_xdg_data_home() {
+    let s = render("{{xdg_data_home}}");
+    assert!(s.ends_with("/.local/share")); // test dir is not deterministic
+}
+#[tokio::test]
+#[cfg(unix)]
+async fn test_xdg_state_home() {
+    let s = render("{{xdg_state_home}}");
+    assert!(s.ends_with("/.local/state")); // test dir is not deterministic
+}
+#[tokio::test]
+async fn test_arch() {
+    if cfg!(target_arch = "x86_64") {
+        assert_eq!(render("{{arch()}}"), "x64");
+    } else if cfg!(target_arch = "aarch64") {
+        assert_eq!(render("{{arch()}}"), "arm64");
+    } else {
+        assert_eq!(render("{{arch()}}"), env::consts::ARCH);
+    }
+}
+#[tokio::test]
+async fn test_num_cpus() {
+    let s = render("{{ num_cpus() }}");
+    let num = s.parse::<u32>().unwrap();
+    assert!(num > 0);
+}
+#[tokio::test]
+async fn test_os() {
+    if cfg!(target_os = "linux") {
+        assert_eq!(render("{{os()}}"), "linux");
+    } else if cfg!(target_os = "macos") {
+        assert_eq!(render("{{os()}}"), "macos");
+    } else if cfg!(target_os = "windows") {
+        assert_eq!(render("{{os()}}"), "windows");
+    }
+}
+#[tokio::test]
+async fn test_os_family() {
+    if cfg!(target_family = "unix") {
+        assert_eq!(render("{{os_family()}}"), "unix");
+    } else if cfg!(target_os = "windows") {
+        assert_eq!(render("{{os_family()}}"), "windows");
+    }
+}
+#[tokio::test]
+async fn test_choice() {
+    let result = render("{{choice(n=8, alphabet=\"abcdefgh\")}}");
+    assert_eq!(result.trim().len(), 8);
+}
+#[tokio::test]
+async fn test_haiku() {
+    // Default: 2 words + number
+    let result = render("{{haiku()}}");
+    let parts: Vec<&str> = result.split('-').collect();
+    assert_eq!(parts.len(), 3);
+    assert!(!parts[0].is_empty());
+    assert!(!parts[1].is_empty());
+    assert!(parts[2].parse::<u32>().is_ok());
+
+    // Custom: 3 words, no digits, underscore separator
+    let result = render("{{haiku(words=3, digits=0, separator=\"_\")}}");
+    let parts: Vec<&str> = result.split('_').collect();
+    assert_eq!(parts.len(), 3);
+    assert!(parts.iter().all(|p| p.parse::<u32>().is_err())); // no numbers
+}
+#[tokio::test]
+async fn test_quote() {
+    let template = "{{ \"quoted'str\" | quote }}";
+    let expected = "'quoted'\\''str'";
+    assert_eq!(render_v2(template), expected);
+    assert_eq!(render_v1(template), expected);
+}
+#[tokio::test]
+async fn test_quote_for_cmd() {
+    for engine in [
+        TeraEngine::V1(Box::new(get_tera_v1(None))),
+        TeraEngine::V2(Box::new(get_tera_v2(None))),
+    ] {
+        let mut tera = quote_for_cmd(engine);
+        let mut quote = |value: &str| {
+            let mut ctx = BASE_CONTEXT.clone();
+            ctx.insert("cwd", "/");
+            ctx.insert("value", value);
+            render_str(&mut tera, "{{ value | quote }}", &ctx).unwrap()
+        };
+        // cmd.exe reads neither `'` nor `\"` as a quote, and expands `%VAR%` inside quotes.
+        assert_eq!(quote("my title"), r#""my title""#);
+        assert_eq!(
+            quote(r"C:\Program Files\node.exe"),
+            r#""C:\Program Files\node.exe""#
+        );
+        assert_eq!(quote("it's"), "it's");
+        assert_eq!(quote("50%"), "50^%");
+        assert_eq!(quote("50% & more"), r#""50"^%" & more""#);
+        // A backslash before a quote added around `%` is doubled for the child.
+        assert_eq!(
+            quote(r"C:\data\%cache folder"),
+            r#""C:\data\\"^%"cache folder""#
+        );
+        assert_eq!(quote(r#"a" & b"#), r#"^"a\^" ^& b^""#);
+    }
+}
+#[tokio::test]
+async fn test_as_str() {
+    assert_eq!(render("{{ true | as_str }}"), "true");
+    assert_eq!(render("{{ \"hello\" | as_str }}"), "hello");
+}
+#[tokio::test]
+async fn test_kebabcase() {
+    let s = render("{{ \"thisFilter\" | kebabcase }}");
+    assert_eq!(s, "this-filter");
+}
+#[tokio::test]
+async fn test_lowercamelcase() {
+    let s = render("{{ \"Camel-case\" | lowercamelcase }}");
+    assert_eq!(s, "camelCase");
+}
+#[tokio::test]
+async fn test_shoutykebabcase() {
+    let s = render("{{ \"kebabCase\" | shoutykebabcase }}");
+    assert_eq!(s, "KEBAB-CASE");
+}
+#[tokio::test]
+async fn test_shoutysnakecase() {
+    let s = render("{{ \"snakeCase\" | shoutysnakecase }}");
+    assert_eq!(s, "SNAKE_CASE");
+}
+#[tokio::test]
+async fn test_snakecase() {
+    let s = render("{{ \"snakeCase\" | snakecase }}");
+    assert_eq!(s, "snake_case");
+}
+#[tokio::test]
+async fn test_uppercamelcase() {
+    let s = render("{{ \"CamelCase\" | uppercamelcase }}");
+    assert_eq!(s, "CamelCase");
+}
+#[tokio::test]
+async fn test_hash() {
+    // SHA256 of "foo" is 2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae
+    let s = render("{{ \"foo\" | hash(len=8) }}");
+    assert_eq!(s, "2c26b46b");
+    // Test explicit sha256
+    let s = render("{{ \"foo\" | hash(algorithm=\"sha256\", len=8) }}");
+    assert_eq!(s, "2c26b46b");
+    // Test blake3 - BLAKE3 of "foo" starts with 04e0bb39
+    let s = render("{{ \"foo\" | hash(algorithm=\"blake3\", len=8) }}");
+    assert_eq!(s, "04e0bb39");
+}
+#[tokio::test]
+#[cfg(unix)]
+async fn test_absolute() {
+    let s = render("{{ \"/a/b/../c\" | absolute }}");
+    assert_eq!(s, "/a/c");
+    // relative path
+    let s = render("{{ \"a/b/../c\" | absolute }}");
+    assert!(s.ends_with("/a/c"));
+}
+#[tokio::test]
+async fn test_dirname() {
+    let s = render(r#"{{ "a/b/c" | dirname }}"#);
+    assert_eq!(s, "a/b");
+}
+#[tokio::test]
+async fn test_basename() {
+    let s = render(r#"{{ "a/b/c" | basename }}"#);
+    assert_eq!(s, "c");
+}
+#[tokio::test]
+async fn test_extname() {
+    let s = render(r#"{{ "a/b/c.txt" | extname }}"#);
+    assert_eq!(s, "txt");
+}
+#[tokio::test]
+async fn test_file_stem() {
+    let s = render(r#"{{ "a/b/c.txt" | file_stem }}"#);
+    assert_eq!(s, "c");
+}
+#[tokio::test]
+#[cfg(unix)]
+async fn test_join_path() {
+    let s = render(r#"{{ ["..", "fixtures", "shorthands.toml"] | join_path }}"#);
+    assert_eq!(s, "../fixtures/shorthands.toml");
+}
+#[tokio::test]
+async fn test_semver_matching() {
+    let s = render(
+        r#"{% set p = "1.10.2" %}{% if p is semver_matching(requirement="^1.10.0") %} ok {% endif %}"#,
+    );
+    assert_eq!(s.trim(), "ok");
+}
+#[tokio::test]
+#[cfg(unix)]
+async fn test_read_file() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    // Create a temp directory and test file
+    let temp_dir = TempDir::new().unwrap();
+    let test_file_path = temp_dir.path().join("test.txt");
+    fs::write(&test_file_path, "test content\nwith multiple lines").unwrap();
+
+    // Test with the temp file
+    let mut tera_ctx = BASE_CONTEXT.clone();
+    tera_ctx.insert("config_root", &temp_dir.path().to_str().unwrap());
+    tera_ctx.insert("cwd", temp_dir.path().to_str().unwrap());
+    let mut tera = locked_tera(Some(temp_dir.path()));
+
+    let s = render_str(&mut tera, r#"{{ read_file(path="test.txt") }}"#, &tera_ctx).unwrap();
+    assert_eq!(s, "test content\nwith multiple lines");
+
+    // Test with trim filter
+    let s = render_str(
+        &mut tera,
+        r#"{{ read_file(path="test.txt") | trim }}"#,
+        &tera_ctx,
+    )
+    .unwrap();
+    assert_eq!(s, "test content\nwith multiple lines");
+}
+
+/// A file the filters cannot hash or date is a render error, not a panic: a
+/// `.miserc.toml` is rendered before any trust check and can name any path.
+#[test]
+#[cfg(unix)]
+fn test_file_filters_error_on_bad_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let old = dir.path().join("old.txt");
+    std::fs::write(&old, "").unwrap();
+    let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+    crate::file::set_times(&old, None, Some(before_epoch)).unwrap();
+    let mut context = BASE_CONTEXT.clone();
+    context.insert("old", old.to_str().unwrap());
+    context.insert("missing", dir.path().join("missing.txt").to_str().unwrap());
+
+    let mut tera = TeraEngine::V2(Box::new(get_tera_v2(Some(dir.path()))));
+    assert!(render_str(&mut tera, "{{ old | last_modified }}", &context).is_err());
+    assert!(render_str(&mut tera, "{{ missing | hash_file }}", &context).is_err());
+}
+
+#[test]
+fn test_read_structured_files() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"volta": {"node": "20.1.0"}, "packageManager": "pnpm@9.12.0", "names": ["a", "b"], "my-key": 7}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("Pulumi.yaml"),
+        "name: my-project\nrequiredPulumiVersion: \"3.270.0\"\nflags:\n  - on\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("pyproject.toml"),
+        "[tool.mytool]\nversion = \"1.2.3\"\nreleased = 2026-01-02\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("bad.json"), "{nope").unwrap();
+    {
+        let _lock = crate::testing::lock_ignoring_poison(&crate::testing::SETTINGS_LOCK);
+        read_structured_cases(dir.path());
+    }
+    let _v1 = SettingsGuard::tera_v1();
+    read_structured_cases(dir.path());
+}
+
+fn read_structured_cases(dir: &Path) {
+    let mut tera_ctx = BASE_CONTEXT.clone();
+    tera_ctx.insert("config_root", dir.to_str().unwrap());
+    tera_ctx.insert("cwd", dir.to_str().unwrap());
+    let mut tera = get_tera(Some(dir));
+    let mut render = |input: &str| render_str(&mut tera, input, &tera_ctx);
+    // Neither engine parses `.key` straight after a call, so these bind with `set` or use `get`
+    // (v2 also takes `['key']`, below)
+    for (input, expected) in [
+        (
+            "{% set pkg = read_json(path='package.json') %}{{ pkg.volta.node }}",
+            "20.1.0",
+        ),
+        (
+            "{{ read_json(path='package.json') | get(key='volta') | get(key='node') }}",
+            "20.1.0",
+        ),
+        (
+            "{% set pkg = read_json(path='package.json') %}{{ pkg.packageManager | split(pat='@') | last }}",
+            "9.12.0",
+        ),
+        (
+            "{% set pkg = read_json(path='package.json') %}{{ pkg.names[1] }}{{ pkg['my-key'] }}",
+            "b7",
+        ),
+        (
+            "{% set p = read_yaml(path='Pulumi.yaml') %}{{ p.requiredPulumiVersion }}",
+            "3.270.0",
+        ),
+        // only true and false are booleans in YAML, as everywhere else in mise
+        (
+            "{% set p = read_yaml(path='Pulumi.yaml') %}{{ p.flags[0] }}",
+            "on",
+        ),
+        (
+            "{% set p = read_toml(path='pyproject.toml') %}{{ p.tool.mytool.version }}",
+            "1.2.3",
+        ),
+        (
+            "{% set p = read_toml(path='pyproject.toml') %}{{ p.tool.mytool.released }}",
+            "2026-01-02",
+        ),
+    ] {
+        assert_eq!(render(input).unwrap(), expected, "{input}");
+    }
+    if !use_tera_v1() {
+        for (input, expected) in [
+            (
+                "{{ read_json(path='package.json')['volta']['node'] }}",
+                "20.1.0",
+            ),
+            ("{{ read_json(path='package.json')['names'][1] }}", "b"),
+            ("{{ read_json(path='package.json')['my-key'] }}", "7"),
+            (
+                "{{ read_toml(path='pyproject.toml')['tool']['mytool']['version'] }}",
+                "1.2.3",
+            ),
+        ] {
+            assert_eq!(render(input).unwrap(), expected, "{input}");
+        }
+        assert!(render("{{ read_json(path='package.json')['volta']['deno'] }}").is_err());
+    }
+    let err = format!(
+        "{:?}",
+        render("{{ read_json(path='bad.json') }}").unwrap_err()
+    );
+    assert!(err.contains("read_json("), "{err}");
+    assert!(err.contains("failed to parse file"), "{err}");
+    let err = format!(
+        "{:?}",
+        render("{{ read_yaml(path='missing.yaml') }}").unwrap_err()
+    );
+    assert!(err.contains("failed to read file"), "{err}");
+    // an absent key is an error rather than an empty string
+    assert!(render("{% set p = read_json(path='package.json') %}{{ p.volta.deno }}").is_err());
+    assert_eq!(
+        render(
+            "{% set p = read_json(path='package.json') %}{{ p.volta.deno | default(value='none') }}"
+        )
+        .unwrap(),
+        "none"
+    );
+}
+
+#[test]
+fn test_read_structured_files_refused_in_safe_mode_and_oci() {
+    let _lock = crate::testing::lock_ignoring_poison(&crate::testing::SETTINGS_LOCK);
+    for v1 in [false, true] {
+        let mut settings = mise_settings::SettingsPartial::empty();
+        settings.safe = Some(true);
+        settings.tera_v1 = Some(v1);
+        crate::testing::reset_settings(Some(settings));
+        let mut tera = get_tera(None);
+        for name in ["read_json", "read_yaml", "read_toml"] {
+            assert_refused(
+                &mut tera,
+                name,
+                &format!("{name}() is disabled in safe mode"),
+            );
+        }
+        // OCI dotfile templates must not read host files, even outside safe mode
+        let mut settings = mise_settings::SettingsPartial::empty();
+        settings.tera_v1 = Some(v1);
+        crate::testing::reset_settings(Some(settings));
+        let mut tera = get_tera_for_oci(None);
+        for name in ["read_json", "read_yaml", "read_toml"] {
+            assert_refused(&mut tera, name, "host file access is disabled");
+        }
+    }
+    crate::testing::reset_settings(None);
+}
+
+fn assert_refused(tera: &mut TeraEngine, name: &str, message: &str) {
+    let err = render_str(
+        tera,
+        &format!("{{{{ {name}(path='x') }}}}"),
+        &BASE_CONTEXT.clone(),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{err:?}").contains(message),
+        "{name}: {err:?} should contain {message}"
+    );
+}
+
+#[test]
+fn test_render_for_dry_run() {
+    {
+        let _lock = crate::testing::lock_ignoring_poison(&crate::testing::SETTINGS_LOCK);
+        dry_run_cases();
+    }
+    let _v1 = SettingsGuard::tera_v1();
+    dry_run_cases();
+}
+
+fn dry_run_cases() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("ran");
+    // the command goes through the context: a Windows path in a template
+    // string literal would contain backslash escapes Tera rejects
+    let mut context = BASE_CONTEXT.clone();
+    context.insert("cmd", &format!("touch {}", marker.display()));
+    context.insert("vars", &indexmap::IndexMap::from([("known", "hi")]));
+    let none = IndexSet::new();
+    let pending = IndexSet::from(["pending".to_string()]);
+    let render = |input: &str, unresolved: &IndexSet<String>| match render_for_dry_run(
+        Some(dir.path()),
+        input,
+        &context,
+        unresolved,
+    ) {
+        DryRunRender::Rendered(out) => out,
+        DryRunRender::Unrendered(err) => format!("<unrendered: {}>", error_chain(&err)),
+        DryRunRender::Failed(err) => format!("<failed: {}>", error_chain(&err)),
+    };
+
+    assert_eq!(render("echo {{ vars.known }}", &pending), "echo hi");
+    // exec() is never called, and calling it leaves the template unrendered
+    for unresolved in [&none, &pending] {
+        let out = render("echo {{ exec(command=cmd) }}", unresolved);
+        assert!(out.starts_with("<unrendered: "), "{out}");
+        assert!(out.contains("exec() is disabled during dry run"), "{out}");
+    }
+    assert!(!marker.exists());
+    // with a var unresolved, any failure leaves the template unrendered with
+    // its error, however the var is read
+    for input in [
+        "echo {{ vars.pending }}",
+        "{% set v = vars %}{{ v.pending }}",
+        "{{ read_file(path=vars.pending) }}",
+        "{{ vars.pending | hash_file }}",
+        "{{ vars.pending | extname }}",
+        "echo {{ nope() }}",
+    ] {
+        let out = render(input, &pending);
+        assert!(out.starts_with("<unrendered: "), "{input}: {out}");
+    }
+    // with a var unresolved, a template that uses the whole vars map would
+    // render without it, so it is left unrendered; one entry at a time, or
+    // with nothing unresolved, it renders
+    for input in [
+        "echo '{{ vars | json_encode }}'",
+        "{% for k, v in vars %}{{ k }}={{ v }} {% endfor %}",
+        "{% set v = vars %}{{ v.known }}",
+    ] {
+        let out = render(input, &pending);
+        assert!(
+            out.starts_with("<unrendered: ")
+                && out.contains("whole vars map")
+                && out.contains("pending"),
+            "{input}: {out}"
+        );
+        assert!(render(input, &none).contains("hi"), "{input}");
+    }
+    assert_eq!(render("{{ vars['known'] }}", &pending), "hi");
+    assert_eq!(render("{{ vars.known }}{# x.vars #}", &pending), "hi");
+    // spreading the map reads all of it
+    let out = render("{{ {...vars} | json_encode }}", &pending);
+    assert!(out.contains("whole vars map"), "{out}");
+    // the scan does not parse the template, so neither `{% raw %}` text nor a
+    // stray quote can hide a later read; the word `vars` in plain text counts
+    // too, which only errs toward unrendered
+    for input in [
+        "echo vars {{ vars.known }}",
+        "echo '{% raw %}{{ vars }}{% endraw %}'",
+        "echo '{% raw %}{%{% endraw %}' '{{ vars | json_encode }}'",
+        "{% raw %}endraw {% ignored %}{{ ' }}{% endraw %}{{ vars | json_encode }}",
+    ] {
+        let out = render(input, &pending);
+        assert!(out.contains("whole vars map"), "{input}: {out}");
+    }
+    // with nothing unresolved and no exec() call, a failure is an error
+    let out = render("echo {{ nope() }}", &none);
+    assert!(
+        out.starts_with("<failed: ") && out.contains("nope"),
+        "{out}"
+    );
+    assert!(render("echo {{ vars.undeclared }}", &none).starts_with("<failed: "));
+    // nothing is substituted for an unresolved var, so a template that does
+    // not read one renders once, as is
+    let out = render("{{ choice(n=8, alphabet='ab') }}", &pending);
+    assert_eq!(out.len(), 8, "{out}");
+    assert!(out.chars().all(|c| c == 'a' || c == 'b'), "{out}");
+}
+
+#[test]
+fn test_safe_mode_hides_env_and_files() {
+    let _lock = crate::testing::lock_ignoring_poison(&crate::testing::SETTINGS_LOCK);
+    // restore the default settings even if an assertion fails, before the lock is released
+    struct ResetSettings;
+    impl Drop for ResetSettings {
+        fn drop(&mut self) {
+            crate::testing::reset_settings(None);
+        }
+    }
+    let _reset = ResetSettings;
+    let mut ctx = Context::new();
+    ctx.insert("env", &json!({ "SECRET": "hunter2" }));
+    ctx.insert("p", "/etc");
+    let refused = [
+        ("{{ get_env(name='PATH', default='') }}", "get_env() is"),
+        ("{{ 'Cargo.toml' | hash_file }}", "the hash_file filter is"),
+        ("{{ 'Cargo.toml' | file_size }}", "the file_size filter is"),
+        (
+            "{{ 'Cargo.toml' | last_modified }}",
+            "the last_modified filter is",
+        ),
+        (
+            "{{ 'Cargo.toml' | canonicalize }}",
+            "the canonicalize filter is",
+        ),
+        ("{% if p is dir %}x{% endif %}", "the dir test is"),
+        ("{% if p is file %}x{% endif %}", "the file test is"),
+        ("{% if p is exists %}x{% endif %}", "the exists test is"),
+    ];
+    for v1 in [false, true] {
+        let mut settings = mise_settings::SettingsPartial::empty();
+        settings.safe = Some(true);
+        settings.tera_v1 = Some(v1);
+        crate::testing::reset_settings(Some(settings));
+        for mut tera in [get_tera(None), get_miserc_tera()] {
+            assert!(render_str(&mut tera, "{{ env.SECRET }}", &ctx).is_err());
+            assert_eq!(
+                render_str(&mut tera, "{{ env.SECRET | default(value='unset') }}", &ctx).unwrap(),
+                "unset"
+            );
+            // global and system config keep the environment
+            assert_eq!(
+                render_str_with_env(&mut tera, "{{ env.SECRET }}", &ctx).unwrap(),
+                "hunter2"
+            );
+            for (template, message) in refused {
+                let err = render_str_with_env(&mut tera, template, &ctx).unwrap_err();
+                assert!(
+                    format!("{err:?}")
+                        .contains(&format!("{message} disabled in safe mode (MISE_SAFE=1)")),
+                    "{template}: {err:?}"
+                );
+            }
+        }
+        assert!(render_str_v2(&mut get_tera_v2(None), "{{ env.SECRET }}", &ctx).is_err());
+        // work for a tool from global config renders that config's options with env
+        let trusted = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(with_trusted_templates(async {
+                render_str(&mut get_tera(None), "{{ env.SECRET }}", &ctx)
+            }));
+        assert_eq!(trusted.unwrap(), "hunter2");
+    }
+    // outside safe mode nothing changes
+    crate::testing::reset_settings(None);
+    assert_eq!(
+        render_str(&mut get_tera(None), "{{ env.SECRET }}", &ctx).unwrap(),
+        "hunter2"
+    );
+}

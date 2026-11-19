@@ -1,0 +1,404 @@
+#[cfg(unix)]
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
+
+use eyre::{Result, bail};
+#[cfg(unix)]
+use indexmap::IndexSet;
+
+#[cfg(unix)]
+use crate::config::Config;
+use crate::config::Settings;
+#[cfg(unix)]
+use crate::config::config_file::ConfigFile;
+#[cfg(unix)]
+use crate::config::config_file::mise_toml::MiseToml;
+#[cfg(unix)]
+use crate::config::{ConfigPathOptions, GlobalWriteSection, resolve_target_config_path};
+#[cfg(unix)]
+use crate::env;
+#[cfg(unix)]
+use crate::file::display_path;
+#[cfg(unix)]
+use crate::system;
+#[cfg(unix)]
+use crate::system::PackageTomlConfig;
+use crate::system::history::OperationScope;
+#[cfg(unix)]
+use crate::system::packages::SystemPackageManager;
+#[cfg(unix)]
+use crate::system::packages::brew;
+#[cfg(unix)]
+use toml_edit::{Array, InlineTable, Value};
+
+/// Record installed Homebrew formulae in `[bootstrap.packages]`
+///
+/// Adds a `brew:` entry for each linked formula you installed yourself,
+/// skipping formulae that were installed only as dependencies; `--all`
+/// includes those too. Formulae from third-party taps are written with their
+/// full name, and each tap gets a `[bootstrap.brew.taps]` entry with the URL
+/// already in your config or the default GitHub URL. Writes the local config
+/// unless you pass `-g`, `-e`, or `-p`.
+#[derive(Debug, usage_rs::Args)]
+#[usage(
+    verbatim_doc_comment,
+    example(
+        "mise bootstrap packages import --dry-run",
+        help = "Show the entries that would be written"
+    ),
+    example(
+        "mise bootstrap packages import",
+        help = "Write them to the local config"
+    ),
+    example(
+        "mise bootstrap packages import --all",
+        help = "Include formulae installed as dependencies"
+    ),
+    example(
+        "mise bootstrap packages import -g",
+        help = "Write to the global config"
+    )
+)]
+pub(crate) struct SystemImport {
+    /// Write to the config file for this environment (mise.<ENV>.toml)
+    #[usage(long, short, value_name = "ENV", conflicts = ["global", "path"])]
+    env: Option<String>,
+
+    /// Write to the global config (~/.config/mise/config.toml)
+    ///
+    /// New entries go to the `write_targets.packages` file when that setting is
+    /// set.
+    #[usage(long, short, conflicts = ["env", "path"])]
+    global: bool,
+
+    /// Package manager to import from
+    #[usage(long, short, default = "brew", choices("brew"))]
+    manager: String,
+
+    /// Import every linked formula, including dependencies
+    #[usage(long)]
+    all: bool,
+
+    /// Show the entries that would be written without writing them
+    #[usage(long, short = 'n')]
+    dry_run: bool,
+
+    /// Write to this config file or directory
+    #[usage(
+        long,
+        short,
+        visible_alias = "file",
+        value_name = "PATH",
+        conflicts = "global"
+    )]
+    path: Option<PathBuf>,
+}
+
+impl SystemImport {
+    pub(crate) async fn run(self) -> Result<()> {
+        OperationScope::wrap("bootstrap packages import", self.dry_run, self.run_inner()).await
+    }
+
+    async fn run_inner(self) -> Result<()> {
+        if Settings::get()
+            .system_packages
+            .managers
+            .as_ref()
+            .is_some_and(|enabled| !enabled.contains(&self.manager))
+        {
+            bail!(
+                "manager '{}' is excluded by the system_packages.managers setting",
+                self.manager
+            );
+        }
+        self.run_brew().await
+    }
+
+    #[cfg(unix)]
+    async fn run_brew(self) -> Result<()> {
+        debug_assert_eq!(self.manager, "brew");
+        let manager = brew::BrewManager::new();
+        if !manager.is_available() {
+            bail!("brew is not available: {}", manager.unavailable_reason());
+        }
+        let formulae = brew::linked_formulae(self.all)?;
+        if formulae.is_empty() {
+            info!("brew: no installed formulae to import");
+            return Ok(());
+        }
+
+        let config = Config::get().await?;
+        let requested = formulae
+            .iter()
+            .map(|formula| formula.config_key())
+            .collect();
+        let (existing_global_paths, has_new_global_entries) =
+            self.global_write_paths(&config, &requested);
+        let path = resolve_target_config_path(ConfigPathOptions {
+            global: self.global,
+            path: self.path.clone(),
+            env: self.env.clone(),
+            cwd: None,
+            prefer_toml: true,
+            prevent_home_local: true,
+            override_file: false,
+            global_write_section: Some(GlobalWriteSection::Packages),
+            existing_global_paths,
+            has_new_global_entries,
+        })?;
+
+        let configured_taps = configured_brew_taps(&path).await?;
+        let configured_packages = system::package_configs_for_target(&config, &path);
+        let target_taps = target_brew_taps(&path)?;
+        let target_packages = target_bootstrap_packages(&path)?;
+        let mut taps = BTreeMap::new();
+        for formula in &formulae {
+            let Some((tap, url)) = formula.tap_entry_with_urls(&configured_taps)? else {
+                continue;
+            };
+            if target_taps.contains_key(&tap) {
+                continue;
+            }
+            taps.insert(tap, url);
+        }
+
+        if self.dry_run {
+            for (tap, url) in &taps {
+                miseprintln!(
+                    "{}: [bootstrap.brew.taps].\"{}\" = \"{}\"",
+                    display_path(&path),
+                    tap,
+                    url
+                );
+            }
+            for formula in &formulae {
+                let key = formula.config_key();
+                if target_packages
+                    .get(&key)
+                    .is_some_and(|package| package.version() == "latest")
+                {
+                    continue;
+                }
+                let package = imported_package_value(
+                    target_packages.get(&key),
+                    configured_packages.get(&key),
+                );
+                miseprintln!("{}: \"{}\" = {}", display_path(&path), key, package);
+            }
+            return Ok(());
+        }
+
+        let mut cf = if path.exists() {
+            MiseToml::from_file(&path)?
+        } else {
+            MiseToml::init(&path)
+        };
+        for (tap, url) in &taps {
+            cf.update_bootstrap_brew_tap(tap, url)?;
+        }
+        for formula in &formulae {
+            let key = formula.config_key();
+            cf.update_bootstrap_package_with_fallback(
+                &key,
+                "latest",
+                configured_packages.get(&key),
+            )?;
+        }
+        cf.save()?;
+        info!(
+            "{}: imported {} brew formulae",
+            display_path(&path),
+            formulae.len()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn global_write_paths(
+        &self,
+        config: &Config,
+        requested: &BTreeSet<String>,
+    ) -> (IndexSet<PathBuf>, bool) {
+        if !(self.global || env::in_home_dir()) || self.path.is_some() || self.env.is_some() {
+            return (Default::default(), false);
+        }
+        let mut paths = IndexSet::new();
+        let mut existing = BTreeSet::new();
+        for (path, cf) in &config.config_files {
+            if !crate::config::is_global_config(path)
+                || crate::config::is_system_config(path)
+                || crate::config::is_override_config(path)
+            {
+                continue;
+            }
+            if let Some(bootstrap) = cf.bootstrap_config() {
+                for spec in bootstrap.packages.keys() {
+                    if requested.contains(spec) {
+                        paths.insert(path.clone());
+                        existing.insert(spec.clone());
+                    }
+                }
+            }
+        }
+        (paths, existing.len() != requested.len())
+    }
+
+    #[cfg(not(unix))]
+    async fn run_brew(self) -> Result<()> {
+        let _ = self.manager;
+        bail!("brew import is not supported on windows")
+    }
+}
+
+#[cfg(unix)]
+fn imported_package_value(
+    target: Option<&PackageTomlConfig>,
+    configured: Option<&PackageTomlConfig>,
+) -> Value {
+    let options = match target {
+        Some(PackageTomlConfig::Options(options)) => Some(options),
+        Some(PackageTomlConfig::Version(_)) => None,
+        None => match configured {
+            Some(PackageTomlConfig::Options(options))
+                if !options.os.is_empty()
+                    || !options.env.is_empty()
+                    || options.adopt.is_some()
+                    || options.appdir.is_some() =>
+            {
+                Some(options)
+            }
+            _ => None,
+        },
+    };
+    let Some(options) = options else {
+        return Value::from("latest");
+    };
+    let mut table = InlineTable::new();
+    table.insert("version", Value::from("latest"));
+    if !options.os.is_empty() {
+        let mut os = Array::new();
+        os.extend(options.os.clone());
+        table.insert("os", Value::Array(os));
+    }
+    if !options.env.is_empty() {
+        let mut env = Array::new();
+        env.extend(options.env.clone());
+        table.insert("env", Value::Array(env));
+    }
+    if let Some(adopt) = options.adopt {
+        table.insert("adopt", Value::from(adopt));
+    }
+    if let Some(appdir) = &options.appdir {
+        table.insert("appdir", Value::from(appdir));
+    }
+    Value::InlineTable(table)
+}
+
+#[cfg(unix)]
+async fn configured_brew_taps(path: &Path) -> Result<BTreeMap<String, String>> {
+    let mut taps = BTreeMap::new();
+    let config = Config::get().await?;
+    for (tap, url) in system::brew_taps_from_config(&config) {
+        taps.insert(tap, url);
+    }
+    for (tap, url) in target_brew_taps(path)? {
+        taps.insert(tap, url);
+    }
+    Ok(taps)
+}
+
+#[cfg(unix)]
+fn target_brew_taps(path: &Path) -> Result<BTreeMap<String, String>> {
+    let mut taps = BTreeMap::new();
+    if path.exists() {
+        let cf = MiseToml::from_file(path)?;
+        if let Some(sys) = cf.bootstrap_config() {
+            for (tap, url) in sys.brew.taps {
+                taps.insert(tap, url);
+            }
+        }
+    }
+    Ok(taps)
+}
+
+#[cfg(unix)]
+fn target_bootstrap_packages(path: &Path) -> Result<BTreeMap<String, PackageTomlConfig>> {
+    let mut packages = BTreeMap::new();
+    if path.exists() {
+        let cf = MiseToml::from_file(path)?;
+        if let Some(sys) = cf.bootstrap_config() {
+            for (spec, package) in sys.packages {
+                packages.insert(spec, package);
+            }
+        }
+    }
+    Ok(packages)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::system::PackageOptionsTomlConfig;
+
+    #[test]
+    fn dry_run_preserves_inherited_package_options() {
+        let inherited = PackageTomlConfig::Options(PackageOptionsTomlConfig {
+            version: "1.0.0".to_string(),
+            os: vec!["macos".to_string()],
+            env: vec!["work".to_string()],
+            adopt: None,
+            appdir: None,
+            state: crate::system::PackageDesiredStateTomlConfig::Present,
+            url: None,
+            sha256: None,
+            artifact: None,
+            channel: None,
+            classic: None,
+            names: Default::default(),
+        });
+        assert_eq!(
+            imported_package_value(None, Some(&inherited)).to_string(),
+            r#"{ version = "latest", os = ["macos"], env = ["work"] }"#
+        );
+
+        let adopted = PackageTomlConfig::Options(PackageOptionsTomlConfig {
+            version: "1.0.0".to_string(),
+            os: vec![],
+            env: vec![],
+            adopt: Some(true),
+            appdir: None,
+            state: crate::system::PackageDesiredStateTomlConfig::Present,
+            url: None,
+            sha256: None,
+            artifact: None,
+            channel: None,
+            classic: None,
+            names: Default::default(),
+        });
+        assert_eq!(
+            imported_package_value(None, Some(&adopted)).to_string(),
+            r#"{ version = "latest", adopt = true }"#
+        );
+
+        let appdir = PackageTomlConfig::Options(PackageOptionsTomlConfig {
+            version: "1.0.0".to_string(),
+            os: vec![],
+            env: vec![],
+            adopt: None,
+            appdir: Some("/Applications".to_string()),
+            state: crate::system::PackageDesiredStateTomlConfig::Present,
+            url: None,
+            sha256: None,
+            artifact: None,
+            channel: None,
+            classic: None,
+            names: Default::default(),
+        });
+        assert_eq!(
+            imported_package_value(None, Some(&appdir)).to_string(),
+            r#"{ version = "latest", appdir = "/Applications" }"#
+        );
+    }
+}

@@ -1,0 +1,46 @@
+use eyre::Result;
+
+mod forget;
+mod pins;
+
+/// Inspect and reset the signers mise has pinned for packslip tools
+///
+/// mise verifies a tool installed with the `packslip:` backend against the
+/// identity its project name implies, then remembers the signer it accepted,
+/// the way SSH remembers host keys. A later release from another signer, a
+/// weaker signing scheme, a repackager where the vendor signed before, or one
+/// that drops build provenance is refused. After you confirm the change with
+/// the publisher, run `mise packslip forget <PROJECT>`, and update mise.lock if
+/// it records the old signer.
+///
+/// With no subcommand, lists the pins (same as `mise packslip pins`).
+/// See https://mise.jdx.dev/dev-tools/backends/packslip.html#pinned-signers
+#[derive(Debug, usage_rs::Args)]
+#[usage(verbatim_doc_comment)]
+pub(crate) struct Packslip {
+    #[usage(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Debug, usage_rs::Subcommands)]
+enum Commands {
+    Forget(forget::PackslipForget),
+    Pins(pins::PackslipPins),
+}
+
+impl Commands {
+    fn run(self) -> Result<()> {
+        match self {
+            Self::Forget(cmd) => cmd.run(),
+            Self::Pins(cmd) => cmd.run(),
+        }
+    }
+}
+
+impl Packslip {
+    pub(crate) async fn run(self) -> Result<()> {
+        self.command
+            .unwrap_or(Commands::Pins(pins::PackslipPins::default()))
+            .run()
+    }
+}

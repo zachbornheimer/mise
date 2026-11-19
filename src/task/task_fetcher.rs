@@ -1,0 +1,596 @@
+use crate::config::{Config, Settings, SettingsExt};
+use crate::task::Task;
+use crate::task::task_file_providers::{
+    TaskFileArtifact, TaskFileProviders, TaskFileProvidersBuilder,
+};
+use dashmap::DashMap;
+use eyre::Result;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use tokio::sync::OnceCell;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RemoteTaskArtifactKey {
+    config_source: PathBuf,
+    task_name: String,
+    source: String,
+}
+
+type RemoteTaskArtifacts = DashMap<RemoteTaskArtifactKey, Arc<OnceCell<TaskFileArtifact>>>;
+static REMOTE_TASK_ARTIFACTS: LazyLock<RemoteTaskArtifacts> = LazyLock::new(DashMap::new);
+static REMOTE_TASK_ARTIFACT_SCOPES: Mutex<usize> = Mutex::new(0);
+
+/// Keeps no-cache remote task snapshots alive for one command or direct caller.
+pub struct RemoteTaskArtifactsGuard(());
+
+impl RemoteTaskArtifactsGuard {
+    pub fn new() -> Self {
+        *REMOTE_TASK_ARTIFACT_SCOPES.lock().unwrap() += 1;
+        Self(())
+    }
+}
+
+impl Default for RemoteTaskArtifactsGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for RemoteTaskArtifactsGuard {
+    fn drop(&mut self) {
+        let (include_artifacts, task_artifacts) = {
+            let mut scopes = REMOTE_TASK_ARTIFACT_SCOPES.lock().unwrap();
+            *scopes -= 1;
+            if *scopes != 0 {
+                return;
+            }
+            (
+                crate::config::take_remote_task_include_artifacts(),
+                take_remote_task_artifacts(),
+            )
+        };
+        drop(include_artifacts);
+        drop(task_artifacts);
+    }
+}
+
+fn take_remote_task_artifacts() -> Vec<Arc<OnceCell<TaskFileArtifact>>> {
+    let keys = REMOTE_TASK_ARTIFACTS
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect::<Vec<_>>();
+    keys.into_iter()
+        .filter_map(|key| {
+            REMOTE_TASK_ARTIFACTS
+                .remove(&key)
+                .map(|(_, artifact)| artifact)
+        })
+        .collect()
+}
+
+/// Set once a command has warned that it left a gated `git::` task file unfetched.
+static WARNED_UNFETCHED_GIT_TASK: AtomicBool = AtomicBool::new(false);
+
+/// Set once a fetcher that skips failures has warned that it could not read a task file.
+static WARNED_UNREADABLE_TASK: AtomicBool = AtomicBool::new(false);
+
+/// Handles fetching remote task files and converting them to local paths
+///
+/// # The experimental gate on remote task files
+///
+/// Remote `git::` task files are experimental. Only running a task enforces that gate:
+/// [`TaskFetcher::new`] refuses a gated `git::` file. Commands that only inspect tasks (list,
+/// show, validate, dependency trees, completion, docs generation, and similar) never fetch a
+/// gated remote file; they use [`TaskFetcher::for_inspection`], which leaves the task with its
+/// TOML metadata and warns once that its remote file is experimental and was not fetched.
+/// `mise run --dry-run` plans an execution, so it counts as running and stays strict.
+pub struct TaskFetcher {
+    no_cache: bool,
+    inspecting: bool,
+    warn_unfetched: bool,
+    /// See [`TaskFetcher::skipping_failures`].
+    skip_failures: bool,
+    /// With `no_cache`, share one download of each task file across the command; see
+    /// [`RemoteTaskArtifactsGuard`].
+    share_snapshots: bool,
+}
+
+impl TaskFetcher {
+    /// For commands that run tasks. A `git::` task file fails unless experimental is on.
+    pub fn new(no_cache: bool) -> Self {
+        Self {
+            no_cache,
+            inspecting: false,
+            warn_unfetched: false,
+            share_snapshots: true,
+            skip_failures: false,
+        }
+    }
+
+    /// For commands that only inspect tasks. With experimental off, a task with a `git::` file
+    /// is left unfetched, keeping only its TOML metadata, and a one-time warning says so.
+    pub fn for_inspection(no_cache: bool) -> Self {
+        Self {
+            no_cache,
+            inspecting: true,
+            warn_unfetched: true,
+            share_snapshots: true,
+            skip_failures: false,
+        }
+    }
+
+    /// With `no_cache`, downloads each task file again instead of reusing the command's shared
+    /// snapshot, for a long-lived process such as `mise mcp`, whose one command scope would
+    /// otherwise keep its first download for as long as it runs.
+    pub fn without_shared_snapshots(mut self) -> Self {
+        self.share_snapshots = false;
+        self
+    }
+
+    /// Leaves a task whose remote file cannot be read with its TOML metadata, warning once,
+    /// instead of failing the whole fetch. For choosing among tasks (`--tag`, the MCP task
+    /// list), where one unreachable file must not hide the rest; running a task still fails.
+    pub fn skipping_failures(mut self) -> Self {
+        self.skip_failures = true;
+        self
+    }
+
+    /// Skips the one-time warnings (an unfetched `git::` file, an unreadable file), for output a shell or another program reads, such as
+    /// completion and usage specs.
+    pub fn without_warning(mut self) -> Self {
+        self.warn_unfetched = false;
+        self
+    }
+
+    /// True for a task whose `file` is a `git::` source that has not been fetched.
+    pub fn is_unfetched_git_task(task: &Task) -> bool {
+        task.file
+            .as_ref()
+            .is_some_and(|f| f.to_string_lossy().starts_with("git::"))
+    }
+
+    /// True for a task whose `file` is a remote source that has not been fetched: a gated
+    /// `git::` file, or any remote file of project config in safe mode.
+    pub fn is_unfetched_remote_task(task: &Task) -> bool {
+        task.file
+            .as_ref()
+            .is_some_and(|f| Self::is_remote_source(&f.to_string_lossy()))
+    }
+
+    /// For an unfetched remote task, a copy without its file, so its usage spec comes from
+    /// its TOML metadata alone; `None` for any other task.
+    pub fn toml_only(task: &Task) -> Option<Task> {
+        Self::is_unfetched_remote_task(task).then(|| {
+            let mut task = task.clone();
+            task.file = None;
+            task
+        })
+    }
+
+    /// Fetch remote task files, converting remote paths to local cached paths
+    pub async fn fetch_tasks(&self, config: &Arc<Config>, tasks: &mut Vec<Task>) -> Result<()> {
+        let no_cache = self.no_cache || Settings::get().task.remote_no_cache.unwrap_or(false);
+        let task_file_providers = TaskFileProvidersBuilder::new()
+            .with_cache(!no_cache)
+            .build();
+
+        for t in tasks {
+            if let Err(err) = self
+                .fetch_task(config, &task_file_providers, no_cache, t)
+                .await
+            {
+                if !self.skip_failures {
+                    return Err(err);
+                }
+                // The task keeps its TOML metadata. A run that selects it fetches it again
+                // and fails there.
+                if self.warn_unfetched && !WARNED_UNREADABLE_TASK.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "could not read the file of task `{}`, so only its TOML metadata is known: {err:#}",
+                        t.name
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Fetch one task's remote file, if it has one, and merge its `#MISE` headers.
+    async fn fetch_task(
+        &self,
+        config: &Arc<Config>,
+        task_file_providers: &TaskFileProviders,
+        no_cache: bool,
+        t: &mut Task,
+    ) -> Result<()> {
+        {
+            if let Some(file) = &t.file {
+                let source = file.to_string_lossy().to_string();
+
+                // Skip local files - they don't need provider resolution
+                if !Self::is_remote_source(&source) {
+                    return Ok(());
+                }
+                // Safe mode loads untrusted project config without a trust prompt, and
+                // fetching a URL is not something such a config gets to do, as for remote
+                // includes. The task keeps its TOML metadata, and safe mode refuses to run it.
+                if !t.global && Settings::safe_mode() {
+                    return Ok(());
+                }
+                if source.starts_with("git::") {
+                    if self.inspecting && !Settings::get().experimental {
+                        if self.warn_unfetched
+                            && !WARNED_UNFETCHED_GIT_TASK.swap(true, Ordering::Relaxed)
+                        {
+                            warn!(
+                                "task `{}` has a `git::` file, which is experimental and was not fetched. Enable it with `mise settings experimental=true`",
+                                t.name
+                            );
+                        }
+                        return Ok(());
+                    }
+                    Settings::get().ensure_experimental(&format!(
+                        "loading task `{}` from a `git::` file",
+                        t.name
+                    ))?;
+                }
+
+                let original = t.clone();
+                let provider = task_file_providers
+                    .get_provider(&source)
+                    .ok_or_else(|| eyre::eyre!("No provider found for file: {}", source))?;
+                let artifact = if no_cache && self.share_snapshots {
+                    // Reuse one snapshot when dependency resolution materializes
+                    // the same task again, while keeping separate task definitions
+                    // that happen to use the same URL independent.
+                    let key = RemoteTaskArtifactKey {
+                        config_source: original.config_source.clone(),
+                        task_name: original.name.clone(),
+                        source: source.clone(),
+                    };
+                    let artifact = REMOTE_TASK_ARTIFACTS
+                        .entry(key)
+                        .or_insert_with(|| Arc::new(OnceCell::new()))
+                        .clone();
+                    artifact
+                        .get_or_try_init(|| async { provider.get_local_artifact(&source).await })
+                        .await?
+                        .clone()
+                } else {
+                    provider.get_local_artifact(&source).await?
+                };
+                let local_path = artifact.path;
+                crate::config::trust_check_remote_task_file(&original.config_source, &local_path)?;
+                let config_root = original
+                    .config_root
+                    .clone()
+                    .or_else(|| original.config_source.parent().map(|p| p.to_path_buf()))
+                    .unwrap_or_default();
+                let prefix = local_path.parent().unwrap_or(&local_path);
+
+                // Parse the downloaded script as a regular file task so all #MISE
+                // metadata is honored. The inline TOML task remains the higher-
+                // precedence overlay, matching local file-task behavior.
+                let mut remote = Task::from_path_unrendered_with_cf(
+                    &local_path,
+                    prefix,
+                    &config_root,
+                    original.cf.clone(),
+                )?;
+                remote.name.clone_from(&original.name);
+                remote.display_name.clone_from(&original.display_name);
+
+                // Before rendering, matching where the local file-task loader resolves it: a
+                // template can contribute `env`, `vars`, and `dir`, which the render reads.
+                crate::config::resolve_template_for_late_task(config, &mut remote)?;
+
+                // Restore runtime render context before rendering remote headers.
+                // Templates in those headers may depend on task vars or env inherited
+                // from the invocation that selected this task.
+                remote.args.clone_from(&original.args);
+                remote.trailing_args.clone_from(&original.trailing_args);
+                remote.show_args_in_prefix = original.show_args_in_prefix;
+                remote.inherited_env.clone_from(&original.inherited_env);
+                remote.overlay_env.clone_from(&original.overlay_env);
+                remote.late_secret_env.extend(
+                    original
+                        .late_secret_env
+                        .iter()
+                        .filter(|l| l.overlay)
+                        .cloned(),
+                );
+                remote.overlay_vars.clone_from(&original.overlay_vars);
+                remote.render(config, &config_root).await?;
+                remote.merge_toml_overlay(original.clone());
+
+                // Preserve runtime state that is not task metadata and therefore is
+                // intentionally not handled by merge_toml_overlay().
+                remote.global = original.global;
+                remote.remote_file_source = Some(source);
+                *t = remote;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if a source path is a remote task file (git or http/https)
+    pub fn is_remote_source(source: &str) -> bool {
+        source.starts_with("git::")
+            || source.starts_with("http://")
+            || source.starts_with("https://")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::env_directive::EnvDirective;
+    use crate::task::TaskToolValue;
+    use std::path::PathBuf;
+
+    static REMOTE_TASK_ARTIFACT_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn nested_artifact_scopes_clear_only_after_the_last_scope() {
+        let _test_lock = REMOTE_TASK_ARTIFACT_TEST_LOCK.lock().await;
+        assert_eq!(*REMOTE_TASK_ARTIFACT_SCOPES.lock().unwrap(), 0);
+        REMOTE_TASK_ARTIFACTS.clear();
+
+        let outer = RemoteTaskArtifactsGuard::new();
+        let inner = RemoteTaskArtifactsGuard::new();
+        REMOTE_TASK_ARTIFACTS.insert(
+            RemoteTaskArtifactKey {
+                config_source: PathBuf::from("scope-test.toml"),
+                task_name: "scope-test".into(),
+                source: "https://example.test/task".into(),
+            },
+            Arc::new(OnceCell::new()),
+        );
+
+        drop(inner);
+        assert_eq!(REMOTE_TASK_ARTIFACTS.len(), 1);
+
+        drop(outer);
+        assert!(REMOTE_TASK_ARTIFACTS.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_remote_task_parses_headers_and_applies_toml_overlay() {
+        let _test_lock = REMOTE_TASK_ARTIFACT_TEST_LOCK.lock().await;
+        let _artifacts = RemoteTaskArtifactsGuard::new();
+        let mut server = mockito::Server::new_async().await;
+        let remote = server
+            .mock("GET", "/task")
+            .with_status(200)
+            .with_body(
+                r#"#!/usr/bin/env bash
+#MISE description="remote description"
+#MISE hide=true
+#MISE quiet=true
+#MISE tags=["lint"]
+#MISE tools={node="24", python="3.12"}
+echo ok
+"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let config = Config::get().await.unwrap();
+        let config_root = tempfile::tempdir().unwrap();
+        let source = format!("{}/task", server.url());
+        let mut task = Task {
+            name: "lint".into(),
+            display_name: "lint".into(),
+            description: "toml description".into(),
+            config_source: config_root.path().join("mise.toml"),
+            config_root: Some(config_root.path().to_path_buf()),
+            file: Some(PathBuf::from(&source)),
+            args: vec!["--fix".into()],
+            tags: vec!["slow".into()],
+            tools: [("python".into(), TaskToolValue::String("3.13".into()))]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+
+        let mut tasks = vec![task];
+        TaskFetcher::new(true)
+            .fetch_tasks(&config, &mut tasks)
+            .await
+            .unwrap();
+        task = tasks.pop().unwrap();
+
+        remote.assert_async().await;
+        assert_eq!(task.name, "lint");
+        assert_eq!(task.display_name, "lint");
+        assert_eq!(task.description, "toml description");
+        assert!(task.hide);
+        assert!(task.quiet);
+        // the header's tags, then the TOML's
+        assert_eq!(task.tags, ["lint", "slow"]);
+        assert_eq!(task.args, ["--fix"]);
+        assert_eq!(task.config_root.as_deref(), Some(config_root.path()));
+        assert_eq!(task.remote_file_source.as_deref(), Some(source.as_str()));
+        assert!(task.is_remote());
+        assert_eq!(
+            task.tools.get("node"),
+            Some(&TaskToolValue::String("24".into()))
+        );
+        assert_eq!(
+            task.tools.get("python"),
+            Some(&TaskToolValue::String("3.13".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unshared_no_cache_fetch_downloads_again_within_a_scope() {
+        // Generate mode shares one download per URL within an invocation; this test counts
+        // the requests of plain downloads.
+        let _settings = crate::test::SettingsGuard::lock();
+        let mut partial = <crate::config::settings::SettingsPartial as confique::Layer>::empty();
+        partial.lockfile_mode = Some("merge".into());
+        crate::config::Settings::reset(Some(partial));
+        let _test_lock = REMOTE_TASK_ARTIFACT_TEST_LOCK.lock().await;
+        let _artifacts = RemoteTaskArtifactsGuard::new();
+        let mut server = mockito::Server::new_async().await;
+        let remote = server
+            .mock("GET", "/unshared-task")
+            .with_status(200)
+            .with_body("#!/usr/bin/env bash\n#MISE tags=[\"remote\"]\necho ok\n")
+            .expect(2)
+            .create_async()
+            .await;
+
+        let config = Config::get().await.unwrap();
+        let config_root = tempfile::tempdir().unwrap();
+        let task = Task {
+            name: "lint".into(),
+            display_name: "lint".into(),
+            config_source: config_root.path().join("mise.toml"),
+            config_root: Some(config_root.path().to_path_buf()),
+            file: Some(PathBuf::from(format!("{}/unshared-task", server.url()))),
+            ..Default::default()
+        };
+
+        // One long-lived scope, as in `mise mcp`: each read still downloads the file.
+        for _ in 0..2 {
+            let mut tasks = vec![task.clone()];
+            TaskFetcher::for_inspection(true)
+                .without_shared_snapshots()
+                .fetch_tasks(&config, &mut tasks)
+                .await
+                .unwrap();
+            assert_eq!(tasks[0].tags, ["remote"]);
+        }
+        remote.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_cached_remote_task_parses_headers() {
+        let mut server = mockito::Server::new_async().await;
+        let remote = server
+            .mock("GET", "/cached-task")
+            .with_status(200)
+            .with_body("#!/usr/bin/env bash\n#MISE description=\"from cache\"\necho ok\n")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let config = Config::get().await.unwrap();
+        let config_root = tempfile::tempdir().unwrap();
+        let source = format!("{}/cached-task", server.url());
+        let new_task = || Task {
+            name: "cached".into(),
+            config_source: config_root.path().join("mise.toml"),
+            config_root: Some(config_root.path().to_path_buf()),
+            file: Some(PathBuf::from(&source)),
+            ..Default::default()
+        };
+
+        for _ in 0..2 {
+            let mut tasks = vec![new_task()];
+            TaskFetcher::new(false)
+                .fetch_tasks(&config, &mut tasks)
+                .await
+                .unwrap();
+            assert_eq!(tasks[0].description, "from cache");
+        }
+
+        remote.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_no_cache_remote_task_reuses_logical_snapshot() {
+        let _test_lock = REMOTE_TASK_ARTIFACT_TEST_LOCK.lock().await;
+        let _artifacts = RemoteTaskArtifactsGuard::new();
+        let mut server = mockito::Server::new_async().await;
+        let remote = server
+            .mock("GET", "/command-snapshot")
+            .with_status(200)
+            .with_body("#!/usr/bin/env bash\n#MISE env={REMOTE_REVISION=\"one\"}\necho snapshot\n")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let config = Config::get().await.unwrap();
+        let config_root = tempfile::tempdir().unwrap();
+        let source = format!("{}/command-snapshot", server.url());
+        let task = Task {
+            name: "remote-dependency".into(),
+            config_source: config_root.path().join("mise.toml"),
+            config_root: Some(config_root.path().to_path_buf()),
+            file: Some(PathBuf::from(&source)),
+            ..Default::default()
+        };
+
+        let mut first = vec![task.clone()];
+        TaskFetcher::new(true)
+            .fetch_tasks(&config, &mut first)
+            .await
+            .unwrap();
+        let config = Config::reset().await.unwrap();
+        let mut second = vec![task];
+        TaskFetcher::new(true)
+            .fetch_tasks(&config, &mut second)
+            .await
+            .unwrap();
+
+        remote.assert_async().await;
+        assert_eq!(first[0].file, second[0].file);
+        assert_eq!(first[0].env.0.len(), 1);
+        assert_eq!(second[0].env.0.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_remote_header_templates_use_original_runtime_context() {
+        let _test_lock = REMOTE_TASK_ARTIFACT_TEST_LOCK.lock().await;
+        let _artifacts = RemoteTaskArtifactsGuard::new();
+        let mut server = mockito::Server::new_async().await;
+        let remote = server
+            .mock("GET", "/templated-task")
+            .with_status(200)
+            .with_body(
+                "#!/usr/bin/env bash\n#MISE description=\"{{vars.runtime_value}}\"\necho ok\n",
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        let config = Config::get().await.unwrap();
+        let config_root = tempfile::tempdir().unwrap();
+        let source = format!("{}/templated-task", server.url());
+        let config_source = config_root.path().join("mise.toml");
+        let mut tasks = vec![Task {
+            name: "templated".into(),
+            config_source: config_source.clone(),
+            config_root: Some(config_root.path().to_path_buf()),
+            file: Some(PathBuf::from(&source)),
+            overlay_vars: vec![(
+                EnvDirective::Val(
+                    "runtime_value".into(),
+                    "rendered from runtime context".into(),
+                    Default::default(),
+                ),
+                config_source,
+            )],
+            ..Default::default()
+        }];
+
+        TaskFetcher::new(true)
+            .fetch_tasks(&config, &mut tasks)
+            .await
+            .unwrap();
+
+        remote.assert_async().await;
+        assert_eq!(tasks[0].description, "rendered from runtime context");
+    }
+}

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+
+# `--no-timings` hides every "Finished in …" line: each task's and the run's
+# total. `task.timings = false` hides only the per-task lines.
+
+cat <<EOF >mise.toml
+[tasks.a]
+run = 'echo a-out'
+[tasks.b]
+run = 'echo b-out'
+[tasks.nested]
+run = 'mise run a ::: b'
+EOF
+
+# Parallel tasks default to prefix output, which emits two task timings and a
+# run timing. Capture one run: its stdout and stderr are concurrent streams,
+# so their individual writes may legally interleave after `2>&1` joins them.
+timed_output="$(mise run a ::: b 2>&1)"
+assert_contains_text "$timed_output" "[a]"
+assert_contains_text "$timed_output" "[b]"
+timing_count="$(grep -oF "Finished in" <<<"$timed_output" | wc -l | tr -d ' ')"
+[[ $timing_count == 3 ]] || fail "expected two task timings and one run timing, got $timing_count: $timed_output"
+
+assert_not_contains "mise run --no-timings a ::: b 2>&1" "Finished in"
+assert_contains "mise run --no-timings a ::: b 2>&1" "[a] a-out"
+
+# --no-timings wins when the per-task lines are forced on
+assert_not_contains "MISE_TASK_TIMINGS=1 mise run --no-timings a ::: b 2>&1" "Finished in"
+assert_not_contains "mise run --timings --no-timings a ::: b 2>&1" "Finished in"
+# and reaches the tasks of a nested run
+assert_not_contains "mise run --timings --no-timings nested 2>&1" "] Finished in"
+
+# task.timings = false keeps the run's total
+assert_not_contains "MISE_TASK_TIMINGS=0 mise run a ::: b 2>&1" "] Finished in"
+assert_contains "MISE_TASK_TIMINGS=0 mise run a ::: b 2>&1" "Finished in"

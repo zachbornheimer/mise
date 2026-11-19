@@ -1,0 +1,670 @@
+name: test implementation
+on:
+  workflow_call:
+    inputs:
+      trusted:
+        required: true
+        type: boolean
+    secrets:
+      FORGEJO_TOKEN:
+        required: false
+      MISE_GH_TOKEN:
+        required: false
+      MISE_VERSIONS_API_SECRET:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  MBX_DISABLE: "1"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+  MISE_EXPERIMENTAL: 1
+  MISE_LOCKFILE: 1
+  RUST_BACKTRACE: 1
+  MISE_GITHUB_TOKEN: ${{ secrets.MISE_GH_TOKEN || secrets.GITHUB_TOKEN }}
+  GITHUB_TOKEN: ${{ secrets.MISE_GH_TOKEN || secrets.GITHUB_TOKEN }}
+  FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
+
+jobs:
+  classify-changes:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      full-ci: ${{ steps.classify.outputs.full-ci }}
+      deps-changed: ${{ steps.deps.outputs.deps-changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name == 'pull_request'
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+      - name: Classify changes
+        id: classify
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          echo "full-ci=true" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            exit 0
+          fi
+
+          changed=0
+          while IFS= read -r path; do
+            changed=1
+            case "$path" in
+              docs/* | *.md) ;;
+              *) exit 0 ;;
+            esac
+          done < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+
+          if [ "$changed" -eq 1 ]; then
+            echo "full-ci=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The RustSec advisory DB changes on its own, so `cargo deny check
+      # advisories` only blocks a PR that changes the dependency graph. The
+      # daily deny-advisories workflow reports new advisories otherwise.
+      - name: Detect dependency changes
+        id: deps
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          deps_changed=true
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            deps_changed=false
+            # Capture first so a failed diff fails the step instead of reading
+            # as "no dependency changes".
+            changed_paths=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+            if grep -qE '(^|/)(Cargo\.lock|Cargo\.toml|deny\.toml)$' <<<"$changed_paths"; then
+              deps_changed=true
+            fi
+          fi
+          echo "deps-changed=$deps_changed" >> "$GITHUB_OUTPUT"
+
+  build-ubuntu:
+    runs-on: ${{ !inputs.trusted && 'ubuntu-latest' || 'namespace-profile-endev-linux-amd64-large;overrides.cache-tag=cache' }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: rustup update stable --no-self-update && rustup default stable && rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: build
+          save-if: ${{ inputs.trusted && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v')) }}
+      - run: |
+          cargo build --all-features --ignore-rust-version
+          echo "$PWD/target/debug" >> "$GITHUB_PATH"
+      - run: mise -v
+      # Downstream jobs only execute this binary. Compile with line tables
+      # (CARGO_PROFILE_DEV_DEBUG) and strip the uploaded copy further.
+      - name: Prepare mise artifact
+        run: |
+          install -Dm755 target/debug/mise target/ci-artifacts/mise
+          strip --strip-debug target/ci-artifacts/mise
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mise-ubuntu-latest
+          path: target/ci-artifacts/mise
+
+  build-windows:
+    runs-on: ${{ inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true' && fromJSON('["self-hosted", "jdx-win-trusted-v1"]') || 'windows-latest' }}
+    timeout-minutes: 60
+    needs: [classify-changes]
+    if: needs.classify-changes.outputs.full-ci == 'true'
+    env:
+      MISE_DATA_DIR: ~/.local/share/mise
+      MISE_CACHE_DIR: ~/.cache/mise
+      # Runs on the self-hosted runner (repository variable WINDOWS_SELF_HOSTED=true, trusted runs
+      # only) use its shared mbx cache.
+      MBX_DISABLE: ${{ inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true' && '0' || '1' }}
+      MBX_TARGET_VIEWS: "0"
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C link-arg=/STACK:8000000 -C target-feature=+crt-static -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # The self-hosted runner keeps its Cargo state and mbx store between jobs, so there is
+      # nothing to restore, and saving would upload gigabytes from a home connection.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: ${{ !(inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true') }}
+        with:
+          shared-key: build-windows
+          save-if: ${{ inputs.trusted && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v')) }}
+      - shell: pwsh
+        run: |
+          ${{ inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true' && 'mbx' || 'cargo' }} build --no-default-features --features rustls-native-roots,vfox/vendored-lua,self_update --all-targets
+          ${{ inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true' && 'mbx' || 'cargo' }} build -p mise-shim
+          Add-Content $env:GITHUB_PATH "$env:GITHUB_WORKSPACE\target\debug"
+      - parallel:
+          - run: mise -v
+          - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+            with:
+              name: mise-windows-latest
+              path: |
+                target/debug/mise.exe
+                target/debug/mise-shim.exe
+
+  unit:
+    name: unit-macos
+    runs-on: ${{ !inputs.trusted && 'macos-latest' || 'namespace-profile-endev-macos-arm64;overrides.cache-tag=cache' }}
+    timeout-minutes: 180
+    needs: [classify-changes]
+    if: needs.classify-changes.outputs.full-ci == 'true'
+    env:
+      # Enable the mise Cargo wrapper for unit tests and E2E rebuilds.
+      MBX_DISABLE: "0"
+      MBX_CACHE_DIR: ${{ github.workspace }}/.mbx-cache
+      # Keep the bootstrap binary at target/debug/mise with either backend.
+      MBX_TARGET_VIEWS: "0"
+      MISE_CARGO_BUILD_COMMAND: cargo build
+      MISE_CARGO_BUILD_EXTRA_ARGS: --ignore-rust-version
+      # Untrusted runs land on a shared macos-latest runner that is roughly twice as
+      # slow, where the strict per-test ceilings only produce false failures.
+      NEXTEST_PROFILE: ${{ inputs.trusted && 'ci' || 'ci-shared' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.head_ref }}
+      - name: Cache mbx objects on Namespace
+        if: inputs.trusted
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
+        with:
+          path: ${{ env.MBX_CACHE_DIR }}
+      - name: Cache Cargo downloads on Namespace
+        if: inputs.trusted && !(github.event_name == 'push' && github.ref == 'refs/heads/main')
+        uses: namespacelabs/nscloud-cache-action@1124a6f3ce44e5cf84cc22111530961f4d2a15f9 # v1
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/.global-cache
+      # Namespace builds reuse local objects. Main also publishes a target/registry
+      # archive so GitHub-hosted untrusted builds have a cache to restore.
+      # Install mbx before bootstrapping this checkout's mise.
+      - uses: jdx/mr-boxington-action@88acf2bb50552c7c508cbac13e5f8c576b95b1de # v1.7.3
+        with:
+          backend: ${{ inputs.trusted && !(github.event_name == 'push' && github.ref == 'refs/heads/main') && 'local' || 'github' }}
+          cache-generation: unit-macos-v1
+      - name: Install test tools
+        run: brew install fd tmux
+      - run: rustup update stable --no-self-update && rustup default stable && rustup component add rustfmt clippy
+      - run: |
+          mbx build --all-features --ignore-rust-version
+          echo "$PWD/target/debug" >> "$GITHUB_PATH"
+      - uses: ./.github/actions/mise-tools
+      # The CI profile fails ordinary tests after one second and explicitly
+      # budgeted full-command-graph tests after two seconds.
+      - run: mise run test:unit-ci
+        if: ${{ !(inputs.trusted && github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+      # On main the same run goes through jouet so its timing is recorded. The
+      # `jouet-cost` job in test.yml pushes the timings, so this job needs no write token.
+      # `--display human` streams the output, and the baseline rerun is off so a
+      # failure stays a failure.
+      - name: Test with jouet
+        if: ${{ inputs.trusted && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        env:
+          JOUET_TEST_BASELINE: "off"
+        run: |
+          mise x -- jouet test --display human --cmd -- mise run test:unit-ci
+      - name: Bundle jouet timings
+        if: ${{ always() && inputs.trusted && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: git bundle create "$RUNNER_TEMP/cost-${{ github.job }}-${{ strategy.job-index }}.bundle" refs/notes/jouet-cost || true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ always() && inputs.trusted && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+        with:
+          name: jouet-cost-${{ github.job }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/cost-${{ github.job }}-${{ strategy.job-index }}.bundle
+          if-no-files-found: ignore
+      # The full E2E suite runs on Linux. Tests whose filenames contain `macos`
+      # are also discovered and exercised here for platform-specific coverage.
+      - run: mise run test:e2e macos
+      # Linux runs this in the full suite; Windows has the equivalent Pester
+      # wrapper. Always replace a disposable copy, never the CI runner binary.
+      - run: mise run test:e2e cli/test_self_update_install
+      # Tracked history shells out to git and needs the Xcode Command
+      # Line Tools guard exercised on a real macOS runner. Each test has its
+      # own HOME, TMPDIR, and mise directories, so these run concurrently.
+      # They are listed longest first so the slowest start immediately.
+      # macos-latest runners have 3 cores; Namespace runners have 6.
+      - name: Test dotfiles and bootstrap e2e
+        env:
+          E2E_JOBS: ${{ inputs.trusted && '3' || '2' }}
+        run: >-
+          mise run test:e2e
+          '^test_dotfiles_rollback_types$' '^test_dotfiles_sync_files_encrypted$'
+          '^test_dotfiles_rollback$' '^test_dotfiles_capture$'
+          '^test_dotfiles_track$' '^test_dotfiles_rollback_review$'
+          '^test_bootstrap_user_services$' '^test_dotfiles_sync_permissions$'
+          '^test_dotfiles_recovery_journey$' '^test_dotfiles_sync$'
+          '^test_dotfiles_managed_manual$' '^test_dotfiles_history_bootstrap$'
+          '^test_dotfiles_history$' '^test_dotfiles_directory_permissions$'
+          '^test_bootstrap_unit_templates$' '^test_dotfiles_history_policies$'
+          '^test_dotfiles_onboarding$' '^test_dotfiles_alias_enrollment$'
+          '^test_bootstrap_from_git_dumb_http$'
+      # The watcher tests assert on debounce and throttle windows. Keep them
+      # serial so concurrent tests cannot delay filesystem events.
+      - name: Test dotfiles watcher e2e
+        run: >-
+          mise run test:e2e
+          '^test_dotfiles_watch_throttle$' '^test_dotfiles_watch$'
+          '^test_dotfiles_watch_pending$'
+
+  lint:
+    runs-on: ${{ !inputs.trusted && 'ubuntu-latest' || 'namespace-profile-endev-linux-amd64-large;overrides.cache-tag=cache' }}
+    timeout-minutes: 80
+    needs: [classify-changes, build-ubuntu]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: rustup update stable --no-self-update && rustup default stable && rustup component add rustfmt clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: lint
+          save-if: ${{ inputs.trusted && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v')) }}
+      - parallel:
+          - uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8 # v2.75.28
+            with:
+              tool: cargo-msrv,cargo-machete
+          - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+            with:
+              name: mise-ubuntu-latest
+              path: target/debug
+      - run: echo "$PWD/target/debug" >> "$GITHUB_PATH" && chmod +x target/debug/mise
+      # mold comes from its GitHub release through the mise just downloaded;
+      # the Ubuntu mirrors behind apt-get fail often enough to fail lint. Run
+      # outside the checkout so the repo's tools are not installed here.
+      - name: Install mold
+        working-directory: ${{ runner.temp }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: mise x mold@2 -- sh -c 'dirname "$(command -v mold)"' >> "$GITHUB_PATH"
+      - uses: ./.github/actions/mise-tools
+      - run: mise x -- aube install
+      # build-ubuntu produced this commit's binary, downloaded above.
+      - run: mise run render
+        env:
+          MISE_TASK_SKIP: build
+      - name: assert render produces no diff
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::'mise run render' produced changes. Run it locally and commit."
+            git status
+            git diff HEAD
+            exit 1
+          fi
+      # Keep these independent checks on one Namespace runner while overlapping
+      # their work. Clippy runs afterward so its all-features test build does not
+      # compete with the MSRV build for memory. Clippy is stricter than HK's
+      # cargo-check, so CI can skip that redundant compilation while retaining it
+      # for local lint runs.
+      - parallel:
+          # cargo-deny is a lazy tool in mise.toml: the cargo-deny shim installs it on
+          # first use. Call the binary directly; `cargo deny` goes through the cargo
+          # wrapper, which does not trigger the lazy install.
+          - run: mise x -- cargo-deny check bans licenses sources
+          - env:
+              DEPS_CHANGED: ${{ needs.classify-changes.outputs.deps-changed }}
+            run: |
+              if [ "$DEPS_CHANGED" = "true" ]; then
+                rm -rf ~/.cargo/advisory-dbs && mise x -- cargo-deny check advisories
+              fi
+          - run: cargo machete --with-metadata
+          - run: ./scripts/test-standalone.sh
+          - run: ./scripts/test-check-glibc.sh
+          # Online checks (action refs, known-vulnerable actions, impostor commits)
+          # run here only; locally: JACTIONLINT_ONLINE=1 hk check --all
+          - run: mise run lint
+            env:
+              HK_SKIP_STEPS: cargo-check
+              JACTIONLINT_ONLINE: 1
+              GITHUB_TOKEN: ${{ github.token }}
+          # MSRV uses a separate target directory so its older compiler cannot
+          # invalidate stable's build artifacts. Some AWS crates declare a newer
+          # rust-version than their code requires; rustc still rejects genuinely
+          # incompatible syntax and APIs when the metadata check is ignored.
+          - name: Verify MSRV
+            run: cargo msrv verify -- cargo check --ignore-rust-version
+            env:
+              CARGO_TARGET_DIR: target/msrv
+      # Separate targets keep Cargo's directory lock from serializing these
+      # overlapping configurations.
+      - parallel:
+          - name: Run Clippy with default features
+            env:
+              CARGO_TARGET_DIR: ${{ runner.temp }}/clippy-default
+            run: cargo clippy --ignore-rust-version -- -D warnings
+          - name: Run Clippy with all features and targets
+            env:
+              CARGO_TARGET_DIR: ${{ runner.temp }}/clippy-all
+            run: cargo clippy --all-features --all-targets --ignore-rust-version -- -D warnings
+
+  e2e:
+    name: e2e
+    permissions:
+      contents: read
+    # The release PR runs the full suite against the packaged release tarball.
+    # Keep that stronger signal instead of also testing the debug artifact.
+    if: ${{ needs.classify-changes.outputs.full-ci == 'true' && (github.event_name != 'pull_request' || github.head_ref != 'release' || github.base_ref != 'main') }}
+    runs-on: ${{ !inputs.trusted && 'ubuntu-latest' || 'namespace-profile-endev-linux-amd64-large;overrides.cache-tag=cache' }}
+    needs: [build-ubuntu, classify-changes]
+    timeout-minutes: 125
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Fetch tokens
+        id: tokens
+        uses: ./.github/actions/fetch-token
+        with:
+          api-secret: ${{ secrets.MISE_VERSIONS_API_SECRET }}
+          count: "8"
+      - parallel:
+          - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+            with:
+              name: mise-ubuntu-latest
+              path: target/debug
+          # our own e2e image, the e2e tag moves on purpose
+          # jactionlint ignore=unpinned-images
+          - name: Pull e2e Docker image
+            run: docker pull ghcr.io/jdx/mise:e2e
+      - run: echo "$PWD/target/debug" >> "$GITHUB_PATH" && chmod +x target/debug/mise
+      - name: Test e2e runner
+        run: python3 scripts/test-e2e-runner.py
+      # Tests run in ephemeral containers and do not need host mise tools.
+      # Four branches on a large runner; each handles two token-isolated
+      # tranches sequentially, capped at eight containers total.
+      - parallel:
+          - name: Test tranches 0 and 4
+            timeout-minutes: 60
+            env:
+              E2E_JOBS: 2
+              E2E_MAX_ATTEMPTS: 2
+              E2E_RETRY_WAIT_SECONDS: 30
+              MISE_E2E_DOCKER: "1"
+              TEST_ALL: ${{(github.head_ref == 'release' || github.ref == 'refs/heads/release') && '1' || '0'}}
+              TEST_TRANCHE_COUNT: 8
+              TRANCHE_A: 0
+              TRANCHE_B: 4
+              TOKEN_A: ${{ steps.tokens.outputs.token_0 || secrets.MISE_GH_TOKEN || secrets.GITHUB_TOKEN }}
+              TOKEN_B: ${{ steps.tokens.outputs.token_4 || secrets.MISE_GH_TOKEN || secrets.GITHUB_TOKEN }}
+            run: &e2e-run |
+              e2e_status=0
+              MISE_GITHUB_TOKEN="$TOKEN_A" GITHUB_TOKEN="$TOKEN_A" TEST_TRANCHE="$TRANCHE_A" ./e2e/run_all_tests || e2e_status=$?
+              MISE_GITHUB_TOKEN="$TOKEN_B" GITHUB_TOKEN="$TOKEN_B" TEST_TRANCHE="$TRANCHE_B" ./e2e/run_all_tests || e2e_status=$?
+              exit "$e2e_status"
+          - name: Test tranches 1 and 5
+            timeout-minutes: 60
+            env:
+              E2E_JOBS: 2
+              E2E_MAX_ATTEMPTS: 2
+              E2E_RETRY_WAIT_SECONDS: 30
+              MISE_E2E_DOCKER: "1"
+              TEST_ALL: ${{(github.head_ref == 'release' || github.ref == 'refs/heads/release') && '1' || '0'}}
+              TEST_TRANCHE_COUNT: 8
+              TRANCHE_A: 1
+              TRANCHE_B: 5
+              TOKEN_A: ${{ steps.tokens.outputs.token_1 || secrets.MISE_GH_TOKEN || secrets.GITHUB_TOKEN }}
+              TOKEN_B: ${{ steps.tokens.outputs.token_5 || secrets.MISE_GH_TOKEN || secrets.GITHUB_TOKEN }}
+            run: *e2e-run
+          - name: Test tranches 2 and 6
+            timeout-minutes: 60
+            env:
+              E2E_JOBS: 2
+              E2E_MAX_ATTEMPTS: 2
+              E2E_RETRY_WAIT_SECONDS: 30
+              MISE_E2E_DOCKER: "1"
+              TEST_ALL: ${{(github.head_ref == 'release' || github.ref == 'refs/heads/release') && '1' || '0'}}
+              TEST_TRANCHE_COUNT: 8
+              TRANCHE_A: 2
+              TRANCHE_B: 6
+              TOKEN_A: ${{ steps.tokens.outputs.token_2 || secrets.MISE_GH_TOKEN || secrets.GITHUB_TOKEN }}
+              TOKEN_B: ${{ steps.tokens.outputs.token_6 || secrets.MISE_GH_TOKEN || secrets.GITHUB_TOKEN }}
+            run: *e2e-run
+          - name: Test tranches 3 and 7
+            timeout-minutes: 60
+            env:
+              E2E_JOBS: 2
+              E2E_MAX_ATTEMPTS: 2
+              E2E_RETRY_WAIT_SECONDS: 30
+              MISE_E2E_DOCKER: "1"
+              TEST_ALL: ${{(github.head_ref == 'release' || github.ref == 'refs/heads/release') && '1' || '0'}}
+              TEST_TRANCHE_COUNT: 8
+              TRANCHE_A: 3
+              TRANCHE_B: 7
+              TOKEN_A: ${{ steps.tokens.outputs.token_3 || secrets.MISE_GH_TOKEN || secrets.GITHUB_TOKEN }}
+              TOKEN_B: ${{ steps.tokens.outputs.token_7 || secrets.MISE_GH_TOKEN || secrets.GITHUB_TOKEN }}
+            run: *e2e-run
+
+  bootstrap-linux-host:
+    permissions:
+      contents: read
+    runs-on: ${{ !inputs.trusted && 'ubuntu-latest' || 'namespace-profile-endev-linux-amd64;overrides.cache-tag=cache' }}
+    timeout-minutes: 20
+    needs: [build-ubuntu, classify-changes]
+    if: needs.classify-changes.outputs.full-ci == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mise-ubuntu-latest
+          path: target/debug
+      - run: chmod +x target/debug/mise
+      - name: Converge a complete Linux host over SSH
+        run: scripts/test-bootstrap-linux-host.sh target/debug/mise
+
+  windows-unit:
+    runs-on: ${{ inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true' && fromJSON('["self-hosted", "jdx-win-trusted-v1"]') || 'windows-latest' }}
+    timeout-minutes: 60
+    needs: [classify-changes]
+    if: needs.classify-changes.outputs.full-ci == 'true'
+    env:
+      MISE_DATA_DIR: ~/.local/share/mise
+      MISE_CACHE_DIR: ~/.cache/mise
+      # Runs on the self-hosted runner (repository variable WINDOWS_SELF_HOSTED=true, trusted runs
+      # only) use its shared mbx cache.
+      MBX_DISABLE: ${{ inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true' && '0' || '1' }}
+      MBX_TARGET_VIEWS: "0"
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C link-arg=/STACK:8000000 -C target-feature=+crt-static -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: ${{ !(inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true') }}
+        with:
+          shared-key: windows-unit
+          save-if: ${{ inputs.trusted && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v')) }}
+      - name: cargo test
+        uses: jdx/workflows/retry@7e4ea6cf326e2b3bb4335f733381af531aaa699d # v1.2.1
+        with:
+          timeout_minutes: 30
+          retry_wait_seconds: 30
+          max_attempts: 2
+          command: ${{ inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true' && 'mbx' || 'cargo' }} test
+      # Windows is where the members rot fastest: their tests assume POSIX paths and shells
+      # unless something runs them here.
+      - name: cargo test (workspace members)
+        run: ${{ inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true' && 'mbx' || 'cargo' }} test --workspace --exclude mise
+  # Not a duplicate of the Linux lint: `#[cfg]` decides whether code exists, so
+  # Windows-only code is never seen by Clippy on Linux. A job of its own keeps it
+  # off windows-unit's time limit. Default features only: `aws-lc-sys` needs NASM
+  # to build on Windows, and feature combinations are covered on Linux.
+  windows-lint:
+    runs-on: ${{ inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true' && fromJSON('["self-hosted", "jdx-win-trusted-v1"]') || 'windows-latest' }}
+    timeout-minutes: 40
+    env:
+      MBX_DISABLE: ${{ inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true' && '0' || '1' }}
+      MBX_TARGET_VIEWS: "0"
+    needs: [classify-changes]
+    if: needs.classify-changes.outputs.full-ci == 'true'
+    steps:
+      # Clippy builds the checked-out code and its build scripts, and nothing here needs git auth.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: ${{ !(inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true') }}
+        with:
+          shared-key: windows-lint
+          save-if: ${{ inputs.trusted && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release' || startsWith(github.ref, 'refs/tags/v')) }}
+      - run: rustup component add clippy
+      # Retried once like windows-unit: the self-hosted runner has failed this step
+      # about once in 120 runs with a transient "directory name is invalid" (os error 267).
+      # Two 17-minute attempts plus the wait fit inside the job's 40-minute limit.
+      - name: Run Clippy on Windows
+        uses: jdx/workflows/retry@7e4ea6cf326e2b3bb4335f733381af531aaa699d # v1.2.1
+        with:
+          timeout_minutes: 17
+          retry_wait_seconds: 30
+          max_attempts: 2
+          command: ${{ inputs.trusted && vars.WINDOWS_SELF_HOSTED == 'true' && 'mbx' || 'cargo' }} clippy --workspace --all-targets --ignore-rust-version -- -D warnings
+      # Read-only: records the state of the runner when both attempts failed.
+      - name: Print runner diagnostics
+        if: failure()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Write-Output "runner: $env:RUNNER_NAME"
+          Write-Output "cwd: $((Get-Location).Path)"
+          Write-Output "GITHUB_WORKSPACE: $env:GITHUB_WORKSPACE (exists: $(Test-Path -LiteralPath $env:GITHUB_WORKSPACE))"
+          Write-Output "--- workspace root"
+          Get-ChildItem -LiteralPath $env:GITHUB_WORKSPACE -Force | Format-Table Mode, LastWriteTime, Length, Name | Out-String | Write-Output
+          Write-Output "--- processes"
+          Get-Process -Name cargo, rustc, 'mbx*', cl, link -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, StartTime, Path | Out-String -Width 250 | Write-Output
+          Write-Output "--- disk"
+          $drive = (Split-Path -Qualifier $env:GITHUB_WORKSPACE).TrimEnd(':')
+          Get-PSDrive -Name $drive | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free / 1GB, 1)}}, @{n='UsedGB';e={[math]::Round($_.Used / 1GB, 1)}} | Out-String | Write-Output
+  windows-e2e:
+    permissions:
+      contents: read
+    # Stays on a hosted runner. The Pester suite exercises console windows, scheduled
+    # tasks and other interactive-desktop behavior that a runner running as a service
+    # cannot provide, and it is not compile-bound, so the self-hosted runner gains little.
+    runs-on: windows-latest
+    timeout-minutes: 100
+    needs: [build-windows, classify-changes]
+    if: needs.classify-changes.outputs.full-ci == 'true'
+    env:
+      MISE_DATA_DIR: ~/.local/share/mise
+      MISE_CACHE_DIR: ~/.cache/mise
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: mise-windows-latest
+          path: target/debug
+      - run: ls target\debug
+      - run: Add-Content $env:GITHUB_PATH "$env:GITHUB_WORKSPACE\target\debug"
+      - uses: ./.github/actions/mise-tools
+      - name: e2e
+        uses: jdx/workflows/retry@7e4ea6cf326e2b3bb4335f733381af531aaa699d # v1.2.1
+        with:
+          timeout_minutes: 30
+          retry_wait_seconds: 30
+          max_attempts: 2
+          shell: pwsh
+          command: pwsh e2e-win\run.ps1
+
+  test-ci:
+    permissions: {}
+    runs-on: ${{ !inputs.trusted && 'ubuntu-latest' || 'namespace-profile-endev-linux-amd64;overrides.cache-tag=cache' }}
+    timeout-minutes: 1
+    needs:
+      - classify-changes
+      - build-ubuntu
+      - build-windows
+      - unit
+      - lint
+      - e2e
+      - bootstrap-linux-host
+      - windows-unit
+      - windows-lint
+      - windows-e2e
+    # Evaluate skipped and failed dependencies, but do not waste a runner when
+    # the workflow is cancelled.
+    if: ${{ always() && !cancelled() }}
+    steps:
+      - name: Check CI job results
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          full_ci="${{ needs.classify-changes.outputs.full-ci }}"
+          if [ "${{ needs.build-ubuntu.result }}" != "success" ]; then
+            echo "build-ubuntu failed or was skipped"
+            exit 1
+          fi
+          if [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "lint failed or was skipped"
+            exit 1
+          fi
+
+          if [ "$full_ci" == "true" ]; then
+            if [ "${{ needs.build-windows.result }}" != "success" ]; then
+              echo "build-windows failed or was skipped"
+              exit 1
+            fi
+            if [ "${{ needs.unit.result }}" != "success" ]; then
+              echo "unit failed or was skipped"
+              exit 1
+            fi
+            if [ "${{ github.event_name }}" == "pull_request" ] && [ "$HEAD_REF" == "release" ] && [ "$BASE_REF" == "main" ]; then
+              if [ "${{ needs.e2e.result }}" != "skipped" ]; then
+                echo "e2e should be handled by the release workflow"
+                exit 1
+              fi
+            elif [ "${{ needs.e2e.result }}" != "success" ]; then
+              echo "e2e failed or was skipped"
+              exit 1
+            fi
+            if [ "${{ needs.bootstrap-linux-host.result }}" != "success" ]; then
+              echo "bootstrap-linux-host failed or was skipped"
+              exit 1
+            fi
+            if [ "${{ needs.windows-unit.result }}" != "success" ]; then
+              echo "windows-unit failed or was skipped"
+              exit 1
+            fi
+            if [ "${{ needs.windows-lint.result }}" != "success" ]; then
+              echo "windows-lint failed or was skipped"
+              exit 1
+            fi
+            if [ "${{ needs.windows-e2e.result }}" != "success" ]; then
+              echo "windows-e2e failed or was skipped"
+              exit 1
+            fi
+          else
+            for result in \
+              "${{ needs.build-windows.result }}" \
+              "${{ needs.unit.result }}" \
+              "${{ needs.e2e.result }}" \
+              "${{ needs.bootstrap-linux-host.result }}" \
+              "${{ needs.windows-unit.result }}" \
+              "${{ needs.windows-lint.result }}" \
+              "${{ needs.windows-e2e.result }}"; do
+              if [ "$result" != "skipped" ]; then
+                echo "docs-only jobs should be skipped"
+                exit 1
+              fi
+            done
+          fi
+          echo "All CI jobs completed successfully"

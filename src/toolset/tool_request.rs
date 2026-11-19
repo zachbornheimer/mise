@@ -1,0 +1,1743 @@
+use crate::config::SettingsExt;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::{
+    fmt::{Display, Formatter},
+    sync::Arc,
+};
+
+use eyre::{Result, bail, eyre};
+use xx::file;
+
+use crate::args::BackendArg;
+use crate::backend::backend_type::BackendType;
+use crate::backend::platform_target::PlatformTarget;
+use crate::config::config_file::config_root;
+use crate::dirs;
+use crate::env;
+use crate::lockfile::LockfileTool;
+use crate::path::PathExt;
+use crate::runtime_symlinks::is_runtime_symlink;
+use crate::toolset::tool_version::ResolveOptions;
+use crate::toolset::{
+    ResolvedToolOptions, ToolOptionSource, ToolSource, ToolVersion, ToolVersionOptions,
+};
+use crate::{backend, lockfile};
+use crate::{
+    backend::ABackend,
+    config::{Config, Settings},
+};
+
+/// Lockfile ownership is independent of the request's original provenance.
+#[derive(Debug, Default, Clone, Hash, PartialEq, Eq)]
+pub enum LockfileScope {
+    /// Preserve ordinary source-based reads, including merged reads for CLI requests.
+    #[default]
+    Default,
+    /// A runtime request borrows the effective configuration's lockfile.
+    Source(ToolSource),
+    /// An unconfigured runtime request must not adopt an unrelated pin.
+    NoOwner,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub enum ToolRequest {
+    Version {
+        backend: Arc<BackendArg>,
+        version: String,
+        options: ResolvedToolOptions,
+        source: ToolSource,
+        lockfile_scope: LockfileScope,
+    },
+    Prefix {
+        backend: Arc<BackendArg>,
+        prefix: String,
+        options: ResolvedToolOptions,
+        source: ToolSource,
+        lockfile_scope: LockfileScope,
+    },
+    Ref {
+        backend: Arc<BackendArg>,
+        ref_: String,
+        ref_type: String,
+        options: ResolvedToolOptions,
+        source: ToolSource,
+        lockfile_scope: LockfileScope,
+    },
+    Sub {
+        backend: Arc<BackendArg>,
+        sub: String,
+        orig_version: String,
+        options: ResolvedToolOptions,
+        source: ToolSource,
+        lockfile_scope: LockfileScope,
+    },
+    Path {
+        backend: Arc<BackendArg>,
+        path: PathBuf,
+        options: ResolvedToolOptions,
+        source: ToolSource,
+        lockfile_scope: LockfileScope,
+    },
+    System {
+        backend: Arc<BackendArg>,
+        source: ToolSource,
+        lockfile_scope: LockfileScope,
+        options: ResolvedToolOptions,
+    },
+}
+
+impl ToolRequest {
+    pub fn new(backend: Arc<BackendArg>, s: &str, source: ToolSource) -> eyre::Result<Self> {
+        Self::new_with_options(backend, s, ToolVersionOptions::default(), source)
+    }
+
+    pub fn new_with_options(
+        backend: Arc<BackendArg>,
+        s: &str,
+        request_options: ToolVersionOptions,
+        source: ToolSource,
+    ) -> eyre::Result<Self> {
+        let s = match s.split_once('-') {
+            Some((ref_type @ ("ref" | "tag" | "branch" | "rev"), r)) => format!("{ref_type}:{r}"),
+            _ => s.to_string(),
+        };
+        if crate::semver::is_npm_semver_range_query(&s)
+            && !source.is_unknown()
+            && !matches!(
+                &source,
+                ToolSource::IdiomaticVersionFile(path)
+                    if crate::config::config_file::idiomatic_version::package_json::is_package_json(path)
+            )
+        {
+            let source_display = match &source {
+                ToolSource::Argument => "command argument".to_string(),
+                _ => source.to_string(),
+            };
+            warn_once!(
+                "semver range \"{s}\" is not supported for {} (source: {source_display}); use a concrete version or version prefix",
+                backend.short
+            );
+        }
+        let backend = backend
+            .with_registry_version(&s)
+            .map(Arc::new)
+            .unwrap_or(backend);
+        let options = backend.resolve_opts_with_config_and_request(None, Some(request_options));
+        Ok(match s.split_once(':') {
+            Some((ref_type @ ("ref" | "tag" | "branch" | "rev"), r)) => {
+                validate_ref_string(r)?;
+                Self::Ref {
+                    ref_: r.to_string(),
+                    ref_type: ref_type.to_string(),
+                    options,
+                    backend,
+                    source,
+                    lockfile_scope: LockfileScope::Default,
+                }
+            }
+            Some(("prefix", p)) => {
+                validate_version_string(p)?;
+                Self::Prefix {
+                    prefix: p.to_string(),
+                    options,
+                    backend,
+                    source,
+                    lockfile_scope: LockfileScope::Default,
+                }
+            }
+            Some(("path", p)) => {
+                let p = windows_path_separators(p);
+                validate_path_string(&p)?;
+                let path = resolve_path(&p, &source);
+                Self::Path {
+                    path,
+                    options,
+                    backend,
+                    source,
+                    lockfile_scope: LockfileScope::Default,
+                }
+            }
+            Some((p, v)) if p.starts_with("sub-") => {
+                let sub = p.split_once('-').unwrap().1;
+                validate_version_string(sub)?;
+                validate_version_string(v)?;
+                Self::Sub {
+                    sub: sub.to_string(),
+                    options,
+                    orig_version: v.to_string(),
+                    backend,
+                    source,
+                    lockfile_scope: LockfileScope::Default,
+                }
+            }
+            None => {
+                if s == "system" {
+                    Self::System {
+                        options,
+                        backend,
+                        source,
+                        lockfile_scope: LockfileScope::Default,
+                    }
+                } else {
+                    validate_version_string(&s)?;
+                    Self::Version {
+                        version: s,
+                        options,
+                        backend,
+                        source,
+                        lockfile_scope: LockfileScope::Default,
+                    }
+                }
+            }
+            _ => bail!("invalid tool version request: {s}"),
+        })
+    }
+
+    /// Construct an unvalidated version request for tests that exercise paths
+    /// derived from otherwise-invalid version strings.
+    #[cfg(test)]
+    pub(crate) fn new_version_for_test(
+        backend: Arc<BackendArg>,
+        version: &str,
+        source: ToolSource,
+    ) -> Self {
+        let options = backend.resolve_opts_with_config_and_request(None, None);
+        Self::Version {
+            backend,
+            version: version.to_string(),
+            options,
+            source,
+            lockfile_scope: LockfileScope::Default,
+        }
+    }
+
+    pub fn set_source(&mut self, source: ToolSource) -> Self {
+        match self {
+            Self::Version { source: s, .. }
+            | Self::Prefix { source: s, .. }
+            | Self::Ref { source: s, .. }
+            | Self::Path { source: s, .. }
+            | Self::Sub { source: s, .. }
+            | Self::System { source: s, .. } => *s = source,
+        }
+        self.set_lockfile_scope(LockfileScope::Default);
+        self.clone()
+    }
+    pub fn ba(&self) -> &Arc<BackendArg> {
+        match self {
+            Self::Version { backend, .. }
+            | Self::Prefix { backend, .. }
+            | Self::Ref { backend, .. }
+            | Self::Path { backend, .. }
+            | Self::Sub { backend, .. }
+            | Self::System { backend, .. } => backend,
+        }
+    }
+    pub fn backend(&self) -> Result<ABackend> {
+        self.ba().backend()
+    }
+    /// Reapply registry defaults after an alias, prefix, or subtraction resolves
+    /// across a backend boundary. Retain every non-registry option's provenance.
+    pub(super) fn with_registry_version(self, version: &str) -> Self {
+        let Some(backend) = self.ba().with_registry_version(version) else {
+            return self;
+        };
+        self.with_backend(backend)
+    }
+
+    /// This request installed by `backend`, with the registry's defaults for
+    /// that backend in place of those of its current one. Every other option
+    /// keeps its provenance.
+    pub fn with_backend(mut self, backend: BackendArg) -> Self {
+        let mut options = ResolvedToolOptions::default();
+        options.apply_registry(&backend.registry_opts(), &backend.full_without_opts());
+        self.resolved_options()
+            .extend_without_registry(&mut options);
+        *self.resolved_options_mut() = options;
+        match &mut self {
+            Self::Version { backend: b, .. }
+            | Self::Prefix { backend: b, .. }
+            | Self::Ref { backend: b, .. }
+            | Self::Sub { backend: b, .. }
+            | Self::Path { backend: b, .. }
+            | Self::System { backend: b, .. } => *b = Arc::new(backend),
+        }
+        self
+    }
+
+    pub fn source(&self) -> &ToolSource {
+        match self {
+            Self::Version { source, .. }
+            | Self::Prefix { source, .. }
+            | Self::Ref { source, .. }
+            | Self::Path { source, .. }
+            | Self::Sub { source, .. }
+            | Self::System { source, .. } => source,
+        }
+    }
+    pub fn lockfile_scope(&self) -> &LockfileScope {
+        match self {
+            Self::Version { lockfile_scope, .. }
+            | Self::Prefix { lockfile_scope, .. }
+            | Self::Ref { lockfile_scope, .. }
+            | Self::Path { lockfile_scope, .. }
+            | Self::Sub { lockfile_scope, .. }
+            | Self::System { lockfile_scope, .. } => lockfile_scope,
+        }
+    }
+
+    /// The source whose lockfile this request reads: the one it borrows, else its own.
+    pub fn lockfile_owner_source(&self) -> &ToolSource {
+        match self.lockfile_scope() {
+            LockfileScope::Source(source) => source,
+            _ => self.source(),
+        }
+    }
+
+    pub fn set_lockfile_scope(&mut self, scope: LockfileScope) {
+        match self {
+            Self::Version { lockfile_scope, .. }
+            | Self::Prefix { lockfile_scope, .. }
+            | Self::Ref { lockfile_scope, .. }
+            | Self::Path { lockfile_scope, .. }
+            | Self::Sub { lockfile_scope, .. }
+            | Self::System { lockfile_scope, .. } => *lockfile_scope = scope,
+        }
+    }
+
+    pub(crate) fn lockfile_source(&self) -> Option<&ToolSource> {
+        match self.lockfile_scope() {
+            LockfileScope::Default => Some(self.source()),
+            LockfileScope::Source(source) => Some(source),
+            LockfileScope::NoOwner => None,
+        }
+    }
+
+    /// Read dependency tables from the same owner as the runtime pin.
+    pub(crate) fn read_lockfile(&self, config: &Config) -> Result<lockfile::Lockfile> {
+        match self.lockfile_source() {
+            Some(source) => lockfile::read_lockfile_for_tool_source(config, source),
+            None => Ok(lockfile::Lockfile::default()),
+        }
+    }
+
+    pub fn tool_config_locked(&self, config: &Config, use_locked_version: bool) -> bool {
+        // A lockfile bypass must not inherit an additional owner's policy.
+        // Invocation-wide locked policy still uses the original source separately.
+        let source = if use_locked_version {
+            self.lockfile_source().unwrap_or(self.source())
+        } else {
+            self.source()
+        };
+        config.tool_config_locked(source)
+    }
+
+    pub fn os(&self) -> &Option<Vec<String>> {
+        &self.resolved_options().effective().os
+    }
+    pub fn set_options(&mut self, options: ToolVersionOptions) -> &mut Self {
+        let resolved = self
+            .ba()
+            .resolve_opts_with_config_and_request(None, Some(options));
+        *self.resolved_options_mut() = resolved;
+        self
+    }
+
+    /// The effective options, to rewrite a value without changing where it came from.
+    pub(crate) fn options_mut(&mut self) -> &mut ToolVersionOptions {
+        self.resolved_options_mut().effective_mut()
+    }
+
+    fn resolved_options_mut(&mut self) -> &mut ResolvedToolOptions {
+        match self {
+            Self::Version { options: o, .. }
+            | Self::Prefix { options: o, .. }
+            | Self::Ref { options: o, .. }
+            | Self::Sub { options: o, .. }
+            | Self::Path { options: o, .. }
+            | Self::System { options: o, .. } => o,
+        }
+    }
+    /// Whether the version this request resolves to names its install directory as written
+    /// (`Ref`, `Path` and `System` derive the name from the request instead).
+    pub(crate) fn uses_resolved_version_as_pathname(&self) -> bool {
+        matches!(
+            self,
+            Self::Version { .. } | Self::Prefix { .. } | Self::Sub { .. }
+        )
+    }
+    pub fn version(&self) -> String {
+        match self {
+            Self::Version { version: v, .. } => v.clone(),
+            Self::Prefix { prefix: p, .. } => format!("prefix:{p}"),
+            Self::Ref {
+                ref_: r, ref_type, ..
+            } => format!("{ref_type}:{r}"),
+            Self::Path { path: p, .. } => format!("path:{}", p.display_user()),
+            Self::Sub {
+                sub, orig_version, ..
+            } => format!("sub-{sub}:{orig_version}"),
+            Self::System { .. } => "system".to_string(),
+        }
+    }
+
+    pub fn options(&self) -> ToolVersionOptions {
+        self.resolved_options().effective().clone()
+    }
+
+    /// Whether this request's `lazy = true` may claim command names: bootstrap shims, the
+    /// shim farms on PATH, and an install when one of those commands runs. Like `[wrappers]`,
+    /// that hands commands such as `git` to whatever the config names, so safe mode honours it
+    /// only in an entry of global or system config (or a CLI argument), and only when that
+    /// entry sets the options itself rather than a project's tool alias or the project entry
+    /// a runtime argument inherits. The tool stays out of automatic installs either way.
+    pub(crate) fn provides_lazy_bins(&self) -> bool {
+        if self.resolved_options().effective().lazy != Some(true) {
+            return false;
+        }
+        if !Settings::safe_mode() {
+            return true;
+        }
+        let set_by_entry = |key| {
+            matches!(
+                self.option_source(key),
+                None | Some(ToolOptionSource::Request | ToolOptionSource::InlineBackendArg)
+            )
+        };
+        self.source()
+            .path()
+            .is_none_or(crate::config::is_global_config)
+            && set_by_entry("lazy")
+            && set_by_entry("lazy_bins")
+    }
+
+    /// Command names that should receive bootstrap shims before a lazy tool is installed.
+    /// Registry metadata is authoritative when the config does not provide an explicit list.
+    pub fn lazy_bins(&self) -> Result<Option<Vec<String>>> {
+        if !self.provides_lazy_bins() {
+            return Ok(None);
+        }
+        let options = self.resolved_options().effective();
+        if !options.lazy_bins.is_empty() {
+            return Ok(Some(options.lazy_bins.clone()));
+        }
+        if let Some(tool) = self.ba().registry_tool()
+            && !tool.bins.is_empty()
+        {
+            return Ok(Some(
+                tool.bins.iter().map(|bin| (*bin).to_string()).collect(),
+            ));
+        }
+        bail!(
+            "lazy tool {} has no registry bin metadata; set lazy_bins explicitly",
+            self.ba().short
+        )
+    }
+
+    /// Whether running one of this lazy request's commands installs it: the
+    /// declaration provides commands, and `shims.exclude` leaves at least one of
+    /// them a bootstrap shim.
+    pub fn installs_on_first_use(&self) -> bool {
+        matches!(self.lazy_bins(), Ok(Some(bins)) if crate::shims::lazy_bins_keep_a_shim(&bins))
+    }
+
+    /// Whether the registry options this request carries were supplied by a
+    /// backend other than `recorded`, which a lock entry names. A request that
+    /// carries none has nothing to differ.
+    pub(crate) fn registry_options_are_not_for(&self, recorded: &str) -> bool {
+        let name = |full: &str| {
+            crate::args::split_bracketed_opts(full)
+                .map_or(full, |(name, _)| name)
+                .to_string()
+        };
+        self.resolved_options()
+            .registry_backend()
+            .is_some_and(|supplier| name(supplier) != name(recorded))
+    }
+
+    /// This request without the registry's defaults, for a lock entry bound to
+    /// another backend than the one the registry chose: those defaults belong
+    /// to the registry's backend, which may read them as its own settings.
+    pub fn without_registry_options(&self) -> Self {
+        let mut request = self.clone();
+        let mut options = ResolvedToolOptions::default();
+        self.resolved_options()
+            .extend_without_registry(&mut options);
+        *request.resolved_options_mut() = options;
+        request
+    }
+
+    pub(crate) fn explicit_options(&self) -> ToolVersionOptions {
+        self.resolved_options().options_from_sources(&[
+            ToolOptionSource::Request,
+            ToolOptionSource::InlineBackendArg,
+        ])
+    }
+
+    fn resolved_options(&self) -> &ResolvedToolOptions {
+        match self {
+            Self::Version { options: o, .. }
+            | Self::Prefix { options: o, .. }
+            | Self::Ref { options: o, .. }
+            | Self::Sub { options: o, .. }
+            | Self::Path { options: o, .. }
+            | Self::System { options: o, .. } => o,
+        }
+    }
+
+    /// Apply matching configuration through the canonical option precedence chain.
+    ///
+    /// Request provenance is retained internally, so an explicit value that
+    /// equals a backend default still overrides configuration.
+    pub(super) fn apply_config_options(&mut self, config_options: ToolVersionOptions) -> &mut Self {
+        let request_options = self
+            .resolved_options()
+            .options_from_sources(&[ToolOptionSource::Request]);
+        let resolved = self
+            .ba()
+            .resolve_opts_with_config_and_request(Some(config_options), Some(request_options));
+        *self.resolved_options_mut() = resolved;
+        self
+    }
+
+    pub(super) fn to_ref(&self, ref_: String, ref_type: String) -> Self {
+        Self::Ref {
+            backend: self.ba().clone(),
+            ref_,
+            ref_type,
+            options: self.resolved_options().clone(),
+            source: self.source().clone(),
+            lockfile_scope: self.lockfile_scope().clone(),
+        }
+    }
+
+    pub(crate) fn to_path(&self, path: PathBuf) -> Self {
+        Self::Path {
+            backend: self.ba().clone(),
+            path,
+            options: self.resolved_options().clone(),
+            source: self.source().clone(),
+            lockfile_scope: self.lockfile_scope().clone(),
+        }
+    }
+
+    /// Where the effective value of an option came from.
+    pub(crate) fn option_source(&self, key: &str) -> Option<ToolOptionSource> {
+        self.resolved_options().source_for_key(key)
+    }
+
+    /// Whether safe mode ignores this request. A `path:` version needs no install, so one
+    /// from project config would put a directory the project names on PATH, which is why
+    /// safe mode ignores the project's `_.path` too. Global config is the operator's, and a
+    /// tool stub or CLI argument is run by the user.
+    pub(crate) fn ignored_in_safe_mode(&self) -> bool {
+        matches!(self, Self::Path { .. })
+            && Settings::safe_mode()
+            && match self.source() {
+                ToolSource::MiseToml(path)
+                | ToolSource::MiseTomlDaemon(path)
+                | ToolSource::ToolVersions(path)
+                | ToolSource::IdiomaticVersionFile(path) => !crate::config::is_global_config(path),
+                _ => false,
+            }
+    }
+
+    /// In safe mode, records the hosts this request's options name; see
+    /// [`record_safe_mode_credential_hosts`].
+    pub(crate) fn record_safe_mode_credential_hosts(&self) {
+        if !Settings::safe_mode() {
+            return;
+        }
+        let Some(path) = self.source().path() else {
+            return;
+        };
+        let project = !crate::config::is_global_config(path);
+        record_safe_mode_credential_hosts(&self.options().opts, project);
+    }
+
+    /// Rejects install options that can execute configuration-provided code in safe mode.
+    pub(crate) fn ensure_safe_install_options(&self) -> Result<()> {
+        if !Settings::safe_mode() {
+            return Ok(());
+        }
+        let options = self.options();
+        if options.postinstall().is_some() {
+            Settings::ensure_not_safe(&format!(
+                "running tool-level postinstall hooks for {}",
+                self.ba().short
+            ))?;
+        }
+        if !options.core.install_env.is_empty() {
+            Settings::ensure_not_safe(&format!(
+                "using tool-level install_env for {}",
+                self.ba().short
+            ))?;
+        }
+        // spm runs this shell command in place of `swift build`.
+        if self.ba().backend_type() == BackendType::Spm
+            && options.opts.contains_key("install_command")
+        {
+            Settings::ensure_not_safe(&format!(
+                "running tool-level install_command for {}",
+                self.ba().short
+            ))?;
+        }
+        Ok(())
+    }
+
+    pub async fn is_install_satisfied(&self, config: &Arc<Config>) -> bool {
+        if let Some(backend) = backend::get(self.ba()) {
+            match self.resolve(config, &Default::default()).await {
+                Ok(tv) if tv.uv_lock.is_some() || tv.aube_lock.is_some() => {
+                    if self.tool_config_locked(config, true) {
+                        return false;
+                    }
+                    let satisfied = backend
+                        .is_install_satisfied(config, &tv, false)
+                        .await
+                        .unwrap_or(false);
+                    if satisfied {
+                        if let Some(graph) = &tv.uv_lock {
+                            graph.warn_if_missing();
+                        }
+                        if let Some(graph) = &tv.aube_lock {
+                            graph.warn_if_missing();
+                        }
+                    }
+                    satisfied
+                }
+                Ok(tv) => match backend.is_install_satisfied(config, &tv, false).await {
+                    Ok(satisfied) => satisfied,
+                    Err(e) => {
+                        debug!("ToolRequest.is_install_satisfied: {e:#}");
+                        false
+                    }
+                },
+                Err(e) => {
+                    debug!("ToolRequest.is_install_satisfied: {e:#}");
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+
+    /// An already-installed request is being used: let the install layout record
+    /// it. A request a lockfile pins is resolved from the lockfile for this, because
+    /// that pin is what a later refresh must not overwrite.
+    pub async fn note_layout_use(&self, config: &Arc<Config>) {
+        if !crate::install_layout::resolver::enabled() {
+            return;
+        }
+        let Ok(tv) = self.resolve(config, &ResolveOptions::default()).await else {
+            return;
+        };
+        let opts = ResolveOptions {
+            use_locked_version: true,
+            offline: true,
+            ..Default::default()
+        };
+        let locked = self
+            .resolve(config, &opts)
+            .await
+            .ok()
+            .filter(|locked| locked.resolved_from_lockfile());
+        crate::install_layout::resolver::note_satisfied(locked.as_ref().unwrap_or(&tv));
+    }
+
+    pub(crate) fn install_path(&self, config: &Config) -> Option<PathBuf> {
+        match self {
+            Self::Version {
+                backend, version, ..
+            } => {
+                // Joined as written, so only a relative path that stays below the installs dir
+                // (`1.2.3`, `lts/hydrogen`) names an install; `/` would name the filesystem root.
+                if !crate::file::is_safe_relative_path(version) {
+                    return None;
+                }
+                let path = backend.installs_path().join(version);
+                Some(env::find_in_shared_installs(
+                    path,
+                    &backend.tool_dir_name(),
+                    version,
+                ))
+            }
+            Self::Ref {
+                backend,
+                ref_,
+                ref_type,
+                ..
+            } => {
+                let pathname = format!("{ref_type}-{ref_}");
+                let path = backend.installs_path().join(&pathname);
+                Some(env::find_in_shared_installs(
+                    path,
+                    &backend.tool_dir_name(),
+                    &pathname,
+                ))
+            }
+            Self::Sub {
+                backend,
+                sub,
+                orig_version,
+                ..
+            } => self
+                .local_resolve(config, orig_version)
+                .inspect_err(|e| warn!("ToolRequest.local_resolve: {e:#}"))
+                .unwrap_or_default()
+                .and_then(|v| {
+                    // A version that cannot be subtracted from has no install path to look
+                    // for, which is the same answer as "nothing installed matches".
+                    let pathname = version_sub(&v, sub.as_str())
+                        .inspect_err(|e| warn!("ToolRequest.version_sub: {e:#}"))
+                        .ok()?;
+                    let path = backend.installs_path().join(&pathname);
+                    Some(env::find_in_shared_installs(
+                        path,
+                        &backend.tool_dir_name(),
+                        &pathname,
+                    ))
+                }),
+            Self::Prefix {
+                backend, prefix, ..
+            } => {
+                // Check primary install path first
+                let found = match file::ls(backend.installs_path()) {
+                    Ok(installs) => installs
+                        .iter()
+                        .find(|p| {
+                            !is_runtime_symlink(p)
+                                && p.file_name().unwrap().to_string_lossy().starts_with(prefix)
+                        })
+                        .cloned(),
+                    Err(_) => None,
+                };
+                // Fall back to shared install directories
+                found.or_else(|| {
+                    let tool_dir_name = backend.tool_dir_name();
+                    for shared_dir in env::shared_install_dirs().iter() {
+                        let shared_tool_dir = shared_dir.join(&tool_dir_name);
+                        if let Ok(installs) = file::ls(&shared_tool_dir)
+                            && let Some(p) = installs.iter().find(|p| {
+                                !is_runtime_symlink(p)
+                                    && p.file_name().unwrap().to_string_lossy().starts_with(prefix)
+                            })
+                        {
+                            return Some(p.clone());
+                        }
+                    }
+                    None
+                })
+            }
+            Self::Path { path, .. } => Some(path.clone()),
+            Self::System { .. } => None,
+        }
+    }
+
+    pub(crate) fn lockfile_resolve(&self, config: &Config) -> Result<Option<LockfileTool>> {
+        let (query, prefix_boundary) = self.lockfile_version_query();
+        self.lockfile_resolve_with_prefix(config, &query, prefix_boundary, false)
+    }
+
+    /// The string used to match this request against lockfile entries, plus
+    /// whether the match must respect version-separator boundaries.
+    ///
+    /// Lockfiles store resolved concrete versions (e.g. `0.8.1`), so a
+    /// `prefix:` request must match on the bare prefix — the scheme-qualified
+    /// request string (`prefix:0.8`) can never starts-with-match a stored
+    /// version, which made the lockfile a no-op for `prefix:` requests (#5781).
+    /// The boundary flag mirrors prefix resolution's own separator-boundary
+    /// matching, so a stale `10.0.0` entry cannot satisfy `prefix:1`.
+    /// `ref:`/`path:`/`system` requests keep using `version()` because their
+    /// lockfile entries store that string verbatim, and `sub-` requests get
+    /// their lockfile check in `resolve_version` after the subtraction is
+    /// computed.
+    fn lockfile_version_query(&self) -> (String, bool) {
+        match self {
+            Self::Prefix { prefix, .. } => (prefix.clone(), true),
+            _ => (self.version(), false),
+        }
+    }
+
+    /// Like lockfile_resolve but uses a custom prefix instead of self.version().
+    /// This is used after alias resolution (e.g., "lts" → "24") so the lockfile
+    /// prefix match can find entries like "24.13.0".starts_with("24").
+    /// `require_prefix_boundary` additionally restricts matches to version-
+    /// separator boundaries (used for `prefix:` selectors).
+    /// `alias_resolved` says `prefix` is what an alias in the request means
+    /// today, which may no longer be what the lockfile recorded.
+    pub(crate) fn lockfile_resolve_with_prefix(
+        &self,
+        config: &Config,
+        prefix: &str,
+        require_prefix_boundary: bool,
+        alias_resolved: bool,
+    ) -> Result<Option<LockfileTool>> {
+        self.lockfile_resolve_for_target(
+            config,
+            prefix,
+            require_prefix_boundary,
+            alias_resolved,
+            &PlatformTarget::from_current(),
+        )
+    }
+
+    /// Like [`Self::lockfile_resolve_with_prefix`], selecting the entry by the
+    /// lock options of `target` rather than of the current platform, as a
+    /// locked install there would.
+    pub(crate) fn lockfile_resolve_for_target(
+        &self,
+        config: &Config,
+        prefix: &str,
+        require_prefix_boundary: bool,
+        alias_resolved: bool,
+        target: &PlatformTarget,
+    ) -> Result<Option<LockfileTool>> {
+        let backend = self.backend().ok();
+        let (request_options, legacy_options_fallback) = if let Some(backend) = &backend {
+            (
+                backend.lockfile_options(self, target)?,
+                backend.lockfile_options_are_host_specific(),
+            )
+        } else {
+            (BTreeMap::new(), false)
+        };
+        lockfile::get_locked_version(
+            config,
+            lockfile::LockedVersionQuery {
+                request: self,
+                short: &self.ba().short,
+                specifier: &self.version(),
+                prefix,
+                require_prefix_boundary,
+                alias_resolved,
+                request_options: &request_options,
+                legacy_options_fallback,
+                backend: backend.as_deref(),
+                selection_options: &self.options(),
+                target,
+            },
+        )
+    }
+
+    pub(crate) fn local_resolve(&self, config: &Config, v: &str) -> eyre::Result<Option<String>> {
+        if let Some(lt) = self.lockfile_resolve(config)? {
+            return Ok(Some(lt.version));
+        }
+        if let Some(backend) = backend::get(self.ba()) {
+            let matches = backend.list_installed_versions_matching(v);
+            if matches.iter().any(|m| m == v) {
+                return Ok(Some(v.to_string()));
+            }
+            if let Some(v) = matches.last() {
+                return Ok(Some(v.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn resolve(
+        &self,
+        config: &Arc<Config>,
+        opts: &ResolveOptions,
+    ) -> Result<ToolVersion> {
+        ToolVersion::resolve(config, self.clone(), opts).await
+    }
+
+    pub fn resolve_options(&self, opts: &ResolveOptions) -> Result<ResolveOptions> {
+        let minimum_release_age = self.options().minimum_release_age().map(str::to_string);
+        let mut opts = opts.clone();
+        opts.apply_before_date_for_tool(self.ba(), minimum_release_age.as_deref())?;
+        Ok(opts)
+    }
+
+    /// Whether the tool's `os` option allows `platform`, for platforms other
+    /// than the current one (such as `mise lock` targets).
+    pub fn is_os_supported_on(&self, platform: &crate::platform::Platform) -> bool {
+        self.os().as_ref().is_none_or(|os_list| {
+            os_list.iter().any(|entry| {
+                crate::platform::os_selector_matches_target(entry, &platform.os, &platform.arch)
+            })
+        })
+    }
+
+    pub fn is_os_supported(&self) -> bool {
+        if let Some(os_list) = self.os() {
+            let matched = os_list
+                .iter()
+                .any(|entry| crate::platform::os_selector_matches(entry));
+            if !matched {
+                return false;
+            }
+        }
+        self.ba().is_os_supported()
+    }
+}
+
+/// Reject version strings that contain shell-quote-breaking characters,
+/// control characters, or path-traversal sequences. Version strings flow into
+/// install path names and (for vfox plugins) into `ctx.version` / `ctx.rootPath`
+/// values that downstream Lua hooks often interpolate into shell commands.
+///
+/// The deny list is the minimum set of characters that can break out of either
+/// a single- or double-quoted shell string, or that trigger expansion *inside*
+/// double quotes: quotes themselves, backslash, backtick, and `$`. Plus control
+/// characters (newlines split shell tokens) and `..` (filesystem traversal).
+/// Everything else is allowed so legitimate version vocabulary (npm-style
+/// semver ranges like `>=20 <21 || >=22` or `^1.0.0`, dates, channel names,
+/// `lts/hydrogen`, etc.) continues to work — those characters are only
+/// dangerous in *unquoted* shell context, which cannot occur without one of
+/// the rejected expansion characters appearing first. Leading dashes are also
+/// rejected so backend install tools cannot mistake a version for a CLI flag.
+fn validate_version_string(s: &str) -> Result<()> {
+    if s.is_empty() {
+        return Ok(());
+    }
+    if s.starts_with('-') {
+        bail!("invalid tool version {s:?}: must not start with '-'");
+    }
+    // `ToolRequest::install_path` joins the version onto the installs dir, where an absolute one
+    // would replace it.
+    if s.starts_with('/') {
+        bail!("invalid tool version {s:?}: must not start with '/'");
+    }
+    if contains_dot_dot(s) {
+        bail!("invalid tool version {s:?}: contains path-traversal sequence");
+    }
+    if let Some(c) = s.chars().find(|c| is_forbidden_version_char(*c)) {
+        bail!("invalid tool version {s:?}: contains forbidden character {c:?}");
+    }
+    Ok(())
+}
+
+/// Whether `s` holds `..`, spelled out or percent-encoded. Versions and refs are formatted into
+/// download URLs, and URL parsing resolves `%2e%2e` (in any case, or mixed with a plain `.`) like a
+/// `..` segment.
+fn contains_dot_dot(s: &str) -> bool {
+    s.contains("..") || s.to_ascii_lowercase().replace("%2e", ".").contains("..")
+}
+
+/// Validate the version a `Version`, `Prefix` or `Sub` request resolved to.
+///
+/// [`ToolRequest::new`] only sees what was requested; the concrete version can come from a remote
+/// version list, a release tag or `mise.lock`, and it names the install, download and cache
+/// directories as written. So on top of the request rules it may not be empty or `.`, both of
+/// which name the directory that holds every version of the tool.
+pub(crate) fn validate_resolved_version(s: &str) -> Result<()> {
+    if s.is_empty() || s == "." {
+        bail!("invalid tool version {s:?}: not usable as a directory name");
+    }
+    validate_version_string(s)
+}
+
+/// Validate a concrete version that is about to be installed.
+///
+/// A request has to allow whitespace and `; & | < > ( )` because it may be a range
+/// (`>=20 <21 || >=22`). A version that gets installed never holds them, nor URL syntax
+/// (`% # ?`), and plugin hooks put the install path into shell commands and the version into
+/// download URLs. A range that never resolved fails here instead of inside a plugin.
+pub(crate) fn validate_installable_version(s: &str) -> Result<()> {
+    validate_resolved_version(s)?;
+    if let Some(c) = s.chars().find(|c| {
+        c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')' | '%' | '#' | '?')
+    }) {
+        bail!("invalid tool version {s:?}: contains forbidden character {c:?}");
+    }
+    Ok(())
+}
+
+/// Validate `ref:`/`branch:`/`tag:`/`rev:` values. Same character rules as
+/// version strings: branch/tag names already use the same broad vocabulary
+/// (`/`, `+`, `-`, etc.), so only shell-quote-breaking characters and leading
+/// dashes need rejection. Kept as a separate function for distinct error
+/// messages.
+fn validate_ref_string(s: &str) -> Result<()> {
+    if s.is_empty() {
+        return Ok(());
+    }
+    if s.starts_with('-') {
+        bail!("invalid tool ref {s:?}: must not start with '-'");
+    }
+    if contains_dot_dot(s) {
+        bail!("invalid tool ref {s:?}: contains path-traversal sequence");
+    }
+    if let Some(c) = s.chars().find(|c| is_forbidden_version_char(*c)) {
+        bail!("invalid tool ref {s:?}: contains forbidden character {c:?}");
+    }
+    Ok(())
+}
+
+/// Validate `path:` values. Filesystem paths legitimately contain `/`, spaces,
+/// and many other characters, but the resolved path becomes `ctx.rootPath` /
+/// `installPath` for path-mode tools and is interpolated into shell commands
+/// by some plugin hooks. Reject the same shell-quote-breaking characters as
+/// version strings — `$`, backtick, quotes, and `\` — so a hostile `path:`
+/// entry in a project config cannot inject shell syntax. Path traversal is
+/// intentionally not rejected here because `path:../tools/foo` is a normal
+/// relative-path use case.
+///
+/// The list is written for a POSIX shell, which is why `\` is on it. On Windows `\` is a path
+/// separator instead, so it is rewritten by [`windows_path_separators`] before it gets here rather
+/// than being allowed through — see that function. The shell those hooks run through there is
+/// `cmd.exe`, whose metacharacters are a different set, so a few more are rejected on Windows —
+/// see [`is_forbidden_path_char`].
+fn validate_path_string(s: &str) -> Result<()> {
+    if s.is_empty() {
+        return Ok(());
+    }
+    if let Some(c) = s.chars().find(|c| {
+        // Allow newlines/tabs/etc. in paths is still bad — keep control-char
+        // and quote/expansion rejection, but allow `/` since paths need it.
+        is_forbidden_path_char(*c)
+    }) {
+        // The only `\` that survives the rewrite is an extended-length or device prefix, so say
+        // what is actually wrong instead of naming a character the user cannot avoid.
+        #[cfg(windows)]
+        if c == '\\' {
+            bail!(
+                "invalid tool path {s:?}: extended-length and device paths (\\\\?\\, \\\\.\\) are not supported"
+            );
+        }
+        bail!("invalid tool path {s:?}: contains forbidden character {c:?}");
+    }
+    Ok(())
+}
+
+/// Rewrite `\` to `/` in a `path:` value on Windows.
+///
+/// `\` is the path separator there, not a shell metacharacter, so [`validate_path_string`] used to
+/// reject every native path — anything copied out of Explorer or printed by `pwd`. Win32 accepts
+/// `/` wherever it accepts `\`, so rewriting is what makes those usable *without* letting a `\`
+/// reach a vfox hook's `ctx.rootPath`, which is the thing the list exists to prevent (#9814). The
+/// alternative — dropping `\` from the list on Windows — would have weakened that.
+///
+/// Extended-length and device prefixes (`\\?\`, `\\.\`) are left alone. Those are the one place
+/// Windows does not accept `/`, so rewriting would hand back a path that looks right and does not
+/// resolve; they keep being rejected, as they are today.
+#[cfg(windows)]
+fn windows_path_separators(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.starts_with(r"\\?\") || s.starts_with(r"\\.\") {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    if s.contains('\\') {
+        std::borrow::Cow::Owned(s.replace('\\', "/"))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+/// No-op off Windows: `\` is a legal character in a unix filename, so rewriting it would change
+/// which file is meant, and there it really is a shell escape — it stays rejected.
+#[cfg(not(windows))]
+fn windows_path_separators(s: &str) -> std::borrow::Cow<'_, str> {
+    std::borrow::Cow::Borrowed(s)
+}
+
+fn is_forbidden_version_char(c: char) -> bool {
+    if (c as u32) < 0x20 || c == '\x7f' {
+        return true;
+    }
+    matches!(c, '"' | '\'' | '`' | '\\' | '$')
+}
+
+/// The `path:` denylist: the shared version list, plus `cmd.exe`'s metacharacters on Windows.
+///
+/// The version list covers a POSIX shell. On Windows the resolved path reaches vfox hooks that
+/// build `cmd.exe` command lines with it, so cmd's metacharacters are as dangerous here as the
+/// POSIX ones already are — this mirrors that rejection on the platform where cmd is the shell.
+/// `%` is the sharpest: cmd expands `%NAME%` even inside double quotes, so a hook that quotes its
+/// interpolation correctly still cannot contain it.
+///
+/// Only the `path:` arm uses this. Version strings keep the POSIX-only list, because `^` is a real
+/// npm-style range prefix (`^1.2.3`) that must not become a hard error.
+fn is_forbidden_path_char(c: char) -> bool {
+    is_forbidden_version_char(c) || is_forbidden_cmd_char(c)
+}
+
+#[cfg(windows)]
+fn is_forbidden_cmd_char(c: char) -> bool {
+    matches!(c, '&' | '|' | '<' | '>' | '^' | '%')
+}
+
+#[cfg(not(windows))]
+fn is_forbidden_cmd_char(_c: char) -> bool {
+    false
+}
+
+/// Calls `f` with each string value under one of `keys` in tool options. Backends read options
+/// per platform, from a platform table (`platforms.linux-x64.url`) or a flat key
+/// (`platforms_linux_x64_url`), so both count.
+fn visit_option_strings(
+    opts: &indexmap::IndexMap<String, toml::Value>,
+    keys: &[&str],
+    f: &mut dyn FnMut(&str, &str),
+) {
+    fn matches(key: &str, keys: &[&str]) -> bool {
+        keys.contains(&key)
+            || (key.starts_with("platforms_") || key.starts_with("platform_"))
+                && keys.iter().any(|k| key.ends_with(&format!("_{k}")))
+    }
+    fn visit(key: &str, value: &toml::Value, keys: &[&str], f: &mut dyn FnMut(&str, &str)) {
+        match value {
+            toml::Value::String(s) if matches(key, keys) => f(key, s),
+            toml::Value::Table(table) => {
+                for (key, value) in table {
+                    visit(key, value, keys, f);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (key, value) in opts {
+        visit(key, value, keys, f);
+    }
+}
+
+/// The tool options that name a host a tool sends requests to: where it downloads from,
+/// lists versions from, or (for a forge, which falls back to netrc without a token) its API.
+const NETRC_SCOPED_URL_OPTIONS: [&str; 5] = [
+    "url",
+    "checksum_url",
+    "version_list_url",
+    "version_date_url",
+    "api_url",
+];
+
+/// Records, in safe mode, the hosts that tool options from one config file send requests to.
+/// `project` is false for global and system config. A project `api_url` gets no forge token
+/// (unless global config names the same host), and no host a project URL option names gets
+/// netrc credentials outside [`with_safe_mode_tool_scope`]. See
+/// [`ToolRequest::record_safe_mode_credential_hosts`].
+pub(crate) fn record_safe_mode_credential_hosts(
+    opts: &indexmap::IndexMap<String, toml::Value>,
+    project: bool,
+) {
+    visit_option_strings(opts, &NETRC_SCOPED_URL_OPTIONS, &mut |key, url| {
+        let api_url = key == "api_url" || key.ends_with("_api_url");
+        match (project, api_url) {
+            (true, true) => {
+                mise_util::untrusted_hosts::deny_forge_token_for_url(url);
+                mise_util::untrusted_hosts::deny_netrc_for_url(url);
+            }
+            (true, false) => mise_util::untrusted_hosts::deny_netrc_for_url(url),
+            (false, true) => mise_util::untrusted_hosts::allow_forge_token_for_url(url),
+            (false, false) => {}
+        }
+    });
+}
+
+/// Runs `future`, work done for the tool `ba`. In safe mode, netrc credentials are withheld
+/// from every host a project tool's URL options name, whichever code path makes the request;
+/// a tool that global or system config declares runs here in a trusted scope, so its requests
+/// keep their credentials on such a host, and the templates its backend renders from that
+/// config's options (a global `[tool_alias]` `url`, say) keep `env`. A path that does not come
+/// through here loses credentials rather than leaking them.
+pub(crate) async fn with_safe_mode_tool_scope<T>(
+    ba: &BackendArg,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    // Boxed: this wraps resolving, installing and listing, whose futures are large,
+    // and holding one inline here (twice over, in the scopes) overflows the stack
+    // of a debug build.
+    let future = Box::pin(future);
+    if !Settings::safe_mode() {
+        return future.await;
+    }
+    // Set either way: a project tool reached from a global tool's work (a dependency, say)
+    // must not run in that tool's trusted scope.
+    let trusted = !crate::config::is_safe_mode_project_tool(ba);
+    mise_util::untrusted_hosts::with_tool_scope(trusted, future).await
+}
+
+/// Resolve a `path:` tool version request value against the config file's directory.
+///
+/// - `~/` is expanded to `$HOME`
+/// - a leading `./` is stripped
+/// - remaining relative paths are joined with `config_root(source)` when the
+///   source is a file-based config; otherwise they fall back to the current
+///   working directory so CLI usage (e.g. `mise use tool@path:./x`) behaves
+///   the way users expect.
+fn resolve_path(p: &str, source: &ToolSource) -> PathBuf {
+    let p = Path::new(p);
+    if let Ok(rest) = p.strip_prefix("~/") {
+        return dirs::HOME.join(rest);
+    }
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let p = p.strip_prefix("./").unwrap_or(p);
+    let base = match source.path() {
+        Some(src) => config_root::config_root(src),
+        None => dirs::CWD
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from(".")),
+    };
+    base.join(p)
+}
+
+/// subtracts sub from orig and removes suffix
+/// e.g. version_sub("18.2.3", "2") -> "16"
+/// e.g. version_sub("18.2.3", "0.1") -> "18.1"
+/// e.g. version_sub("2.79.0", "0.0.1") -> "2.78" (underflow, returns prefix)
+///
+/// `orig` must already be a concrete version. `latest` and aliases like `lts` have to be
+/// resolved by the caller first — there is nothing here to subtract from — which is what
+/// `tool_version::resolve_sub_base` exists for.
+pub(crate) fn version_sub(orig: &str, sub: &str) -> Result<String> {
+    fn not_numeric(orig: &str, sub: &str) -> eyre::Report {
+        eyre!("cannot subtract {sub} from {orig}: {orig} is not a numeric version")
+    }
+    fn numeric_components(version: &str) -> Option<Vec<u32>> {
+        if version.is_empty() {
+            return None;
+        }
+        version
+            .split('.')
+            .map(str::parse)
+            .collect::<std::result::Result<_, _>>()
+            .ok()
+    }
+    fn format_components(version: &[u32]) -> String {
+        version
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(".")
+    }
+
+    let mut version = numeric_components(orig).ok_or_else(|| not_numeric(orig, sub))?;
+    let sub_version = numeric_components(sub).ok_or_else(|| eyre!("invalid version: {sub}"))?;
+    while version.len() > sub_version.len() {
+        version.pop();
+    }
+    for i in 0..version.len() {
+        let m = sub_version[i];
+        let orig_val = version[i];
+
+        if orig_val < m {
+            // Handle underflow with borrowing from higher digits
+            for j in (0..i).rev() {
+                let prev_val = version[j];
+                if prev_val > 0 {
+                    version[j] = prev_val - 1;
+                    version.truncate(j + 1);
+                    return Ok(format_components(&version));
+                }
+            }
+            return Ok("0".to_string());
+        }
+
+        version[i] = orig_val - m;
+    }
+    Ok(format_components(&version))
+}
+
+impl Display for ToolRequest {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}@{}", self.ba(), self.version())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LockfileScope, ToolRequest, validate_installable_version, validate_ref_string,
+        validate_resolved_version, validate_version_string, version_sub,
+    };
+    use crate::args::{BackendArg, BackendResolution};
+    use crate::toolset::{ToolSource, ToolVersionOptions};
+    use pretty_assertions::assert_str_eq;
+    use std::sync::Arc;
+    use test_log::test;
+
+    #[test]
+    fn netrc_scope_reads_platform_url_options() {
+        let opts = crate::toolset::parse_tool_options(
+            r#"url="https://top.example/t",platforms_linux_x64_url="https://flat.example/t",platform_macos_arm64_api_url="https://flat-api.example",bin="t""#,
+        );
+        let mut opts = opts.opts.into_map();
+        opts.insert(
+            "platforms".into(),
+            toml::from_str::<toml::Value>(
+                r#"linux-arm64 = { url = "https://nested.example/t", checksum_url = "https://nested-sum.example/s" }"#,
+            )
+            .unwrap(),
+        );
+        let mut urls = vec![];
+        super::visit_option_strings(&opts, &super::NETRC_SCOPED_URL_OPTIONS, &mut |_, url| {
+            urls.push(url.to_string());
+        });
+        urls.sort();
+        assert_eq!(
+            urls,
+            [
+                "https://flat-api.example",
+                "https://flat.example/t",
+                "https://nested-sum.example/s",
+                "https://nested.example/t",
+                "https://top.example/t",
+            ]
+        );
+    }
+
+    fn test_ba() -> Arc<BackendArg> {
+        let short = "lockfile-query-test";
+        Arc::new(BackendArg::new_raw(
+            short.into(),
+            Some(format!("asdf:{short}")),
+            short.into(),
+            Some(ToolVersionOptions::default()),
+            BackendResolution::new(true),
+        ))
+    }
+
+    #[test]
+    fn lockfile_scope_survives_conversion_until_source_changes() {
+        let owner = ToolSource::MiseToml("/project/mise.toml".into());
+        let destination = ToolSource::MiseToml("/project/mise.local.toml".into());
+        for selector in [
+            "latest",
+            "prefix:1",
+            "ref:main",
+            "sub-1:3",
+            "path:/tools/dummy",
+            "system",
+        ] {
+            let mut request = ToolRequest::new(test_ba(), selector, ToolSource::Argument).unwrap();
+            request.set_lockfile_scope(LockfileScope::Source(owner.clone()));
+            for mut converted in [
+                request.clone(),
+                request.to_ref("main".into(), "ref".into()),
+                request.to_path("/tools/dummy".into()),
+            ] {
+                assert_eq!(converted.source(), &ToolSource::Argument);
+                assert_eq!(converted.lockfile_source(), Some(&owner));
+                converted.set_source(destination.clone());
+                assert_eq!(converted.source(), &destination);
+                assert_eq!(converted.lockfile_source(), Some(&destination));
+                assert_eq!(converted.lockfile_scope(), &LockfileScope::Default);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn install_path_never_leaves_the_installs_dir() {
+        use super::*;
+        let config = Config::get().await.unwrap();
+        let backend = Arc::new(BackendArg::from("dummy"));
+        // Built without validation, as struct literals elsewhere are.
+        for version in ["/", "/usr", "../x", ""] {
+            let request =
+                ToolRequest::new_version_for_test(backend.clone(), version, ToolSource::Argument);
+            assert_eq!(request.install_path(&config), None, "{version:?}");
+        }
+        let request =
+            ToolRequest::new_version_for_test(backend.clone(), "1.0.0", ToolSource::Argument);
+        assert!(
+            request
+                .install_path(&config)
+                .is_some_and(|p| p.ends_with("1.0.0"))
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_min_version_replaces_only_registry_defaults() {
+        use super::*;
+        let _config = Config::get().await.unwrap();
+        let mut request = ToolRequest::new(
+            Arc::new(BackendArg::from("hk")),
+            "latest",
+            ToolSource::Argument,
+        )
+        .unwrap();
+        let old_defaults =
+            crate::toolset::parse_tool_options("identity_prefix=https://example.test/old/");
+        request
+            .resolved_options_mut()
+            .apply_overrides(&old_defaults, ToolOptionSource::Registry);
+        let explicit = crate::toolset::parse_tool_options("variant=custom");
+        let owner = ToolSource::MiseToml("/project/mise.toml".into());
+        request.set_lockfile_scope(LockfileScope::Source(owner.clone()));
+        request
+            .resolved_options_mut()
+            .apply_overrides(&explicit, ToolOptionSource::Request);
+        let request = request.with_registry_version("1.57.0");
+        assert_eq!(request.ba().full(), "aqua:jdx/hk");
+        assert_eq!(request.version(), "latest");
+        assert_eq!(request.options().get("identity_prefix"), None);
+        assert_eq!(request.options().get("variant"), Some("custom"));
+        assert_eq!(
+            request.option_source("variant"),
+            Some(ToolOptionSource::Request)
+        );
+        let resolved = ToolVersion::new(request, "1.58.1".to_string());
+        assert_eq!(resolved.ba().full(), "packslip:github.com/jdx/hk");
+        assert_eq!(resolved.request.source(), &ToolSource::Argument);
+        assert_eq!(resolved.request.lockfile_source(), Some(&owner));
+    }
+
+    #[test]
+    fn test_lockfile_version_query_uses_bare_prefix() {
+        // Lockfiles store resolved concrete versions, so the scheme-qualified
+        // "prefix:0.8" could never starts_with-match a stored "0.8.1" (#5781).
+        // Prefix requests also require separator-boundary matching so a stale
+        // "0.81.0" entry cannot satisfy prefix:0.8.
+        let prefix = ToolRequest::new(test_ba(), "prefix:0.8", ToolSource::Argument).unwrap();
+        let (query, boundary) = prefix.lockfile_version_query();
+        assert_str_eq!(query, "0.8");
+        assert!(boundary);
+        assert_str_eq!(prefix.version(), "prefix:0.8");
+
+        // Every other variant keeps matching on its version() string, without
+        // the boundary restriction (pre-existing fuzzy semantics).
+        let version = ToolRequest::new(test_ba(), "0.8", ToolSource::Argument).unwrap();
+        let (query, boundary) = version.lockfile_version_query();
+        assert_str_eq!(query, "0.8");
+        assert!(!boundary);
+    }
+
+    #[test]
+    fn test_validate_version_string_accepts_real_versions() {
+        for v in [
+            // concrete versions seen in the wild
+            "1.2.3",
+            "1.2.3-beta",
+            "1.2.3+build",
+            "20240115",
+            "lts/hydrogen",
+            "lts-iron",
+            "latest",
+            "3.12.0a1",
+            "3.2.0-preview1",
+            "tip",
+            "HEAD",
+            "nightly",
+            "1.2.3~rc1",
+            "v1.2.3",
+            "1.20.0-rc.4-otp-29",
+            "29.0-rc3",
+            "2.35.0-beta.01",
+            "stable",
+            "3.16-dev",
+            // npm-style semver range queries (from package.json engines)
+            ">=20.0.0",
+            ">= 25.6.1",
+            "^1.0.0",
+            "~1.2.3",
+            "*",
+            "25.x",
+            ">=20 <21 || >=22",
+            ">=18 <20 || >=22",
+        ] {
+            assert!(
+                validate_version_string(v).is_ok(),
+                "expected {v:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_version_string_rejects_metacharacters() {
+        for v in [
+            // quote / expansion characters that break shell context
+            "1.0$(id)",
+            "1.0`id`",
+            "1.0$HOME",
+            "1.0\"x",
+            "1.0'x",
+            "1.0\\x",
+            // backend commands could parse leading dashes as flags
+            "--version",
+            "-v",
+            // control characters / newline splitting
+            "1.0\nrm",
+            "1.0\rrm",
+            "1.0\tx",
+            "1.0\x00x",
+            // path traversal
+            "../etc/passwd",
+            "1.0/../etc",
+            // percent-encoded traversal, which URL parsing resolves like `..`
+            "1.3.0/%2e%2e/%2e%2e/evil/payload",
+            "1/%2E%2e/x",
+            "1/.%2e/x",
+            "1/%2e./x",
+            // absolute, which would replace the installs dir it is joined onto
+            "/",
+            "/usr/local",
+        ] {
+            assert!(
+                validate_version_string(v).is_err(),
+                "expected {v:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_resolved_version_rejects_directory_names() {
+        for v in [
+            "1.2.3",
+            "lts/hydrogen",
+            "temurin-21.0.1+12",
+            "3.12.0a1",
+            ">=20 <21",
+        ] {
+            assert!(
+                validate_resolved_version(v).is_ok(),
+                "expected {v:?} to be accepted"
+            );
+        }
+        // `installs/<tool>/..` is the directory that holds every tool; `.` and the empty string
+        // are the one that holds every version of this tool
+        for v in [
+            "..",
+            ".",
+            "",
+            "/",
+            "v1/%2e%2e",
+            "1.0$(id)",
+            "4.0.0\"; cd; \"",
+        ] {
+            assert!(
+                validate_resolved_version(v).is_err(),
+                "expected {v:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_installable_version_rejects_shell_and_url_syntax() {
+        for v in [
+            "1.2.3",
+            "lts/hydrogen",
+            "1.2.3+build",
+            "1.2.3~rc1",
+            "2024.01.15",
+        ] {
+            assert!(
+                validate_installable_version(v).is_ok(),
+                "expected {v:?} to be accepted"
+            );
+        }
+        for v in [
+            "2.0.0; cd; touch f #",
+            "2.0.0 || cd | touch f ||",
+            ">=20 <21",
+            "1.0&x",
+            "1.0(x)",
+            "1.0#x",
+            "1.0?x",
+            "1.0%41",
+            "..",
+            "",
+        ] {
+            assert!(
+                validate_installable_version(v).is_err(),
+                "expected {v:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_ref_string_allows_slash() {
+        assert!(validate_ref_string("feature/foo").is_ok());
+        assert!(validate_ref_string("release/1.2").is_ok());
+        assert!(validate_ref_string("main").is_ok());
+    }
+
+    #[test]
+    fn test_validate_ref_string_rejects_metacharacters() {
+        for v in [
+            "a$(id)",
+            "a..b",
+            "a`b`",
+            "a\"b",
+            "a'b",
+            "a\\b",
+            "--version",
+            "-v",
+            "1/%2e%2e/x",
+        ] {
+            assert!(
+                validate_ref_string(v).is_err(),
+                "expected ref {v:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_path_string() {
+        // `validate_path_string` in isolation. On Windows the `path:` arm rewrites separators
+        // first, so a `\` in a real config does not reach here — that pair is covered below.
+        use super::validate_path_string;
+        // valid paths
+        for p in [
+            "/home/user/tools/foo",
+            "./relative/path",
+            "../parent",
+            "~/tools/bar",
+            "/path with spaces/tool",
+            "C:/Users/foo",
+        ] {
+            assert!(
+                validate_path_string(p).is_ok(),
+                "expected path {p:?} to be accepted"
+            );
+        }
+        // shell-dangerous paths
+        for p in [
+            "/tmp/$HOME",
+            "/tmp/`id`",
+            "/tmp/$(id)",
+            "/tmp/'rm",
+            "/tmp/\"rm",
+            "/tmp/\\rm",
+            "/tmp/\nrm",
+        ] {
+            assert!(
+                validate_path_string(p).is_err(),
+                "expected path {p:?} to be rejected"
+            );
+        }
+    }
+
+    /// Rewrite then validate, in the order the `path:` arm does it.
+    fn accept_tool_path(p: &str) -> Result<String, eyre::Report> {
+        let p = super::windows_path_separators(p);
+        super::validate_path_string(&p)?;
+        Ok(p.into_owned())
+    }
+
+    #[test]
+    fn test_tool_path_rewrite_does_not_widen_the_rest() {
+        // The control for the two platform-specific tests below: quote and expansion characters
+        // stay rejected everywhere, and a path with no separator to rewrite comes back untouched.
+        assert_eq!(
+            accept_tool_path("/home/user/tools/foo").unwrap(),
+            "/home/user/tools/foo"
+        );
+        assert_eq!(accept_tool_path("C:/Users/foo").unwrap(), "C:/Users/foo");
+        for p in [
+            "/tmp/$HOME",
+            "/tmp/`id`",
+            "/tmp/$(id)",
+            "/tmp/'rm",
+            "/tmp/\"rm",
+            "/tmp/\nrm",
+        ] {
+            assert!(
+                accept_tool_path(p).is_err(),
+                "expected path {p:?} to be rejected"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_native_windows_tool_path_is_accepted() {
+        // The reported case: a path spelled the way Windows spells it. Rewritten rather than
+        // allowed through, so no `\` reaches a plugin hook's `ctx.rootPath`.
+        for (input, expected) in [
+            (r"C:\Users\foo\bin", "C:/Users/foo/bin"),
+            (r"~\.local\bin", "~/.local/bin"),
+            (r"..\tools\foo", "../tools/foo"),
+            (r"C:\Program Files\tool", "C:/Program Files/tool"),
+        ] {
+            assert_eq!(accept_tool_path(input).unwrap(), expected, "{input:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_extended_length_tool_path_is_left_alone_and_rejected() {
+        // `\\?\` and `\\.\` are the one place Windows does not accept `/`, so rewriting them
+        // would produce a path that looks right and does not resolve. They stay rejected, as
+        // they are on every version before this change.
+        for input in [r"\\?\C:\Users\foo", r"\\.\COM1"] {
+            assert_eq!(
+                super::windows_path_separators(input),
+                input,
+                "{input:?} should not be rewritten"
+            );
+            assert!(accept_tool_path(input).is_err(), "{input:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backslash_is_still_rejected_on_unix() {
+        // The control for the Windows tests: `\` is a legal character in a unix filename and a
+        // shell escape there, so none of the rewriting reaches this platform.
+        assert_eq!(super::windows_path_separators(r"/tmp/\rm"), r"/tmp/\rm");
+        assert!(accept_tool_path(r"/tmp/\rm").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_validate_path_string_rejects_cmd_metacharacters() {
+        use super::validate_path_string;
+        // These pass a POSIX shell but are cmd.exe metacharacters, and the resolved path reaches
+        // vfox hooks that build cmd command lines with it. `%` is the one that survives quoting.
+        for p in [
+            "C:/a&b/tool",
+            "C:/%USERPROFILE%/tool",
+            "C:/a^b/tool",
+            "C:/a|b/tool",
+            "C:/a<b/tool",
+            "C:/a>b/tool",
+        ] {
+            assert!(
+                validate_path_string(p).is_err(),
+                "expected Windows path {p:?} to be rejected"
+            );
+        }
+        // An ordinary Windows path is still fine.
+        assert!(validate_path_string("C:/Program Files/tool").is_ok());
+    }
+
+    #[test]
+    fn test_version_string_keeps_the_posix_only_list() {
+        // The cmd-metacharacter rejection is `path:`-only. Versions keep the POSIX list, or `^1.2.3`
+        // — a real npm-style range — would become a hard error. `&` is not a version metacharacter
+        // there, so this stays accepted on every platform.
+        assert!(validate_version_string("^1.2.3").is_ok());
+        assert!(validate_version_string("1.0&x").is_ok());
+        // The POSIX shell characters are still rejected, unchanged.
+        assert!(validate_version_string("1.0$(id)").is_err());
+    }
+
+    #[test]
+    fn test_version_sub() {
+        assert_str_eq!(version_sub("18.2.3", "2").unwrap(), "16");
+        assert_str_eq!(version_sub("18.2.3", "0.1").unwrap(), "18.1");
+        assert_str_eq!(version_sub("18.2.3", "0.0.1").unwrap(), "18.2.2");
+    }
+
+    #[test]
+    fn test_version_sub_underflow() {
+        // Test cases that would cause underflow return prefix for higher digit
+        assert_str_eq!(version_sub("2.0.0", "0.0.1").unwrap(), "1");
+        assert_str_eq!(version_sub("2.79.0", "0.0.1").unwrap(), "2.78");
+        assert_str_eq!(version_sub("1.0.0", "0.1.0").unwrap(), "0");
+        assert_str_eq!(version_sub("0.1.0", "1").unwrap(), "0");
+        assert_str_eq!(version_sub("1.2.3", "0.2.4").unwrap(), "0");
+        assert_str_eq!(version_sub("1.3.3", "0.2.4").unwrap(), "1.0");
+    }
+
+    #[test]
+    fn test_version_sub_rejects_non_numeric_base() {
+        // An unresolved alias must not reach here, but if it does it has to be an
+        // error rather than a panic: this used to abort the process from
+        // `mise ls-remote <tool>@sub-2:lts`.
+        let err = version_sub("lts", "2").unwrap_err().to_string();
+        assert!(err.contains("lts"), "unexpected error: {err}");
+
+        assert!(version_sub("latest", "1").is_err());
+        assert!(version_sub("3.7b", "1").is_err());
+        assert!(version_sub("1.2.3", "x").is_err());
+        assert!(version_sub("", "1").is_err());
+    }
+}

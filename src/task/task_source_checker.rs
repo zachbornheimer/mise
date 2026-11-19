@@ -1,0 +1,3310 @@
+use crate::config::{Config, Settings};
+use crate::dirs;
+use crate::file::{self, display_path};
+use crate::hash;
+use crate::rand::random_string;
+use crate::task::Task;
+use crate::task::task_source_gitignore::{GitIgnored, is_gitignore_entry};
+use crate::task::task_sources::TaskOutputsExt;
+use eyre::{Result, bail};
+use flate2::Compression;
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::overrides::{Override, OverrideBuilder};
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+use walkdir::{DirEntry, Error as WalkError, WalkDir};
+
+/// Remove mise's automatic output before rerunning a task so an earlier
+/// success cannot make a failed attempt look fresh.
+pub(crate) async fn remove_auto_output(task: &Task, config: &Arc<Config>) -> Result<()> {
+    if !task.outputs.is_auto() {
+        return Ok(());
+    }
+    let root = task_cwd(task, config).await?;
+    for output in task.outputs.paths(task, &root) {
+        match fs::remove_file(&output) {
+            Ok(()) => debug!("removed auto output file: {output}"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Check if a path is a glob pattern
+pub(crate) fn is_glob_pattern(path: &str) -> bool {
+    // This is the character set used for glob detection by glob
+    let glob_chars = ['*', '{', '}'];
+    path.chars().any(|c| glob_chars.contains(&c))
+}
+
+const MAX_BRACE_EXPANSIONS: usize = 1024;
+
+/// Expand globset-style brace alternates before passing a pattern to `glob`.
+///
+/// `Override`/globset understands patterns such as `{a,b}.txt`, but the `glob`
+/// crate used to enumerate task sources and outputs treats braces literally.
+/// Expanding only groups with comma-separated choices lets both stages share
+/// the same syntax without returning to a recursive filesystem walker. Balanced
+/// braces without a comma are encoded as character classes so they keep their
+/// literal meaning in both `glob` and globset.
+pub(crate) fn expand_glob_braces(pattern: &str) -> Result<Vec<String>> {
+    struct BraceGroup {
+        start: usize,
+        end: usize,
+        branches: Vec<(usize, usize)>,
+    }
+
+    fn find_group(pattern: &str) -> Result<Option<BraceGroup>> {
+        let mut escaped = false;
+        let mut class_depth = 0;
+        let mut group_start = None;
+        let mut group_depth = 0;
+        let mut branch_start = 0;
+        let mut branches = Vec::new();
+
+        for (idx, ch) in pattern.char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            // On Windows, backslashes are path separators rather than glob
+            // escapes. Literal braces can still be expressed with a character
+            // class, e.g. `[{]` and `[}]`.
+            if ch == '\\' && !cfg!(windows) {
+                escaped = true;
+                continue;
+            }
+            match ch {
+                '[' if class_depth == 0 => class_depth = 1,
+                ']' if class_depth == 1 => class_depth = 0,
+                '{' if class_depth == 0 => {
+                    if group_depth == 0 {
+                        group_start = Some(idx);
+                        branch_start = idx + ch.len_utf8();
+                    }
+                    group_depth += 1;
+                }
+                ',' if class_depth == 0 && group_depth == 1 => {
+                    branches.push((branch_start, idx));
+                    branch_start = idx + ch.len_utf8();
+                }
+                '}' if class_depth == 0 => {
+                    if group_depth == 0 {
+                        bail!("unopened brace alternate in glob pattern {pattern:?}");
+                    }
+                    group_depth -= 1;
+                    if group_depth == 0 {
+                        let start = group_start.unwrap();
+                        if !branches.is_empty() {
+                            branches.push((branch_start, idx));
+                            return Ok(Some(BraceGroup {
+                                start,
+                                end: idx,
+                                branches,
+                            }));
+                        }
+
+                        // A balanced group without a top-level comma is a
+                        // literal brace pair. It may still contain a nested
+                        // alternate, so look inside it before continuing with
+                        // the remainder of the pattern.
+                        if let Some(mut nested) = find_group(&pattern[start + 1..idx])? {
+                            let offset = start + 1;
+                            nested.start += offset;
+                            nested.end += offset;
+                            for (branch_start, branch_end) in &mut nested.branches {
+                                *branch_start += offset;
+                                *branch_end += offset;
+                            }
+                            return Ok(Some(nested));
+                        }
+                        group_start = None;
+                        branches.clear();
+                    }
+                }
+                _ => {}
+            }
+        }
+        if group_depth != 0 {
+            bail!("unclosed brace alternate in glob pattern {pattern:?}");
+        }
+        Ok(None)
+    }
+
+    fn expand(pattern: &str, expanded: &mut Vec<String>) -> Result<()> {
+        let Some(group) = find_group(pattern)? else {
+            if expanded.len() >= MAX_BRACE_EXPANSIONS {
+                bail!(
+                    "glob pattern expands to more than {MAX_BRACE_EXPANSIONS} alternatives: {pattern:?}"
+                );
+            }
+            let mut literal = String::with_capacity(pattern.len());
+            let mut escaped = false;
+            let mut class_depth = 0;
+            for ch in pattern.chars() {
+                if escaped {
+                    escaped = false;
+                    literal.push(ch);
+                    continue;
+                }
+                if ch == '\\' && !cfg!(windows) {
+                    escaped = true;
+                    literal.push(ch);
+                    continue;
+                }
+                match ch {
+                    '[' if class_depth == 0 => {
+                        class_depth = 1;
+                        literal.push(ch);
+                    }
+                    ']' if class_depth == 1 => {
+                        class_depth = 0;
+                        literal.push(ch);
+                    }
+                    '{' if class_depth == 0 => literal.push_str("[{]"),
+                    '}' if class_depth == 0 => literal.push_str("[}]"),
+                    _ => literal.push(ch),
+                }
+            }
+            expanded.push(literal);
+            return Ok(());
+        };
+
+        let prefix = &pattern[..group.start];
+        let suffix = &pattern[group.end + 1..];
+        for (branch_start, branch_end) in group.branches {
+            let branch = &pattern[branch_start..branch_end];
+            // Match globset's default: empty alternatives are discarded.
+            if branch.is_empty() {
+                continue;
+            }
+            expand(&format!("{prefix}{branch}{suffix}"), expanded)?;
+        }
+        Ok(())
+    }
+
+    let mut expanded = Vec::new();
+    expand(pattern, &mut expanded)?;
+    Ok(expanded)
+}
+
+/// The matcher for a task's `sources`, built by [`build_source_matcher`].
+///
+/// Entries are evaluated in order and the last one that decides a path wins.
+/// A glob entry decides the paths it matches. A `!@gitignore` entry decides
+/// the paths git ignores, dropping them from what earlier entries matched, so
+/// the matcher keeps the globs between two such entries in their own
+/// [`Gitignore`] segment.
+pub(crate) struct SourceMatcher {
+    inner: Segments,
+    /// The same entries anchored at a directory that also holds every entry
+    /// reaching outside `inner`'s root (`../shared/**`). Present only when
+    /// `sources` has a `!@gitignore` entry, so that the entry also applies to
+    /// files found outside the root.
+    outer: Option<Segments>,
+    /// Present when `sources` has a `!@gitignore` entry and the match root
+    /// is in a git work tree.
+    gitignored: Option<Arc<GitIgnored>>,
+}
+
+/// Glob entries anchored at `root`, split at each `!@gitignore`. Every
+/// segment but the first follows one.
+struct Segments {
+    root: PathBuf,
+    segments: Vec<Gitignore>,
+}
+
+impl SourceMatcher {
+    fn empty(root: &Path) -> Self {
+        Self {
+            inner: Segments {
+                root: root.to_path_buf(),
+                segments: vec![],
+            },
+            outer: None,
+            gitignored: None,
+        }
+    }
+
+    /// The directory relative patterns are anchored at.
+    pub(crate) fn path(&self) -> &Path {
+        &self.inner.root
+    }
+
+    /// Whether `sources` select `path`.
+    pub(crate) fn matched(&self, path: &Path, is_dir: bool) -> bool {
+        self.decide(&self.inner, path, is_dir).unwrap_or(false)
+    }
+
+    /// Whether `sources` select `path`, an absolute path outside the root.
+    /// `None` when no entry decides it.
+    fn matched_outside(&self, path: &Path) -> Option<bool> {
+        let outer = self.outer.as_ref()?;
+        if !path.starts_with(&outer.root) {
+            return None;
+        }
+        self.decide(outer, path, false)
+    }
+
+    fn decide(&self, segments: &Segments, path: &Path, is_dir: bool) -> Option<bool> {
+        for (i, segment) in segments.segments.iter().enumerate().rev() {
+            // Globs are stored inverted, the way `Override` stores them: a
+            // source pattern is an ignore rule and a `!` entry a whitelist.
+            match segment.matched(path, is_dir) {
+                ignore::Match::Ignore(_) => return Some(true),
+                ignore::Match::Whitelist(_) => return Some(false),
+                ignore::Match::None => {}
+            }
+            if i > 0
+                && self.gitignored.as_ref().is_some_and(|gitignored| {
+                    gitignored.is_ignored(&segments.root.join(path), is_dir)
+                })
+            {
+                return Some(false);
+            }
+        }
+        None
+    }
+}
+
+/// Build the matcher for a task's `sources` patterns.
+///
+/// `match_root` is the directory the matcher is anchored at (the workspace
+/// root in workspace setups, otherwise the task CWD). `task_cwd` is the
+/// directory the task actually runs from. Relative patterns are resolved
+/// against `task_cwd` and absolute ones taken as-is; either way the result is
+/// re-expressed relative to `match_root` so every pattern lives in the same
+/// namespace as the paths the matcher is asked about.
+///
+/// Patterns use gitignore syntax with `!` inverted (the [`Override`] convention):
+/// a non-negated entry marks a file as a *source*, `!`-prefixed excludes it,
+/// `\!` escapes a literal `!`, and order matters. `!@gitignore`
+/// excludes the files git ignores.
+pub(crate) fn build_source_matcher(
+    match_root: &Path,
+    task_cwd: &Path,
+    sources: &[String],
+) -> SourceMatcher {
+    let Some(inner) = build_segments(match_root, task_cwd, sources, true) else {
+        return SourceMatcher::empty(match_root);
+    };
+    if inner.segments.len() < 2 {
+        return SourceMatcher {
+            inner,
+            outer: None,
+            gitignored: None,
+        };
+    }
+    let outer = outer_root(match_root, task_cwd, sources)
+        .and_then(|root| build_segments(&root, task_cwd, sources, false));
+    SourceMatcher {
+        inner,
+        outer,
+        gitignored: GitIgnored::discover(match_root).map(Arc::new),
+    }
+}
+
+/// Build the segments of `sources` anchored at `root`. `None`, after a
+/// warning when `warn` is set, if the matcher cannot be built.
+fn build_segments(
+    root: &Path,
+    task_cwd: &Path,
+    sources: &[String],
+    warn: bool,
+) -> Option<Segments> {
+    let segment_builder = || {
+        let mut builder = GitignoreBuilder::new(root);
+        builder.allow_unclosed_class(false);
+        builder
+    };
+    let mut builders = vec![segment_builder()];
+    for s in sources {
+        if is_gitignore_entry(s) {
+            builders.push(segment_builder());
+            continue;
+        }
+        let builder = builders.last_mut().expect("one builder");
+        // Expand braces first: each alternative can reach a different
+        // directory (`{../shared,src}/**`), and normalizing resolves its `..`.
+        // Only the entry's own leading `!` negates it, so split it off before
+        // expanding: `{!important,other}.txt` includes a file named
+        // `!important.txt`. An escaped `\!` entry stays literal as written.
+        let (prefix, body) = split_negation(s);
+        let expanded = match expand_glob_braces(body) {
+            Ok(expanded) => expanded,
+            Err(e) => {
+                // Source matcher construction is infallible to callers. An
+                // invalid pattern is skipped so freshness falls back to stale
+                // when no sources can be enumerated.
+                if warn {
+                    warn!("invalid source pattern {s:?}: {e}");
+                }
+                continue;
+            }
+        };
+        for alternative in expanded {
+            let normalized = match prefix {
+                Some(prefix) => normalize_parts(root, task_cwd, prefix, &alternative),
+                None => alternative,
+            };
+            if let Err(e) = builder.add_line(None, &normalized)
+                && warn
+            {
+                warn!("invalid source pattern {s:?}: {e}");
+            }
+        }
+    }
+    match builders
+        .iter()
+        .map(|b| b.build())
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(segments) => Some(Segments {
+            root: root.to_path_buf(),
+            segments,
+        }),
+        Err(e) => {
+            if warn {
+                warn!("failed to build source matcher: {e}");
+            }
+            None
+        }
+    }
+}
+
+/// The nearest directory that holds `match_root` and the literal part of every
+/// entry reaching outside it, or `None` when no entry does.
+fn outer_root(match_root: &Path, task_cwd: &Path, sources: &[String]) -> Option<PathBuf> {
+    let mut root = match_root.to_path_buf();
+    for s in sources {
+        if is_gitignore_entry(s) || s.starts_with("\\!") {
+            continue;
+        }
+        let body = s.strip_prefix('!').unwrap_or(s);
+        // Each brace alternative can reach a different directory.
+        let Ok(alternatives) = expand_glob_braces(body) else {
+            continue;
+        };
+        for alternative in alternatives {
+            let alternative = Path::new(&alternative);
+            if parent_dir_pops_glob(alternative) {
+                continue;
+            }
+            let base = lexical_normalize(&task_cwd.join(alternative))
+                .components()
+                .take_while(|c| {
+                    !c.as_os_str()
+                        .to_string_lossy()
+                        .contains(['*', '?', '[', '{'])
+                })
+                .collect::<PathBuf>();
+            while !base.starts_with(&root) {
+                root = root.parent()?.to_path_buf();
+            }
+        }
+    }
+    (root != match_root).then_some(root)
+}
+
+/// Resolve `.` and `..` in `path` without consulting the filesystem.
+///
+/// Being lexical, this disagrees with `canonicalize` whenever a symlink is
+/// involved: `dir/link/..` becomes `dir`, not the parent of the link's target.
+/// Source matching is lexical too — gitignore globs never resolve symlinks —
+/// so both sides of a comparison must be normalized the same way to stay
+/// consistent with each other.
+///
+/// A `..` with nothing to collapse is kept in a relative path (`../x` has no
+/// representation without it) and dropped in an absolute one, where `/..` is
+/// `/`.
+///
+/// Only for paths and patterns that are *matched*. A directory the task will
+/// actually run in must keep its `..` for the OS to resolve at `chdir` time, so
+/// [`normalize_task_cwd`] collapses `.` alone.
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
+    let absolute = path.is_absolute();
+    let mut normalized = PathBuf::new();
+    let mut depth = 0usize;
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if depth > 0 {
+                    normalized.pop();
+                    depth -= 1;
+                } else if !absolute {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(part) => {
+                normalized.push(part);
+                depth += 1;
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Returns true when resolving `..` in `pattern` would collapse a component
+/// holding a glob metacharacter.
+///
+/// `**/../x` has no well-defined expansion — the `..` would have to apply to
+/// whatever each match of `**` resolved to — so callers leave such a pattern
+/// exactly as written rather than inventing a meaning for it.
+pub(crate) fn parent_dir_pops_glob(pattern: &Path) -> bool {
+    let mut stack: Vec<bool> = Vec::new();
+    for component in pattern.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir if stack.pop() == Some(true) => {
+                return true;
+            }
+            Component::Normal(part) => {
+                stack.push(part.to_string_lossy().contains(['*', '?', '[', '{']));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Render a relative path as a gitignore pattern body.
+///
+/// Gitignore patterns are always `/`-separated, but `Path` renders the platform
+/// separator, so on Windows a pattern rebuilt from a `PathBuf` arrives as
+/// `dist\**\*.map`. `globset` reads `\` as an escape rather than a separator,
+/// which silently turns the pattern into one that matches something else
+/// entirely — a negated entry then stops excluding and the matcher widens.
+/// Joining the components explicitly keeps the separator independent of the
+/// platform the path was built on.
+fn pattern_from_path(path: &Path) -> Option<String> {
+    let mut pattern = String::new();
+    for component in path.components() {
+        let part = component.as_os_str().to_str()?;
+        if !pattern.is_empty() {
+            pattern.push('/');
+        }
+        pattern.push_str(part);
+    }
+    Some(pattern)
+}
+
+/// Normalise `pattern` so it is always expressed relative to `match_root`.
+///
+/// A relative body is resolved against `task_cwd` and an absolute one taken as
+/// written; the result is then lexically normalized and stripped back to a
+/// `match_root`-relative path. Relative entries therefore stay anchored at the
+/// task directory while `..` climbs out of it: `match_root=/ws`,
+/// `task_cwd=/ws/lib/worker`, `src/**/*.go` → `lib/worker/src/**/*.go` and
+/// `../shared/*.go` → `lib/shared/*.go`.
+///
+/// A pattern resolving outside `match_root` is returned unchanged, as is one
+/// whose `..` would collapse a glob component. Gitignore syntax cannot express
+/// a path above the matcher's root; [`is_source`] passes such absolute paths
+/// through without consulting the matcher instead.
+fn normalize_pattern(match_root: &Path, task_cwd: &Path, pattern: &str) -> String {
+    match split_negation(pattern) {
+        (Some(prefix), body) => normalize_parts(match_root, task_cwd, prefix, body),
+        (None, _) => pattern.to_string(),
+    }
+}
+
+/// Splits a source entry into its negation prefix (`"!"` or `""`) and body.
+/// An entry starting with an escaped `\!` has no prefix to split: it is
+/// returned whole with `None`, and callers keep it as written.
+fn split_negation(pattern: &str) -> (Option<&'static str>, &str) {
+    if pattern.starts_with("\\!") {
+        (None, pattern)
+    } else if let Some(rest) = pattern.strip_prefix('!') {
+        (Some("!"), rest)
+    } else {
+        (Some(""), pattern)
+    }
+}
+
+/// [`normalize_pattern`] for an entry already split into its negation
+/// `prefix` and `body`. A `body` starting with `!` names a file, so it is
+/// escaped as `\!` wherever it ends up in the result.
+fn normalize_parts(match_root: &Path, task_cwd: &Path, prefix: &str, body: &str) -> String {
+    let raw = || {
+        if body.starts_with('!') {
+            format!("{prefix}\\{body}")
+        } else {
+            format!("{prefix}{body}")
+        }
+    };
+    let body_path = Path::new(body);
+    // Inspect the pattern as written: `task_cwd` may legitimately contain a
+    // glob metacharacter as a literal directory name, and folding it in would
+    // make an ordinary `../` entry look like a `..` popping a glob.
+    if parent_dir_pops_glob(body_path) {
+        return raw();
+    }
+    let body_abs = if body_path.is_absolute() {
+        body_path.to_path_buf()
+    } else {
+        task_cwd.join(body_path)
+    };
+    let body_abs = lexical_normalize(&body_abs);
+    let Ok(rel) = body_abs.strip_prefix(match_root) else {
+        return raw();
+    };
+    let Some(rel_str) = pattern_from_path(rel) else {
+        return raw();
+    };
+    if rel_str.is_empty() {
+        return raw();
+    }
+    let rel_str = if rel_str.starts_with('!') {
+        format!("\\{rel_str}")
+    } else {
+        rel_str.to_string()
+    };
+    format!("{prefix}{rel_str}")
+}
+
+/// Returns true iff `path` is selected as a source by `matcher`.
+///
+/// `path` is lexically normalized first: `glob` builds the paths it returns
+/// from the raw pattern, so an enumerated file still carries the `..` that
+/// [`normalize_pattern`] has already resolved out of the matcher's copy.
+///
+/// Absolute paths that don't fall under the matcher's root are out of
+/// gitignore's domain — no pattern matches them, so the matcher would
+/// silently drop a file the glob legitimately included. Trust the glob in
+/// that case, unless `!@gitignore` decides the path.
+pub(crate) fn is_source(matcher: &SourceMatcher, path: &Path) -> bool {
+    let path = lexical_normalize(path);
+    if path.is_absolute() && !path.starts_with(matcher.path()) {
+        return matcher.matched_outside(&path).unwrap_or(true);
+    }
+    matcher.matched(&path, false)
+}
+
+/// Expands a trailing `**` to `**/*` so enumeration reaches files.
+///
+/// The `glob` crate matches a trailing `**` against directories only, while the
+/// `ignore`/`globset` matcher built from the same entry matches the files
+/// underneath it per gitignore semantics. Enumeration therefore never offers
+/// the files the matcher would have accepted, and because everything it does
+/// offer matches, nothing looks rejected and no diagnostic fires.
+///
+/// A `**` in the interior of a pattern (`src/**/foo.rs`) already spans
+/// directories correctly and is left alone.
+///
+/// Separators are tested with [`std::path::is_separator`], matching how `glob`
+/// itself decides whether a `**` forms its own path component. `\` is a
+/// separator on Windows, so `src\**` carries the same defect there, while on
+/// unix that string is an escape and `glob` rejects it outright.
+fn expand_trailing_globstar(pattern: &str) -> String {
+    let trailing_globstar = pattern == "**"
+        || pattern.strip_suffix("**").is_some_and(|head| {
+            head.chars()
+                .next_back()
+                .is_some_and(std::path::is_separator)
+        });
+    if trailing_globstar {
+        format!("{pattern}/*")
+    } else {
+        pattern.to_string()
+    }
+}
+
+/// Brace-expands `pattern` for file enumeration, expanding a trailing `**` in
+/// each alternative so enumeration reaches files.
+///
+/// Enumeration callers use this rather than [`expand_glob_braces`] directly,
+/// because the expansion has to happen per alternative: `{src/**,dist}` carries
+/// its `**` inside the braces, where a check on the whole pattern cannot see
+/// it. Matcher construction deliberately keeps calling [`expand_glob_braces`],
+/// since `globset` already matches the files under a trailing `**` and
+/// rewriting there would change what the matcher selects rather than what
+/// enumeration offers.
+pub(crate) fn expand_enumeration_patterns(pattern: &str) -> Result<Vec<String>> {
+    Ok(expand_glob_braces(pattern)?
+        .into_iter()
+        .map(|alternative| expand_trailing_globstar(&alternative))
+        .collect())
+}
+
+/// Returns the include-side glob patterns from `sources`, suitable for file
+/// enumeration via [`expand_enumeration_patterns`]. `!`-prefixed entries are
+/// dropped (they only constrain matching, not enumeration); `\!`-prefixed
+/// entries have the escape removed so they can be globbed as literal
+/// `!`-prefixed paths.
+pub(crate) fn source_glob_patterns(sources: &[String]) -> Vec<String> {
+    sources
+        .iter()
+        .filter_map(|s| {
+            if s.starts_with('!') {
+                None
+            } else if let Some(rest) = s.strip_prefix("\\!") {
+                Some(format!("!{rest}"))
+            } else {
+                Some(s.clone())
+            }
+        })
+        .collect()
+}
+
+/// Build a glob iterator that follows valid directory symlinks but detects
+/// ancestor loops instead of recursively expanding them forever.
+///
+/// The walk searches its base directory recursively, so non-globstar
+/// patterns are capped at their component depth to preserve `glob`'s
+/// component-by-component expansion semantics. Literal prefixes that do not
+/// exist yet are moved into the pattern so they produce zero matches instead
+/// of a traversal error.
+pub(crate) fn glob_walk(pattern: &Path, case_insensitive: bool) -> Result<GlobWalker> {
+    glob_walk_pruned(pattern, case_insensitive, &DirPruner::none())
+}
+
+/// Like [`glob_walk`], but never enters a directory that `pruner` says every
+/// path below is excluded from.
+pub(crate) fn glob_walk_pruned(
+    pattern: &Path,
+    case_insensitive: bool,
+    pruner: &DirPruner,
+) -> Result<GlobWalker> {
+    fn has_metacharacters(component: &str) -> bool {
+        let mut escaped = false;
+        for ch in component.chars() {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' && !cfg!(windows) {
+                escaped = true;
+            } else if matches!(ch, '*' | '?' | '[') {
+                return true;
+            }
+        }
+        false
+    }
+
+    let mut base = PathBuf::new();
+    let mut glob_pattern = PathBuf::new();
+    let mut globbing = false;
+    let mut recursive = false;
+    let mut pattern_depth = 0;
+
+    for component in pattern.components() {
+        let text = component.as_os_str().to_string_lossy();
+        if !globbing && has_metacharacters(&text) {
+            globbing = true;
+        }
+        if globbing {
+            recursive |= text == "**";
+            pattern_depth += 1;
+            glob_pattern.push(component);
+        } else {
+            base.push(component);
+        }
+    }
+
+    // `task_source_files` also resolves statically named sources through this
+    // helper. Walk the parent in that case because globwalk intentionally does
+    // not yield its traversal root.
+    if !globbing && let Some(file_name) = base.file_name().map(|name| name.to_os_string()) {
+        base.pop();
+        glob_pattern.push(file_name);
+        pattern_depth = 1;
+    }
+
+    while !base.as_os_str().is_empty() && !base.exists() {
+        let Some(file_name) = base.file_name().map(|name| name.to_os_string()) else {
+            break;
+        };
+        base.pop();
+        let mut prefixed_pattern = PathBuf::from(file_name);
+        prefixed_pattern.push(glob_pattern);
+        glob_pattern = prefixed_pattern;
+        pattern_depth += 1;
+    }
+
+    let Some(mut glob_pattern) = pattern_from_path(&glob_pattern) else {
+        bail!("glob pattern is not valid UTF-8: {}", pattern.display());
+    };
+    if glob_pattern.starts_with('!') {
+        glob_pattern.insert(0, '\\');
+    }
+
+    // globwalk treats a lone `*` as a gitignore pattern that matches at any
+    // depth; anchor it so it only matches directly under the base.
+    let override_pattern = if glob_pattern == "*" {
+        "/*".to_string()
+    } else {
+        glob_pattern.clone()
+    };
+    let mut overrides = OverrideBuilder::new(&base);
+    overrides.case_insensitive(case_insensitive)?;
+    overrides.add(&override_pattern)?;
+
+    // Components before the first `**` match one directory level each, so a
+    // directory at that depth whose name fails its component can hold no
+    // match. A lone component is unanchored (it matches at any depth), and is
+    // capped by the depth limit instead.
+    let components = glob_pattern.split('/').collect_vec();
+    let prefix_len = components
+        .iter()
+        .position(|component| *component == "**")
+        .unwrap_or(components.len());
+    let prefix = if components.len() > 1 && !glob_pattern.contains('[') {
+        // A character class can contain `/`, which would shift the components.
+        components[..prefix_len]
+            .iter()
+            .map(|component| {
+                globset::GlobBuilder::new(component)
+                    .case_insensitive(case_insensitive)
+                    .literal_separator(true)
+                    .build()
+                    .ok()
+                    .map(|glob| glob.compile_matcher())
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    let mut walker = WalkDir::new(&base)
+        .follow_links(true)
+        .sort_by(|a, b| a.file_name().cmp(b.file_name()));
+    if !recursive {
+        walker = walker.max_depth(pattern_depth);
+    }
+    Ok(GlobWalker {
+        overrides: overrides.build()?,
+        walker: walker.into_iter(),
+        prefix,
+        pruner: pruner.clone(),
+        pruned: false,
+    })
+}
+
+/// Walks a directory tree and yields the entries a glob selects, without
+/// entering directories that the pattern's leading components rule out.
+///
+/// `globwalk` enters every directory below its base unless the pattern ignores
+/// it, which a positive pattern never does. For `packages/*/src/**/*` that
+/// meant reading every `packages/*/node_modules` although only `src` can match.
+pub(crate) struct GlobWalker {
+    overrides: Override,
+    walker: walkdir::IntoIter,
+    /// One matcher per leading pattern component, ending before the first
+    /// `**`. `None` marks a component that failed to compile, which is never
+    /// used to rule a directory out.
+    prefix: Vec<Option<globset::GlobMatcher>>,
+    pruner: DirPruner,
+    pruned: bool,
+}
+
+impl GlobWalker {
+    /// Whether the walk skipped a directory because of its pruner.
+    pub(crate) fn pruned(&self) -> bool {
+        self.pruned
+    }
+
+    fn directory_may_match(&self, entry: &DirEntry) -> bool {
+        let Some(matcher) = entry
+            .depth()
+            .checked_sub(1)
+            .and_then(|index| self.prefix.get(index))
+        else {
+            return true;
+        };
+        matcher
+            .as_ref()
+            .is_none_or(|matcher| matcher.is_match(entry.file_name()))
+    }
+}
+
+impl Iterator for GlobWalker {
+    type Item = std::result::Result<DirEntry, WalkError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(entry) = self.walker.next() {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => return Some(Err(err)),
+            };
+            let is_dir = entry.file_type().is_dir();
+            if is_dir && !self.directory_may_match(&entry) {
+                self.walker.skip_current_dir();
+                continue;
+            }
+            if is_dir && self.pruner.excludes_entry(&entry) {
+                self.walker.skip_current_dir();
+                self.pruned = true;
+            }
+            let Ok(relative) = entry.path().strip_prefix(self.overrides.path()) else {
+                continue;
+            };
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+            // `Override` strips its own root, so give it the unstripped path;
+            // stripping first would strip a relative root twice.
+            if self.overrides.matched(entry.path(), is_dir).is_whitelist() {
+                return Some(Ok(entry));
+            }
+        }
+        None
+    }
+}
+
+/// Return a successful walk entry, pruning expected errors from following
+/// symlinks that loop or point to a missing target.
+pub(crate) fn prune_symlink_walk_error(
+    entry: std::result::Result<DirEntry, WalkError>,
+) -> Result<Option<DirEntry>> {
+    match entry {
+        Ok(entry) => Ok(Some(entry)),
+        Err(err) if symlink_walk_error_path(&err).is_some() => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Return the symlink path attached to an expected loop or missing-target
+/// traversal error. Callers that only enumerate reachable files prune it;
+/// artifact caching retains the symlink itself as an output root.
+pub(crate) fn symlink_walk_error_path(err: &WalkError) -> Option<&Path> {
+    let path = err.path()?;
+    let is_symlink =
+        || fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink());
+    if err.loop_ancestor().is_some() && is_symlink() {
+        return Some(path);
+    }
+    err.io_error()
+        .is_some_and(|error| {
+            error.kind() == std::io::ErrorKind::NotFound || is_filesystem_loop_error(error)
+        })
+        .then_some(path)
+        .filter(|_| is_symlink())
+}
+
+#[cfg(unix)]
+fn is_filesystem_loop_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(nix::errno::Errno::ELOOP as i32)
+}
+
+#[cfg(windows)]
+fn is_filesystem_loop_error(error: &std::io::Error) -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_CANT_RESOLVE_FILENAME, ERROR_CIRCULAR_DEPENDENCY};
+
+    error.raw_os_error().is_some_and(|code| {
+        code == ERROR_CANT_RESOLVE_FILENAME as i32 || code == ERROR_CIRCULAR_DEPENDENCY as i32
+    })
+}
+
+/// Decides which directories a walk can skip because a `!` entry excludes
+/// everything below them.
+///
+/// A directory is skipped only when an entry that excludes its whole subtree
+/// matches it and no positive entry follows that entry, since the last
+/// matching entry wins and a later one could include a path again. In
+/// `sources` only an entry ending in `/**` excludes a subtree, because files
+/// are matched by their own path (`!**/node_modules` excludes the directory
+/// but not what is inside it). In `outputs` every entry covers its subtree,
+/// as [`build_output_matcher`] adds a `/**` twin to each. Anything the pruner
+/// cannot read with certainty is left out, so it only ever walks too much.
+#[derive(Clone, Default)]
+pub(crate) struct DirPruner {
+    root: PathBuf,
+    excluded: Arc<Vec<Override>>,
+}
+
+impl DirPruner {
+    pub(crate) fn none() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn for_sources(match_root: &Path, task_cwd: &Path, sources: &[String]) -> Self {
+        Self::build(match_root, task_cwd, sources, false)
+    }
+
+    pub(crate) fn for_outputs(root: &Path, outputs: &[String]) -> Self {
+        Self::build(root, root, outputs, true)
+    }
+
+    fn build(match_root: &Path, task_cwd: &Path, entries: &[String], outputs: bool) -> Self {
+        let mut excluded: Vec<Override> = vec![];
+        let normalized_root = lexical_normalize(match_root);
+        for entry in entries {
+            // Dropping git-ignored files never includes a path again, so it
+            // leaves the excluded directories excluded.
+            if !outputs && is_gitignore_entry(entry) {
+                continue;
+            }
+            let normalized = normalize_pattern(match_root, task_cwd, entry);
+            let Ok(alternatives) = expand_glob_braces(&normalized) else {
+                excluded.clear();
+                continue;
+            };
+            for alternative in alternatives {
+                let Some(body) = alternative.strip_prefix('!') else {
+                    // A positive entry could include a path below any
+                    // directory an earlier entry excluded.
+                    excluded.clear();
+                    continue;
+                };
+                let subtree = match body.strip_suffix("/**") {
+                    Some(subtree) => subtree,
+                    None if outputs => body,
+                    None => continue,
+                };
+                if subtree.is_empty()
+                    || subtree == "**"
+                    || subtree.ends_with('/')
+                    || subtree.contains(['[', '\\'])
+                {
+                    continue;
+                }
+                // `subtree/**` is anchored, so the directory pattern is too.
+                let anchored = if subtree.contains('/') {
+                    subtree.to_string()
+                } else {
+                    format!("/{subtree}")
+                };
+                let mut builder = OverrideBuilder::new(&normalized_root);
+                if builder.add(&anchored).is_ok()
+                    && let Ok(matcher) = builder.build()
+                {
+                    excluded.push(matcher);
+                }
+            }
+        }
+        Self {
+            root: normalized_root,
+            excluded: Arc::new(excluded),
+        }
+    }
+
+    /// Returns true when every path below the directory `dir` is excluded.
+    #[cfg(test)]
+    pub(crate) fn excludes(&self, dir: &Path) -> bool {
+        self.excludes_from(dir, false)
+    }
+
+    /// Like [`Self::excludes`], and also true when an ancestor of `dir` is
+    /// excluded. A walk that starts at `dir` has not passed through its
+    /// ancestors, so it must check them itself.
+    fn excludes_from(&self, dir: &Path, ancestors: bool) -> bool {
+        if self.excluded.is_empty() {
+            return false;
+        }
+        let dir = lexical_normalize(dir);
+        let Ok(relative) = dir.strip_prefix(&self.root) else {
+            return false;
+        };
+        // Hand the matcher the rooted path: it strips its own root, and a
+        // relative root would otherwise be stripped from the path twice.
+        let excluded = |path: &Path| {
+            !path.as_os_str().is_empty()
+                && self
+                    .excluded
+                    .iter()
+                    .any(|matcher| matcher.matched(self.root.join(path), true).is_whitelist())
+        };
+        if ancestors {
+            relative.ancestors().any(excluded)
+        } else {
+            excluded(relative)
+        }
+    }
+
+    fn excludes_entry(&self, entry: &DirEntry) -> bool {
+        self.excludes_from(entry.path(), entry.depth() == 0)
+    }
+
+    /// An iterator over `dir` that yields every directory but does not enter
+    /// the excluded ones, `dir` itself included. A directory the matcher still
+    /// selects (`outputs = ["dist", "!dist/cache/**"]` selects `dist/cache`)
+    /// must stay in the results so deleting it is noticed.
+    pub(crate) fn walk_dir(
+        &self,
+        dir: &Path,
+        follow_links: bool,
+    ) -> impl Iterator<Item = Result<DirEntry, WalkError>> {
+        let pruner = self.clone();
+        let mut walker = WalkDir::new(dir).follow_links(follow_links).into_iter();
+        std::iter::from_fn(move || {
+            let entry = walker.next()?;
+            if let Ok(entry) = &entry
+                && entry.file_type().is_dir()
+                && pruner.excludes_entry(entry)
+            {
+                walker.skip_current_dir();
+            }
+            Some(entry)
+        })
+    }
+}
+
+/// Whether `pattern` selects anything when walked without pruning. Callers use
+/// it to tell "everything it matched was pruned" from "it matched nothing". A
+/// walk error is not a match. A symlink the walk could not follow counts only when
+/// `count_broken_symlinks` is set, mirroring the unpruned walk of the caller:
+/// the artifact cache counts such links, the freshness checks skip them.
+pub(crate) fn glob_has_entries(pattern: &Path, count_broken_symlinks: bool) -> bool {
+    glob_walk(pattern, false).is_ok_and(|mut walker| {
+        walker.any(|entry| match entry {
+            Ok(_) => true,
+            Err(err) => count_broken_symlinks && symlink_walk_error_path(&err).is_some(),
+        })
+    })
+}
+
+/// Build an ordered matcher for task output patterns.
+///
+/// Output entries use the same syntax as sources: `!` excludes, `\!` escapes
+/// a literal leading bang, and the last matching pattern wins. Each pattern
+/// also applies to descendants because a matched output directory is handled
+/// recursively by freshness checks and artifact caching.
+pub(crate) fn build_output_matcher(root: &Path, outputs: &[String]) -> Result<Override> {
+    let mut builder = OverrideBuilder::new(root);
+    for output in outputs {
+        let output = normalize_pattern(root, root, output);
+        // Output callers already propagate matcher errors and conservatively
+        // treat the task as stale, so keep malformed patterns visible here.
+        for output in expand_glob_braces(&output)? {
+            builder.add(&output)?;
+            let descendant = if let Some(body) = output.strip_prefix('!') {
+                format!("!{body}/**")
+            } else if let Some(body) = output.strip_prefix("\\!") {
+                format!("\\!{body}/**")
+            } else {
+                format!("{output}/**")
+            };
+            if !output.ends_with("/**") {
+                builder.add(&descendant)?;
+            }
+        }
+    }
+    Ok(builder.build()?)
+}
+
+/// Return the include-side output patterns used to enumerate output roots.
+pub(crate) fn output_glob_patterns(outputs: &[String]) -> Vec<String> {
+    source_glob_patterns(outputs)
+}
+
+/// Returns true when an output path is selected by the ordered matcher.
+///
+/// `path` is lexically normalized to stay in step with [`normalize_pattern`],
+/// which resolves `..` out of the matcher's patterns. Output enumeration
+/// resolves candidates from the raw pattern, so `outputs = ["dist/../x"]`
+/// reaches here still carrying the `..` the matcher no longer holds.
+pub(crate) fn is_output(matcher: &Override, path: &Path, is_dir: bool) -> bool {
+    let path = lexical_normalize(path);
+    if path.is_absolute() && !path.starts_with(matcher.path()) {
+        return true;
+    }
+    matcher.matched(&path, is_dir).is_whitelist()
+}
+
+fn resolve_task_path(root: &Path, path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+fn normalize_task_cwd(path: PathBuf) -> PathBuf {
+    let mut normalized: PathBuf = path
+        .components()
+        .filter(|component| !matches!(component, Component::CurDir))
+        .collect();
+    if normalized.as_os_str().is_empty() && !path.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    normalized
+}
+
+/// Get the working directory for a task
+pub async fn task_cwd(task: &Task, config: &Arc<Config>) -> Result<PathBuf> {
+    if let Some(d) = task.dir(config).await? {
+        Ok(normalize_task_cwd(d))
+    } else {
+        Ok(config
+            .project_root
+            .clone()
+            .or_else(|| dirs::CWD.clone())
+            .unwrap_or_default())
+    }
+}
+
+/// Return the outermost config root that contains the task working directory.
+///
+/// Source patterns are anchored here so workspace-rooted patterns and task-CWD
+/// relative patterns use the same namespace.
+pub(crate) fn task_source_match_root(root: &Path, config: &Config) -> PathBuf {
+    config
+        .config_files
+        .values()
+        .filter_map(|cf| cf.project_root())
+        .filter(|pr| root.starts_with(pr) || *pr == root)
+        .min_by_key(|p| p.components().count())
+        .unwrap_or_else(|| root.to_path_buf())
+}
+
+/// Source file metadatas for a task, anchored at the correct workspace root.
+struct SourceMetadatas {
+    root: PathBuf,
+    match_root: PathBuf,
+    files: Vec<(PathBuf, fs::Metadata)>,
+    /// Whether `sources` matched any file. The task's own config files are
+    /// always added to `files`, so `files` is not empty when this is false.
+    matched_sources: bool,
+}
+
+/// Collect source file metadatas for a task, anchored at the correct workspace root.
+async fn collect_source_metadatas(task: &Task, config: &Arc<Config>) -> Result<SourceMetadatas> {
+    let root = task_cwd(task, config).await?;
+    // Anchor the Override matcher at the outermost config root that is an
+    // ancestor of the task CWD (i.e. the workspace root). This allows
+    // workspace-rooted patterns like `{{ config_root }}/lib/**/*` to be
+    // correctly relativized so that files inside a subproject directory are
+    // not silently dropped.
+    //
+    // config.project_root cannot be used directly: BTreeMap iterates by
+    // lexicographic path order, so a subproject config may be returned
+    // before the workspace root config (mise.toml) even though
+    // the workspace root has a shorter path.
+    let match_root_owned = task_source_match_root(&root, config);
+    let match_root = match_root_owned.as_path();
+    let matcher = build_source_matcher(match_root, &root, &task.sources);
+    let glob_patterns = source_glob_patterns(&task.sources);
+    let pruner = DirPruner::for_sources(match_root, &root, &task.sources);
+    let mut source_metadatas = get_file_metadatas(&root, &glob_patterns, &matcher, &pruner)?;
+    let matched_sources = !source_metadatas.is_empty();
+    // Always include every file that contributed to the task definition,
+    // regardless of excludes — a stray `!mise.toml` must not silently
+    // disable invalidation.
+    for config_source in task.config_sources() {
+        let config_path = if config_source.is_absolute() {
+            config_source.to_path_buf()
+        } else {
+            root.join(config_source)
+        };
+        if let Ok(meta) = config_path.metadata()
+            && meta.is_file()
+            && !source_metadatas.iter().any(|(p, _)| p == &config_path)
+        {
+            source_metadatas.push((config_path, meta));
+        }
+    }
+    // The script a TOML task's `file` names defines it too. A file task's script is already
+    // its config source; a remote one has no local file and is skipped. It is not a config
+    // source, which would also make trust checks read it. A `file` that fails to render
+    // leaves the task to fail when it runs.
+    if let Ok(Some(script)) = task.file_path(config).await
+        && let Ok(meta) = script.metadata()
+        && meta.is_file()
+        && !source_metadatas.iter().any(|(p, _)| p == &script)
+    {
+        source_metadatas.push((script, meta));
+    }
+    Ok(SourceMetadatas {
+        root,
+        match_root: match_root_owned,
+        files: source_metadatas,
+        matched_sources,
+    })
+}
+
+/// Compute the current source hash for a task. Returns `(hash, hash_file_path)`
+/// or `None` if the task has no sources or no matching files were found.
+async fn compute_source_hash(
+    task: &Task,
+    config: &Arc<Config>,
+) -> Result<Option<(String, PathBuf)>> {
+    if task.sources.is_empty() {
+        return Ok(None);
+    }
+    let use_content_hash = Settings::get().task.source_freshness_hash_contents;
+    let SourceMetadatas {
+        root,
+        files: source_metadatas,
+        ..
+    } = collect_source_metadatas(task, config).await?;
+    if source_metadatas.is_empty() {
+        return Ok(None);
+    }
+    let source_hash = if use_content_hash {
+        let cache_path = content_hash_cache_path(task, &root);
+        let mut cache = load_content_hash_cache(&cache_path);
+        let h = file_contents_to_hash(&source_metadatas, &mut cache)?;
+        if let Err(e) = save_content_hash_cache(&cache_path, &cache) {
+            trace!("failed to save content hash cache: {e}");
+        }
+        h
+    } else {
+        file_metadatas_to_hash(&source_metadatas)
+    };
+    let source_hash_path = sources_hash_path(task, &root, use_content_hash);
+    Ok(Some((source_hash, source_hash_path)))
+}
+
+pub(crate) struct TaskCacheInputs {
+    pub source_hash: String,
+    pub source_paths: Vec<PathBuf>,
+    pub root_identity: PathBuf,
+}
+
+/// Compute stable paths and content hashes for artifact-cache inputs in one source scan.
+pub(crate) async fn task_cache_inputs(
+    task: &Task,
+    config: &Arc<Config>,
+    persist_content_hash_cache: bool,
+) -> Result<Option<TaskCacheInputs>> {
+    if task.sources.is_empty() {
+        return Ok(None);
+    }
+    let SourceMetadatas {
+        root,
+        match_root,
+        files: mut source_metadatas,
+        ..
+    } = collect_source_metadatas(task, config).await?;
+    if source_metadatas.is_empty() {
+        return Ok(None);
+    }
+    source_metadatas.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let cache_path = content_hash_cache_path(task, &root);
+    let mut cache = load_content_hash_cache(&cache_path);
+    let mut next = ContentHashCache::new();
+    let mut hasher = blake3::Hasher::new();
+    let mut source_paths = Vec::with_capacity(source_metadatas.len());
+    for (path, metadata) in source_metadatas {
+        let identity = match path.strip_prefix(&match_root) {
+            Ok(relative) => format!("workspace\0{}", relative.to_string_lossy()),
+            // Retaining the absolute path deliberately disables cross-checkout reuse for
+            // sources outside the workspace instead of allowing ambiguous identities.
+            Err(_) => format!("external\0{}", path.to_string_lossy()),
+        };
+        hasher.update(&(identity.len() as u64).to_le_bytes());
+        hasher.update(identity.as_bytes());
+        let contents = match cache.get(&path) {
+            Some(entry) if cached_entry_matches(entry, &metadata) => entry.hash.clone(),
+            _ => hash::file_hash_blake3(&path, None)?,
+        };
+        hasher.update(contents.as_bytes());
+        next.insert(path.clone(), make_cache_entry(&metadata, contents));
+        source_paths.push(path.strip_prefix(&root).unwrap_or(&path).to_path_buf());
+    }
+    cache = next;
+    if persist_content_hash_cache && let Err(e) = save_content_hash_cache(&cache_path, &cache) {
+        trace!("failed to save content hash cache: {e}");
+    }
+    let root_identity = root
+        .strip_prefix(&match_root)
+        .unwrap_or(&root)
+        .to_path_buf();
+    Ok(Some(TaskCacheInputs {
+        source_hash: hasher.finalize().to_hex().to_string(),
+        source_paths,
+        root_identity,
+    }))
+}
+
+/// The files a task's `sources` select right now, relative to the task's root, without
+/// hashing them. Used to notice files that started matching while a task ran.
+pub(crate) async fn task_source_paths(task: &Task, config: &Arc<Config>) -> Result<Vec<PathBuf>> {
+    let SourceMetadatas { root, files, .. } = collect_source_metadatas(task, config).await?;
+    Ok(files
+        .into_iter()
+        .map(|(path, _)| path.strip_prefix(&root).unwrap_or(&path).to_path_buf())
+        .collect())
+}
+
+/// Check if task sources are up to date (fresher than outputs)
+pub(crate) async fn sources_are_fresh(task: &Task, config: &Arc<Config>) -> Result<bool> {
+    if task.sources.is_empty() {
+        return Ok(false);
+    }
+    let settings = Settings::get();
+    let use_content_hash = settings.task.source_freshness_hash_contents;
+    let equal_mtime_is_fresh = settings.task.source_freshness_equal_mtime_is_fresh;
+
+    let run = async || -> Result<bool> {
+        let SourceMetadatas {
+            root,
+            files: source_metadatas,
+            matched_sources,
+            ..
+        } = collect_source_metadatas(task, config).await?;
+
+        // Check if sources resolved to no files (likely a config mistake).
+        // The task's own config file is still a source, so freshness is
+        // decided as before.
+        if !matched_sources {
+            warn!(
+                "task {} has sources defined but no matching files found",
+                task.name
+            );
+        }
+        if source_metadatas.is_empty() {
+            return Ok(false);
+        }
+
+        // Check for epoch timestamps (files extracted from tarballs without preserved timestamps)
+        // These are considered stale since we can't trust the mtime.
+        // Skipped in hash mode — content is the authority there, not timestamps.
+        if !use_content_hash {
+            for (path, metadata) in &source_metadatas {
+                if let Ok(mtime) = metadata.modified()
+                    && mtime == UNIX_EPOCH
+                {
+                    debug!(
+                        "source file {} has epoch timestamp, treating as stale",
+                        display_path(path)
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+
+        let source_hash = if use_content_hash {
+            let cache_path = content_hash_cache_path(task, &root);
+            let mut cache = load_content_hash_cache(&cache_path);
+            let h = file_contents_to_hash(&source_metadatas, &mut cache)?;
+            if let Err(e) = save_content_hash_cache(&cache_path, &cache) {
+                trace!("failed to save content hash cache: {e}");
+            }
+            h
+        } else {
+            file_metadatas_to_hash(&source_metadatas)
+        };
+        let source_hash_path = sources_hash_path(task, &root, use_content_hash);
+        if let Some(dir) = source_hash_path.parent() {
+            file::create_dir_all(dir)?;
+        }
+        let existing_hash = source_existing_hash(task, &root, use_content_hash);
+        if existing_hash.as_deref().is_some_and(|h| h != source_hash) {
+            debug!(
+                "source {} hash mismatch in {}",
+                if use_content_hash {
+                    "content"
+                } else {
+                    "metadata"
+                },
+                source_hash_path.display()
+            );
+            // Do not write the hash here — the task is about to run. If it
+            // fails, the baseline must stay at the previous value so the next
+            // invocation still detects the mismatch. save_checksum writes the
+            // hash after a successful run.
+            return Ok(false);
+        }
+        if use_content_hash {
+            // In hash mode, content alone determines freshness — no mtime check.
+            // With no stored baseline there is nothing to compare the content
+            // against, so the task is stale. Falling through to the mtime
+            // comparison here would let an edit whose mtime is older than the
+            // output masquerade as fresh — exactly what hash mode exists to
+            // prevent — on the first run after the setting is enabled.
+            if existing_hash.is_none() {
+                debug!("no stored content hash in {}", source_hash_path.display());
+                return Ok(false);
+            }
+            // Compare against the stored output hash to catch partial/missing outputs.
+            let current_output_hash = compute_output_hash(task, &root)?;
+            let stored_output_hash = output_existing_hash(task, &root);
+            let fresh = current_output_hash.is_some()
+                && current_output_hash.as_deref() == stored_output_hash.as_deref();
+            // Only when there is nothing to do. The hash mismatch above has
+            // already returned, so `source_hash` equals what is stored and the
+            // write moves nothing but the file's mtime — which is the baseline
+            // `task_source_files(only_changed=true)` measures against. Advancing
+            // it on the way into a run that has to repair a missing or modified
+            // output told that run nothing was outstanding, and it rendered an
+            // empty file list. Same reason the mismatch branch does not write:
+            // the task is about to run, and `save_checksum` records the baseline
+            // once it succeeds.
+            if fresh {
+                file::write(&source_hash_path, &source_hash)?;
+            }
+            return Ok(fresh);
+        }
+        let sources = get_last_modified_from_metadatas(&source_metadatas);
+        let outputs = get_last_modified(&root, &task.outputs.paths(task, &root))?;
+        trace!("sources: {sources:?}, outputs: {outputs:?}");
+        let fresh = match (sources, outputs) {
+            (Some(sources), Some(outputs)) => {
+                if equal_mtime_is_fresh {
+                    sources <= outputs
+                } else {
+                    sources < outputs
+                }
+            }
+            _ => false,
+        };
+        if fresh {
+            // Write a snapshot of the current hash so future checks can detect
+            // source changes even when mtime would appear fresh (e.g. after a
+            // touch or a cache restore).
+            file::write(&source_hash_path, &source_hash)?;
+        }
+        Ok(fresh)
+    };
+    Ok(run().await.unwrap_or_else(|err| {
+        warn!("sources_are_fresh: {err:?}");
+        false
+    }))
+}
+
+/// Save a checksum file after a task completes successfully
+pub(crate) async fn save_checksum(task: &Task, config: &Arc<Config>) -> Result<()> {
+    if task.sources.is_empty() {
+        return Ok(());
+    }
+    let root = task_cwd(task, config).await?;
+    if task.outputs.is_auto() {
+        for p in task.outputs.paths(task, &root) {
+            debug!("touching auto output file: {p}");
+            file::touch_file(&PathBuf::from(&p))?;
+        }
+    } else {
+        // Warn if any explicitly declared output was not generated.
+        for output in output_glob_patterns(&task.outputs.paths(task, &root)) {
+            let output_exists = if is_glob_pattern(&output) {
+                expand_enumeration_patterns(&output)
+                    .map(|patterns| {
+                        patterns.into_iter().any(|pattern| {
+                            let pattern = resolve_task_path(&root, pattern);
+                            glob_walk(&pattern, false)
+                                .map(|mut paths| {
+                                    paths.any(|entry| match entry {
+                                        Ok(_) => true,
+                                        Err(err) => symlink_walk_error_path(&err).is_some(),
+                                    })
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            } else {
+                let path = Path::new(&output);
+                let full_path = if path.is_relative() {
+                    root.join(path)
+                } else {
+                    path.to_path_buf()
+                };
+                fs::symlink_metadata(full_path).is_ok()
+            };
+            if !output_exists {
+                warn!(
+                    "task {} did not generate expected output: {}",
+                    task.name, output
+                );
+            }
+        }
+    }
+    // Persist the source hash now that the task has succeeded. Doing this here
+    // rather than in sources_are_fresh ensures a failed run never advances the
+    // baseline — the next invocation will detect a mismatch and re-run.
+    if let Some((hash, path)) = compute_source_hash(task, config).await? {
+        if let Some(dir) = path.parent() {
+            file::create_dir_all(dir)?;
+        }
+        file::write(&path, &hash)?;
+    }
+    // Persist the output hash so the next freshness check can detect missing
+    // or incomplete outputs even when the source hash still matches.
+    // Traversal errors (broken symlinks, unreadable files) are warned but not
+    // propagated — the task itself succeeded; failing here would be misleading.
+    // Without a stored output hash the next freshness check will conservatively
+    // treat the task as stale.
+    if Settings::get().task.source_freshness_hash_contents {
+        let out_path = outputs_hash_path(task, &root);
+        match compute_output_hash(task, &root) {
+            Ok(Some(h)) => {
+                if let Some(dir) = out_path.parent() {
+                    file::create_dir_all(dir)?;
+                }
+                file::write(&out_path, &h)?;
+            }
+            Ok(None) => {} // no outputs defined — nothing to save
+            Err(e) => {
+                // Remove the stale baseline so the next run is not skipped
+                // against an obsolete output snapshot.
+                let _ = std::fs::remove_file(&out_path);
+                warn!(
+                    "task {} output hashing failed; next run will not be skipped: {e}",
+                    task.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Identity hash for a task in a given working directory. Used as the
+/// filename stem for any per-task state we write under `STATE/task-sources/`,
+/// so that changes to the task definition (sources, cmd, etc.), the config
+/// file it came from, or the working directory all invalidate state in
+/// lock-step.
+fn task_state_key(task: &Task, root: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    task.hash(&mut hasher);
+    task.config_sources().hash(&mut hasher);
+    root.hash(&mut hasher);
+    task.run.hash(&mut hasher);
+    task.sources.hash(&mut hasher);
+    task.outputs.patterns().hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
+/// Get the path to store source hashes for a task
+fn sources_hash_path(task: &Task, root: &Path, content_hash: bool) -> PathBuf {
+    let suffix = if content_hash { "-content" } else { "" };
+    dirs::STATE
+        .join("task-sources")
+        .join(format!("{}{suffix}", task_state_key(task, root)))
+}
+
+/// Path of the marker recording that this task's work is done. Its mtime is
+/// the baseline for "changed since mise last considered this task up to date":
+/// `save_checksum` writes it after a successful run, and `sources_are_fresh`
+/// writes it when a freshness check finds there is nothing to do. A *failed*
+/// run advances neither, so its sources stay outstanding until it passes.
+///
+/// Callers outside this module cannot build the path themselves, because
+/// `task_state_key` hashes the working directory — it is only correct when
+/// the root comes from `task_cwd`.
+pub(crate) async fn source_baseline_path(task: &Task, config: &Arc<Config>) -> Result<PathBuf> {
+    let root = task_cwd(task, config).await?;
+    Ok(sources_hash_path(
+        task,
+        &root,
+        Settings::get().task.source_freshness_hash_contents,
+    ))
+}
+
+/// Get the existing source hash for a task, if it exists
+fn source_existing_hash(task: &Task, root: &Path, content_hash: bool) -> Option<String> {
+    let path = sources_hash_path(task, root, content_hash);
+    if path.exists() {
+        Some(file::read_to_string(&path).unwrap_or_default())
+    } else {
+        None
+    }
+}
+
+/// Path to the stored output hash for a task.
+fn outputs_hash_path(task: &Task, root: &Path) -> PathBuf {
+    dirs::STATE
+        .join("task-sources")
+        .join(format!("{}-outputs", task_state_key(task, root)))
+}
+
+/// Read the previously stored output hash, if any.
+fn output_existing_hash(task: &Task, root: &Path) -> Option<String> {
+    let path = outputs_hash_path(task, root);
+    if path.exists() {
+        Some(file::read_to_string(&path).unwrap_or_default())
+    } else {
+        None
+    }
+}
+
+/// Compute a content-integrity hash for all current output files.
+///
+/// Returns `None` when any statically-named output is missing (incomplete
+/// outputs), when a glob pattern expands to zero matching filesystem objects,
+/// or when the task declares no outputs. A `Some` value encodes the sorted
+/// `(path, blake3_content_hash)` of every resolved output file — two identical
+/// sets of fully-present, content-identical outputs produce the same hash.
+///
+/// Content hashing (blake3) catches same-size modifications inside directory
+/// outputs that `(path, size)` or `(path, size, mtime)` would miss.
+/// Directory outputs (static or glob-matched) are walked recursively.
+fn compute_output_hash(task: &Task, root: &Path) -> Result<Option<String>> {
+    let raw_patterns = task.outputs.paths(task, root);
+    let matcher = build_output_matcher(root, &raw_patterns)?;
+    let pruner = DirPruner::for_outputs(root, &raw_patterns);
+    let patterns_or_paths = output_glob_patterns(&raw_patterns);
+    if patterns_or_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let (glob_pats, static_paths): (Vec<&String>, Vec<&String>) =
+        patterns_or_paths.iter().partition(|p| is_glob_pattern(p));
+
+    // (path, blake3_hex) — full content hash for correctness.
+    let mut entries: Vec<(PathBuf, String)> = Vec::new();
+
+    fn hash_file(path: &Path) -> Result<(PathBuf, String)> {
+        Ok((path.to_path_buf(), hash::file_hash_blake3(path, None)?))
+    }
+
+    /// Walk a directory and push entries for all descendants.
+    /// Files get their blake3 content hash; subdirectories get a "dir" sentinel
+    /// so that additions/deletions of empty nested directories are detected.
+    /// Symlinked directories are followed so content changes inside them are
+    /// caught. Returns `true` when at least one entry was found.
+    fn push_dir_entries(
+        dir: &Path,
+        entries: &mut Vec<(PathBuf, String)>,
+        matcher: &Override,
+        pruner: &DirPruner,
+    ) -> Result<bool> {
+        let mut found_any = false;
+        for entry in pruner.walk_dir(dir, true) {
+            let Some(entry) = prune_symlink_walk_error(entry)? else {
+                continue;
+            };
+            let path = entry.path();
+            if path == dir {
+                continue; // skip the root directory itself
+            }
+            if !is_output(matcher, path, entry.file_type().is_dir()) {
+                continue;
+            }
+            if entry.file_type().is_file() {
+                entries.push(hash_file(path)?);
+                found_any = true;
+            } else if entry.file_type().is_dir() {
+                entries.push((path.to_path_buf(), "dir".to_string()));
+                found_any = true;
+            }
+        }
+        Ok(found_any)
+    }
+
+    for path_str in static_paths {
+        let path = {
+            let p = Path::new(path_str.as_str());
+            if p.is_relative() {
+                root.join(p)
+            } else {
+                p.to_path_buf()
+            }
+        };
+        match path.metadata() {
+            Ok(m) if m.is_file() => {
+                if is_output(&matcher, &path, false) {
+                    entries.push(hash_file(&path)?);
+                } else {
+                    continue;
+                }
+            }
+            Ok(m) if m.is_dir() => {
+                if !push_dir_entries(&path, &mut entries, &matcher, &pruner)?
+                    && is_output(&matcher, &path, true)
+                {
+                    // Empty directory — sentinel so its deletion is detected.
+                    entries.push((path, "empty-dir".to_string()));
+                }
+            }
+            Ok(_) => {
+                if is_output(&matcher, &path, false) {
+                    entries.push((path, "other".to_string()));
+                }
+            }
+            Err(_) => {
+                if is_output(&matcher, &path, false) || is_output(&matcher, &path, true) {
+                    return Ok(None); // selected and missing → outputs incomplete
+                }
+            }
+        }
+    }
+
+    for pattern_str in glob_pats {
+        let mut glob_matched = false;
+        for expanded in expand_enumeration_patterns(pattern_str)? {
+            let full = resolve_task_path(root, expanded);
+            let mut walker = glob_walk_pruned(&full, false, &pruner)?;
+            for entry in walker.by_ref() {
+                // Propagate glob resolution errors (OS errors during directory
+                // reads) rather than silently skipping them — a partial result
+                // could produce the same hash as a complete one.
+                let Some(entry) = prune_symlink_walk_error(entry)? else {
+                    continue;
+                };
+                let path = entry.into_path();
+                glob_matched = true;
+                let metadata = match path.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(_) => {
+                        if !is_output(&matcher, &path, false) && !is_output(&matcher, &path, true) {
+                            continue;
+                        }
+                        return Ok(None); // selected and unreadable → outputs incomplete
+                    }
+                };
+                if !is_output(&matcher, &path, metadata.is_dir()) {
+                    continue;
+                }
+                match metadata {
+                    m if m.is_file() => {
+                        entries.push(hash_file(&path)?);
+                    }
+                    m if m.is_dir() => {
+                        let found = push_dir_entries(&path, &mut entries, &matcher, &pruner)?;
+                        if !found {
+                            entries.push((path, "empty-dir".to_string()));
+                        }
+                    }
+                    _ => {
+                        entries.push((path, "other".to_string()));
+                    }
+                }
+            }
+            if !glob_matched && walker.pruned() {
+                // Everything it matched may sit in a directory the walk skipped.
+                glob_matched = glob_has_entries(&full, false);
+            }
+        }
+        // A glob that matches nothing means expected outputs are missing.
+        if !glob_matched {
+            return Ok(None);
+        }
+    }
+
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    Ok(Some(hash::hash_to_str(&entries)))
+}
+
+/// Get file metadata for a list of include-side patterns or paths, retaining
+/// only files that `matcher` selects as a source.
+fn get_file_metadatas(
+    root: &Path,
+    patterns_or_paths: &[String],
+    matcher: &SourceMatcher,
+    pruner: &DirPruner,
+) -> Result<Vec<(PathBuf, fs::Metadata)>> {
+    if patterns_or_paths.is_empty() {
+        return Ok(vec![]);
+    }
+    let (patterns, paths): (Vec<&String>, Vec<&String>) =
+        patterns_or_paths.iter().partition(|p| is_glob_pattern(p));
+
+    let mut metadatas = BTreeMap::new();
+    for pattern in patterns {
+        for expanded in expand_enumeration_patterns(pattern)? {
+            let pattern = resolve_task_path(root, expanded);
+            let files = glob_walk_pruned(&pattern, false, pruner)?;
+            for file in files.flatten().map(|entry| entry.into_path()) {
+                if let Ok(metadata) = file.metadata() {
+                    metadatas.insert(file, metadata);
+                }
+            }
+        }
+    }
+
+    for path in paths {
+        let file = resolve_task_path(root, path);
+        if let Ok(metadata) = file.metadata() {
+            metadatas.insert(file, metadata);
+        }
+    }
+
+    let metadatas = metadatas
+        .into_iter()
+        .filter(|(_, m)| m.is_file())
+        .filter(|(p, _)| is_source(matcher, p))
+        .collect_vec();
+
+    Ok(metadatas)
+}
+
+/// Convert file metadata to a hash string for comparison
+///
+/// Includes path, file size and mtime. Without the mtime, a change that keeps the file size — a
+/// version bump from `1.2.3` to `1.2.4`, say — and lands an mtime no newer than the output falls
+/// through to the mtime comparison below, which then reports the task as fresh and leaves a stale
+/// output in place. That is what tar, unzip, `rsync -a` and `cp -p` do when they restore an older
+/// tree; `git checkout` is unaffected because it always writes with the current time.
+///
+/// The [`SystemTime`] is hashed as it is rather than as a duration since the epoch: converting
+/// would fold every pre-epoch mtime into the same value as "this filesystem reports no mtime",
+/// making two distinct timestamps indistinguishable. `None` therefore means only that the mtime is
+/// unavailable.
+fn file_metadatas_to_hash(metadatas: &[(PathBuf, fs::Metadata)]) -> String {
+    let stat_info: Vec<_> = metadatas
+        .iter()
+        .map(|(p, m)| (p, m.len(), m.modified().ok()))
+        .collect();
+    hash::hash_to_str(&stat_info)
+}
+
+/// Per-file content hash cache entry. The `(size, mtime_secs, mtime_nanos)`
+/// tuple is the cache key (in the git-style "stat-info" sense): when those
+/// three match, we reuse `hash` without re-reading the file.
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedFileHash {
+    mtime_secs: i64,
+    mtime_nanos: u32,
+    size: u64,
+    /// Inode change time. Unlike mtime it cannot be set from userspace, so an edit that restores
+    /// the old size and mtime (`rsync -a`, `cp -p`, `touch -r`) still invalidates the entry.
+    /// Entries written before this field existed deserialize as 0 and are rehashed once.
+    #[serde(default)]
+    ctime_secs: i64,
+    #[serde(default)]
+    ctime_nanos: i64,
+    hash: String,
+}
+
+#[cfg(unix)]
+fn metadata_ctime(metadata: &fs::Metadata) -> (i64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.ctime(), metadata.ctime_nsec())
+}
+
+#[cfg(not(unix))]
+fn metadata_ctime(_metadata: &fs::Metadata) -> (i64, i64) {
+    (0, 0)
+}
+
+type ContentHashCache = BTreeMap<PathBuf, CachedFileHash>;
+
+/// Path to the per-task content-hash cache file. Shares `task_state_key`
+/// with `sources_hash_path` so changes to the task definition invalidate
+/// both in lock-step.
+fn content_hash_cache_path(task: &Task, root: &Path) -> PathBuf {
+    dirs::STATE
+        .join("task-sources")
+        .join(format!("{}-content-cache", task_state_key(task, root)))
+}
+
+fn load_content_hash_cache(path: &Path) -> ContentHashCache {
+    (|| -> Result<ContentHashCache> {
+        let mut zlib = ZlibDecoder::new(File::open(path)?);
+        let mut bytes = Vec::new();
+        zlib.read_to_end(&mut bytes)?;
+        Ok(rmp_serde::from_slice(&bytes)?)
+    })()
+    .unwrap_or_default()
+}
+
+fn save_content_hash_cache(path: &Path, cache: &ContentHashCache) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        file::create_dir_all(parent)?;
+    }
+    let partial = path.with_extension(format!("part-{}", random_string(8)));
+    {
+        let mut zlib = ZlibEncoder::new(File::create(&partial)?, Compression::fast());
+        zlib.write_all(&rmp_serde::to_vec_named(cache)?)?;
+        // Propagate finalization errors explicitly — ZlibEncoder's Drop impl
+        // would silently discard them, leaving a truncated partial file that
+        // we'd then rename into place as a poisoned cache.
+        zlib.finish()?;
+    }
+    file::rename(&partial, path)?;
+    Ok(())
+}
+
+fn cached_entry_matches(entry: &CachedFileHash, metadata: &fs::Metadata) -> bool {
+    let Ok(mtime) = metadata.modified() else {
+        return false;
+    };
+    let Ok(dur) = mtime.duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    let (ctime_secs, ctime_nanos) = metadata_ctime(metadata);
+    entry.size == metadata.len()
+        && entry.ctime_secs == ctime_secs
+        && entry.ctime_nanos == ctime_nanos
+        && entry.mtime_secs == dur.as_secs() as i64
+        && entry.mtime_nanos == dur.subsec_nanos()
+}
+
+fn make_cache_entry(metadata: &fs::Metadata, hash: String) -> CachedFileHash {
+    let dur = metadata
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok());
+    let (ctime_secs, ctime_nanos) = metadata_ctime(metadata);
+    CachedFileHash {
+        ctime_secs,
+        ctime_nanos,
+        mtime_secs: dur.map(|d| d.as_secs() as i64).unwrap_or(0),
+        mtime_nanos: dur.map(|d| d.subsec_nanos()).unwrap_or(0),
+        size: metadata.len(),
+        hash,
+    }
+}
+
+/// Convert file contents to a hash string for comparison using blake3.
+///
+/// More accurate than metadata hashing but slower since it reads all file
+/// contents. `cache` is consulted first: if a file's `(size, mtime_secs,
+/// mtime_nanos)` match the cached entry, the stored hash is reused and the
+/// file is not re-read. On return, `cache` is rebuilt from scratch with one
+/// entry per current source file — entries for files no longer in `sources`
+/// are pruned so the cache file size stays bounded.
+fn file_contents_to_hash(
+    metadatas: &[(PathBuf, fs::Metadata)],
+    cache: &mut ContentHashCache,
+) -> Result<String> {
+    let mut content_hashes: Vec<(&PathBuf, String)> = Vec::new();
+    let mut next: ContentHashCache = BTreeMap::new();
+    for (path, metadata) in metadatas {
+        let hash = match cache.get(path) {
+            Some(entry) if cached_entry_matches(entry, metadata) => entry.hash.clone(),
+            _ => hash::file_hash_blake3(path, None)?,
+        };
+        next.insert(path.clone(), make_cache_entry(metadata, hash.clone()));
+        content_hashes.push((path, hash));
+    }
+    *cache = next;
+    Ok(hash::hash_to_str(&content_hashes))
+}
+
+/// Get the last modified time from file metadata
+fn get_last_modified_from_metadatas(metadatas: &[(PathBuf, fs::Metadata)]) -> Option<SystemTime> {
+    metadatas.iter().flat_map(|(_, m)| m.modified()).max()
+}
+
+/// Get the last modified time from selected task outputs.
+fn get_last_modified(root: &Path, patterns_or_paths: &[String]) -> Result<Option<SystemTime>> {
+    if patterns_or_paths.is_empty() {
+        return Ok(None);
+    }
+    let matcher = build_output_matcher(root, patterns_or_paths)?;
+    let pruner = DirPruner::for_outputs(root, patterns_or_paths);
+    let mut file_modified = Vec::new();
+    let mut directory_modified = Vec::new();
+    for pattern in output_glob_patterns(patterns_or_paths) {
+        let is_glob = is_glob_pattern(&pattern);
+        let mut pruned_matches = false;
+        let candidates = if is_glob {
+            let mut candidates = Vec::new();
+            for expanded in expand_enumeration_patterns(&pattern)? {
+                let expanded = resolve_task_path(root, expanded);
+                let mut walker = glob_walk_pruned(&expanded, false, &pruner)?;
+                let before = candidates.len();
+                for entry in walker.by_ref() {
+                    if let Some(entry) = prune_symlink_walk_error(entry)? {
+                        candidates.push(entry.into_path());
+                    }
+                }
+                // Matches that sit in a skipped directory still count as found.
+                if candidates.len() == before
+                    && walker.pruned()
+                    && glob_has_entries(&expanded, false)
+                {
+                    pruned_matches = true;
+                }
+            }
+            candidates
+        } else {
+            vec![resolve_task_path(root, &pattern)]
+        };
+        let mut found_candidate = pruned_matches;
+        for candidate in candidates {
+            if fs::symlink_metadata(&candidate).is_err() {
+                continue;
+            }
+            found_candidate = true;
+            for entry in pruner.walk_dir(&candidate, true) {
+                let Some(entry) = prune_symlink_walk_error(entry)? else {
+                    continue;
+                };
+                let metadata = entry.metadata()?;
+                if is_output(&matcher, entry.path(), metadata.is_dir()) {
+                    if metadata.is_dir() {
+                        directory_modified.push(metadata.modified()?);
+                    } else {
+                        file_modified.push(metadata.modified()?);
+                    }
+                }
+            }
+        }
+        // Every positive output pattern represents a required artifact root.
+        // Excluded static paths are the exception; the ordered matcher makes
+        // those optional even though they remain in the enumeration list.
+        if !found_candidate
+            && (is_glob || {
+                let path = resolve_task_path(root, &pattern);
+                is_output(&matcher, &path, false) || is_output(&matcher, &path, true)
+            })
+        {
+            return Ok(None);
+        }
+    }
+    let last_mod = file_modified.into_iter().chain(directory_modified).max();
+
+    trace!(
+        "last_modified of {}: {last_mod:?}",
+        patterns_or_paths.iter().join(" ")
+    );
+    Ok(last_mod)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_walk_skips_symlink_loops() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let tree = temp.path().join("tree");
+        fs::create_dir(&tree)?;
+        fs::write(tree.join("input.txt"), "input")?;
+        symlink(".", tree.join("a"))?;
+        symlink(".", tree.join("b"))?;
+
+        let pattern = tree.join("**/*");
+        let entries = glob_walk(&pattern, false)?.collect_vec();
+        let paths = entries
+            .iter()
+            .filter_map(|entry| entry.as_ref().ok())
+            .map(|entry| entry.path())
+            .collect_vec();
+
+        assert!(paths.contains(&tree.join("input.txt").as_path()));
+        assert_eq!(entries.iter().filter(|entry| entry.is_err()).count(), 2);
+        assert!(
+            entries.len() < 10,
+            "loop expansion was not bounded: {entries:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_walk_skips_broken_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let tree = temp.path().join("tree");
+        fs::create_dir(&tree)?;
+        fs::write(tree.join("input.txt"), "input")?;
+        symlink("missing", tree.join("dangling"))?;
+        symlink("self", tree.join("self"))?;
+
+        let paths = glob_walk(&tree.join("**/*"), false)?
+            .filter_map(|entry| prune_symlink_walk_error(entry).transpose())
+            .map(|entry| entry.map(|entry| entry.into_path()))
+            .collect::<Result<Vec<_>>>()?;
+
+        assert_eq!(paths, [tree.join("input.txt")]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_walk_follows_non_looping_directory_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let tree = temp.path().join("tree");
+        let actual = temp.path().join("actual");
+        fs::create_dir(&tree)?;
+        fs::create_dir(&actual)?;
+        fs::write(actual.join("input.txt"), "input")?;
+        symlink("../actual", tree.join("linked"))?;
+
+        let paths = glob_walk(&tree.join("**/*"), false)?
+            .map(|entry| entry.map(|entry| entry.into_path()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert!(paths.contains(&tree.join("linked/input.txt")));
+        Ok(())
+    }
+
+    #[test]
+    fn glob_walk_preserves_non_recursive_depth_and_order() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let tree = temp.path().join("tree");
+        fs::create_dir_all(tree.join("nested"))?;
+        fs::write(tree.join("b.txt"), "b")?;
+        fs::write(tree.join("a.txt"), "a")?;
+        fs::write(tree.join("nested/deep.txt"), "deep")?;
+
+        let paths = glob_walk(&tree.join("*.txt"), false)?
+            .map(|entry| entry.map(|entry| entry.into_path()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(paths, [tree.join("a.txt"), tree.join("b.txt")]);
+        Ok(())
+    }
+
+    fn walked(pattern: &Path) -> Result<Vec<PathBuf>> {
+        glob_walk(pattern, false)?
+            .map(|entry| Ok(entry?.into_path()))
+            .collect()
+    }
+
+    #[test]
+    fn glob_walk_does_not_enter_directories_the_prefix_rules_out() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let tree = temp.path().join("tree");
+        fs::create_dir_all(tree.join("packages/p1/src/nested"))?;
+        fs::create_dir_all(tree.join("packages/p1/node_modules/dep"))?;
+        fs::create_dir_all(tree.join("packages/p2/src"))?;
+        fs::write(tree.join("packages/p1/src/a.ts"), "")?;
+        fs::write(tree.join("packages/p1/src/nested/b.ts"), "")?;
+        fs::write(tree.join("packages/p1/node_modules/dep/c.ts"), "")?;
+        fs::write(tree.join("packages/p2/src/d.ts"), "")?;
+
+        let paths = walked(&tree.join("packages/*/src/**/*"))?;
+        let files = paths.iter().filter(|p| p.is_file()).collect_vec();
+        assert_eq!(
+            files,
+            [
+                &tree.join("packages/p1/src/a.ts"),
+                &tree.join("packages/p1/src/nested/b.ts"),
+                &tree.join("packages/p2/src/d.ts"),
+            ]
+        );
+
+        // Unreadable directories outside `src` would error if they were entered.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = tree.join("packages/p1/node_modules/dep");
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))?;
+            let result =
+                glob_walk(&tree.join("packages/*/src/**/*"), false)?.collect::<Result<Vec<_>, _>>();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))?;
+            if !nix::unistd::Uid::effective().is_root() {
+                assert!(result.is_ok(), "walked into node_modules: {result:?}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn glob_walk_still_enters_directories_after_a_globstar() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let tree = temp.path().join("tree");
+        fs::create_dir_all(tree.join("src/deep/src"))?;
+        fs::create_dir_all(tree.join("other"))?;
+        fs::write(tree.join("src/deep/src/a.ts"), "")?;
+        fs::write(tree.join("other/b.ts"), "")?;
+
+        let paths = walked(&tree.join("**/src/**/*.ts"))?;
+        assert_eq!(paths, [tree.join("src/deep/src/a.ts")]);
+        Ok(())
+    }
+
+    #[test]
+    fn glob_walk_prefix_respects_case_insensitivity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let tree = temp.path().join("tree");
+        fs::create_dir_all(tree.join("pkg/SRC"))?;
+        fs::write(tree.join("pkg/SRC/a.ts"), "")?;
+
+        let pattern = tree.join("*/src/**/*.ts");
+        assert!(glob_walk(&pattern, false)?.next().is_none());
+        let paths = glob_walk(&pattern, true)?
+            .map(|entry| entry.map(|entry| entry.into_path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(paths, [tree.join("pkg/SRC/a.ts")]);
+        Ok(())
+    }
+
+    fn pruned_dirs(sources: &[&str], dirs: &[&str]) -> Vec<bool> {
+        let sources = sources.iter().map(|s| s.to_string()).collect_vec();
+        let root = Path::new("/project");
+        let pruner = DirPruner::for_sources(root, root, &sources);
+        dirs.iter()
+            .map(|dir| pruner.excludes(&root.join(dir)))
+            .collect()
+    }
+
+    #[test]
+    fn pruner_skips_directories_a_trailing_globstar_exclusion_covers() {
+        let sources = ["**/*.ts", "!**/node_modules/**"];
+        assert_eq!(
+            pruned_dirs(&sources, &["node_modules", "a/b/node_modules", "a", "src"]),
+            [true, true, false, false]
+        );
+        assert_eq!(
+            pruned_dirs(&["src/**", "!src/gen/**"], &["src/gen", "src", "gen"]),
+            [true, false, false]
+        );
+    }
+
+    #[test]
+    fn pruner_walks_directories_a_later_entry_can_include_again() {
+        let sources = ["src/**/*.ts", "!src/gen/**", "src/gen/keep.ts"];
+        assert_eq!(pruned_dirs(&sources, &["src/gen"]), [false]);
+        // A positive entry before the exclusion does not matter.
+        let sources = ["src/**/*.ts", "!src/gen/**"];
+        assert_eq!(pruned_dirs(&sources, &["src/gen"]), [true]);
+    }
+
+    #[test]
+    fn pruner_does_not_skip_what_an_entry_excludes_only_by_its_own_path() {
+        // `!src/gen`, `!src/*` and `!**/node_modules` exclude the paths they
+        // match, but files below a matching directory are still sources.
+        for entry in ["!src/gen", "!src/*", "!**/node_modules"] {
+            assert_eq!(
+                pruned_dirs(&["**/*.ts", entry], &["src/gen", "node_modules"]),
+                [false, false],
+                "{entry}"
+            );
+        }
+    }
+
+    #[test]
+    fn pruner_keeps_unreadable_patterns_and_outside_paths_walkable() {
+        assert_eq!(
+            pruned_dirs(&["**/*.ts", "!dist[12]/**"], &["dist1"]),
+            [false]
+        );
+        assert_eq!(pruned_dirs(&["**/*.ts", "!**"], &["a"]), [false]);
+        let root = Path::new("/project");
+        let pruner = DirPruner::for_sources(root, root, &["!/other/**".to_string()]);
+        assert!(!pruner.excludes(Path::new("/elsewhere/other")));
+    }
+
+    #[test]
+    fn pruner_for_outputs_covers_the_subtree_of_every_exclusion() {
+        let root = Path::new("/project");
+        let outputs = ["dist".to_string(), "!dist/.vite".to_string()];
+        let pruner = DirPruner::for_outputs(root, &outputs);
+        assert!(pruner.excludes(&root.join("dist/.vite")));
+        assert!(!pruner.excludes(&root.join("dist")));
+        assert!(!pruner.excludes(&root.join("dist/assets")));
+
+        let outputs = ["!dist/.vite".to_string(), "dist/.vite/keep".to_string()];
+        assert!(!DirPruner::for_outputs(root, &outputs).excludes(&root.join("dist/.vite")));
+    }
+
+    #[test]
+    fn pruner_walk_keeps_excluded_directories_without_entering_them() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        fs::create_dir_all(root.join("dist/cache/inner"))?;
+        fs::write(root.join("dist/a.txt"), "")?;
+        fs::write(root.join("dist/cache/inner/b.txt"), "")?;
+        let outputs = ["dist".to_string(), "!dist/cache/**".to_string()];
+        let pruner = DirPruner::for_outputs(root, &outputs);
+
+        let walked = pruner
+            .walk_dir(&root.join("dist"), true)
+            .map(|entry| entry.map(|entry| entry.into_path()))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sorted()
+            .collect_vec();
+        assert_eq!(
+            walked,
+            [
+                root.join("dist"),
+                root.join("dist/a.txt"),
+                root.join("dist/cache"),
+            ]
+        );
+
+        // Starting inside an excluded directory does not descend either.
+        let inside = pruner
+            .walk_dir(&root.join("dist/cache"), true)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(inside.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn get_file_metadatas_selects_the_same_files_without_entering_excluded_directories()
+    -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        fs::create_dir_all(root.join("src"))?;
+        fs::create_dir_all(root.join("node_modules/dep"))?;
+        fs::write(root.join("src/a.ts"), "")?;
+        fs::write(root.join("node_modules/dep/b.ts"), "")?;
+        let sources = ["**/*.ts".to_string(), "!**/node_modules/**".to_string()];
+        let matcher = build_source_matcher(root, root, &sources);
+        let patterns = source_glob_patterns(&sources);
+
+        let plain = get_file_metadatas(root, &patterns, &matcher, &DirPruner::none())?;
+        let pruner = DirPruner::for_sources(root, root, &sources);
+        let pruned = get_file_metadatas(root, &patterns, &matcher, &pruner)?;
+        let names = |files: &[(PathBuf, fs::Metadata)]| {
+            files.iter().map(|(path, _)| path.clone()).collect_vec()
+        };
+        assert_eq!(names(&plain), [root.join("src/a.ts")]);
+        assert_eq!(names(&pruned), names(&plain));
+
+        let mut walker = glob_walk_pruned(&root.join("**/*.ts"), false, &pruner)?;
+        let walked = walker
+            .by_ref()
+            .map(|entry| entry.map(|entry| entry.into_path()))
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(walked, [root.join("src/a.ts")]);
+        assert!(walker.pruned());
+        Ok(())
+    }
+
+    #[test]
+    fn pruner_excludes_a_walk_root_below_an_excluded_ancestor() {
+        let root = Path::new("/project");
+        let outputs = [
+            "dist".to_string(),
+            "dist/cache/nested".to_string(),
+            "!dist/cache/**".to_string(),
+        ];
+        let pruner = DirPruner::for_outputs(root, &outputs);
+        assert!(pruner.excludes_from(&root.join("dist/cache/nested"), true));
+        assert!(!pruner.excludes_from(&root.join("dist/cache/nested"), false));
+        assert!(!pruner.excludes_from(&root.join("dist/other"), true));
+    }
+
+    #[test]
+    fn pruner_with_a_relative_root_matches_paths_named_like_the_root() {
+        let root = Path::new("proj");
+        let outputs = ["proj/cache/nested".to_string(), "!cache/**".to_string()];
+        let pruner = DirPruner::for_outputs(root, &outputs);
+        // `proj/proj/cache` is `cache/nested`'s sibling directory below the root,
+        // not an excluded `cache`.
+        assert!(!pruner.excludes_from(&root.join("proj/cache/nested"), true));
+        assert!(pruner.excludes_from(&root.join("cache/nested"), true));
+    }
+
+    #[test]
+    fn pruner_root_is_normalized_like_the_paths_it_compares() {
+        let outputs = ["dist".to_string(), "!dist/cache".to_string()];
+        let pruner = DirPruner::for_outputs(Path::new("/project/./sub/.."), &outputs);
+        assert!(pruner.excludes(Path::new("/project/dist/cache")));
+    }
+
+    #[test]
+    fn glob_walk_does_not_prune_prefixes_around_character_classes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let tree = temp.path().join("tree");
+        fs::create_dir_all(tree.join("a/src"))?;
+        fs::write(tree.join("a/src/input.ts"), "")?;
+
+        // `[ab/]` is one component for the matcher, which the prefix filter
+        // must not split in two and rule `a/src` out.
+        let paths = walked(&tree.join("[ab/]/src/**/*.ts"))?;
+        assert!(paths.contains(&tree.join("a/src/input.ts")), "{paths:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn glob_walk_matches_below_a_relative_base_named_like_a_match() -> Result<()> {
+        let temp = tempfile::tempdir_in(".")?;
+        let name = temp.path().file_name().unwrap().to_owned();
+        fs::create_dir_all(temp.path().join(&name))?;
+        fs::write(temp.path().join(&name).join("input.txt"), "")?;
+
+        // The base is `<name>`, so the match sits at `<name>/<name>/input.txt`.
+        let pattern = Path::new(&name).join("*/*.txt");
+        let paths = walked(&pattern)?;
+        assert_eq!(paths, [Path::new(&name).join(&name).join("input.txt")]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glob_has_entries_counts_dangling_symlinks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::os::unix::fs::symlink("missing", temp.path().join("dangling.js"))?;
+        assert!(glob_has_entries(&temp.path().join("*.js"), true));
+        assert!(!glob_has_entries(&temp.path().join("*.js"), false));
+        Ok(())
+    }
+
+    #[test]
+    fn glob_has_entries_sees_matches_inside_skipped_directories() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        fs::create_dir_all(root.join("vendor/x"))?;
+        fs::write(root.join("vendor/x/a.js"), "")?;
+        assert!(glob_has_entries(&root.join("vendor/**/*.js"), false));
+        assert!(!glob_has_entries(&root.join("vendor/**/*.rs"), false));
+        Ok(())
+    }
+
+    #[test]
+    fn glob_walk_treats_missing_literal_prefix_as_no_matches() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let entries = glob_walk(&temp.path().join("missing/**/*.txt"), false)?.collect_vec();
+
+        assert!(entries.is_empty());
+        Ok(())
+    }
+
+    fn matches(sources: &[&str], path: &str) -> bool {
+        let sources: Vec<String> = sources.iter().map(|s| s.to_string()).collect();
+        let root = Path::new(".");
+        let matcher = build_source_matcher(root, root, &sources);
+        is_source(&matcher, Path::new(path))
+    }
+
+    /// Gitignore patterns are `/`-separated on every platform, but `Path`
+    /// renders `\` on Windows and `globset` reads that as an escape. A pattern
+    /// rebuilt from a `PathBuf` there stops meaning what it says: a negated
+    /// entry no longer excludes, so the matcher widens instead of narrowing.
+    /// This only bites on Windows, so it is asserted rather than left to the
+    /// platform-specific tests that happen to cover it.
+    #[test]
+    fn patterns_stay_slash_separated_on_every_platform() {
+        let joined = Path::new("dist").join("**").join("*.map");
+        assert_eq!(pattern_from_path(&joined).unwrap(), "dist/**/*.map");
+
+        let root = Path::new("/project");
+        let normalized = normalize_pattern(root, root, "!dist/**/*.map");
+        assert_eq!(normalized, "!dist/**/*.map");
+    }
+
+    #[test]
+    fn output_matcher_excludes_and_reincludes_descendants() {
+        let root = Path::new("/project");
+        let patterns = vec![
+            "dist".to_string(),
+            "!dist/**/*.map".to_string(),
+            "dist/keep.map".to_string(),
+        ];
+        let matcher = build_output_matcher(root, &patterns).unwrap();
+
+        assert!(is_output(&matcher, &root.join("dist/app.js"), false));
+        assert!(!is_output(&matcher, &root.join("dist/app.map"), false));
+        assert!(is_output(&matcher, &root.join("dist/nested/app.js"), false));
+        assert!(is_output(&matcher, &root.join("dist/keep.map"), false));
+    }
+
+    #[test]
+    fn output_matcher_normalizes_absolute_patterns_under_root() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("dist/result.txt");
+        let patterns = vec![format!("{}/dist/**/*", root.path().display())];
+        let matcher = build_output_matcher(root.path(), &patterns).unwrap();
+
+        assert!(is_output(&matcher, &output, false));
+    }
+
+    /// Output enumeration resolves candidates from the raw pattern, so the
+    /// `..` the matcher resolved away is still present in the path it is asked
+    /// about. Both sides must normalize or the output never matches and the
+    /// task stays permanently stale.
+    ///
+    /// The pattern has to contain a slash to pin this down: a slashless
+    /// gitignore pattern matches at any depth, so an un-normalized path would
+    /// match on its basename alone and hide the difference.
+    #[test]
+    fn output_matcher_normalizes_parent_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let patterns = vec!["dist/../out/result.txt".to_string()];
+        let matcher = build_output_matcher(root.path(), &patterns).unwrap();
+
+        assert!(is_output(
+            &matcher,
+            &root.path().join("dist/../out/result.txt"),
+            false
+        ));
+        assert!(is_output(
+            &matcher,
+            &root.path().join("out/result.txt"),
+            false
+        ));
+    }
+
+    #[test]
+    fn metadata_hash_notices_a_same_size_change_with_an_older_mtime() {
+        // https://github.com/jdx/mise/discussions/4209 — restoring an older tree with tar,
+        // `rsync -a` or `cp -p` keeps the recorded mtime, so a same-size edit is invisible to a
+        // hash built from the path and size alone and the mtime comparison then calls it fresh.
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path().join("pin.txt");
+        fs::write(&p, "1.2.3").unwrap();
+        let before = file_metadatas_to_hash(&[(p.clone(), fs::metadata(&p).unwrap())]);
+
+        fs::write(&p, "1.2.4").unwrap();
+        let restored = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000));
+        crate::file::set_times(&p, restored, restored).unwrap();
+        let after = file_metadatas_to_hash(&[(p.clone(), fs::metadata(&p).unwrap())]);
+
+        assert_eq!(
+            fs::metadata(&p).unwrap().len(),
+            5,
+            "the fixture only exercises the bug while both versions are the same size"
+        );
+        assert_ne!(before, after, "the mtime change should be part of the hash");
+    }
+
+    #[test]
+    fn metadata_hash_separates_pre_epoch_mtimes() {
+        // mtimes from before 1970 must stay distinct from each other, and from "the filesystem
+        // reports no mtime" — folding them together would hide a change the same way the missing
+        // mtime did.
+        let root = tempfile::tempdir().unwrap();
+        let p = root.path().join("ancient.txt");
+        fs::write(&p, "x").unwrap();
+
+        let stamp = |secs: i64| {
+            let offset = std::time::Duration::from_secs(secs.unsigned_abs());
+            let t = Some(if secs < 0 {
+                std::time::UNIX_EPOCH - offset
+            } else {
+                std::time::UNIX_EPOCH + offset
+            });
+            // a filesystem that cannot store a pre-epoch timestamp is not what this pins down
+            crate::file::set_times(&p, t, t).ok()?;
+            let metadata = fs::metadata(&p).unwrap();
+            let mtime = metadata.modified().ok()?;
+            Some((mtime, file_metadatas_to_hash(&[(p.clone(), metadata)])))
+        };
+        let (Some((first_mtime, first)), Some((second_mtime, second))) =
+            (stamp(-2_000_000), stamp(-1_000_000))
+        else {
+            return;
+        };
+        if first_mtime == second_mtime {
+            return;
+        }
+
+        assert_ne!(
+            first, second,
+            "two different pre-epoch mtimes should hash differently"
+        );
+    }
+
+    #[test]
+    fn output_globs_ignore_excludes_and_unescape_literal_bangs() {
+        assert_eq!(
+            output_glob_patterns(&[
+                "dist".to_string(),
+                "!dist/**/*.map".to_string(),
+                "\\!important".to_string(),
+            ]),
+            ["dist", "!important"]
+        );
+    }
+
+    /// A trailing `**` must enumerate files. The `glob` crate matches it against
+    /// directories only, so without the expansion `src/**` yields subdirectories
+    /// and no files at all — a `sources` entry that contributes nothing to
+    /// freshness and an `outputs` entry that archives nothing.
+    #[test]
+    fn trailing_globstar_expands_to_reach_files() {
+        assert_eq!(expand_trailing_globstar("src/**"), "src/**/*");
+        assert_eq!(expand_trailing_globstar("**"), "**/*");
+        assert_eq!(expand_enumeration_patterns("src/**").unwrap(), ["src/**/*"]);
+    }
+
+    /// The expansion runs on each brace alternative. `{src/**,dist/**}` ends in
+    /// `}`, so a check against the whole pattern never sees the `**` and every
+    /// alternative would go on enumerating directories only.
+    #[test]
+    fn trailing_globstar_expands_inside_brace_alternatives() {
+        assert_eq!(
+            expand_enumeration_patterns("{src,dist}/**").unwrap(),
+            ["src/**/*", "dist/**/*"]
+        );
+        assert_eq!(
+            expand_enumeration_patterns("{src/**,dist/**,docs/*.md}").unwrap(),
+            ["src/**/*", "dist/**/*", "docs/*.md"]
+        );
+    }
+
+    /// `\` is a path separator on Windows, so `src\**` is a trailing globstar
+    /// there and carries the same defect. On unix the same string is an escape
+    /// that `glob` rejects outright, so it must be left alone.
+    #[test]
+    fn trailing_globstar_follows_platform_separators() {
+        if cfg!(windows) {
+            assert_eq!(expand_trailing_globstar(r"src\**"), r"src\**/*");
+        } else {
+            assert_eq!(expand_trailing_globstar(r"src\**"), r"src\**");
+        }
+    }
+
+    /// Only a *trailing* `**` is wrong. In the interior it already spans
+    /// directories correctly, and rewriting it would change what the pattern
+    /// selects rather than fixing what it enumerates.
+    #[test]
+    fn interior_globstar_and_other_patterns_are_untouched() {
+        for pattern in [
+            "src/**/foo.rs",
+            "src/**/*.ts",
+            "src/*",
+            "dist",
+            "src/**/*",
+            "**/*",
+            "a**",
+        ] {
+            assert_eq!(expand_trailing_globstar(pattern), pattern);
+        }
+    }
+
+    #[test]
+    fn glob_braces_expand_nested_and_multiple_alternates() {
+        assert_eq!(
+            expand_glob_braces("src/{a,{b,c}}/{one,two}.txt").unwrap(),
+            [
+                "src/a/one.txt",
+                "src/a/two.txt",
+                "src/b/one.txt",
+                "src/b/two.txt",
+                "src/c/one.txt",
+                "src/c/two.txt",
+            ]
+        );
+        assert_eq!(expand_glob_braces("{,a}.txt").unwrap(), ["a.txt"]);
+        assert!(expand_glob_braces("src/{a,b.txt").is_err());
+        assert!(expand_glob_braces(&"{a,b}".repeat(11)).is_err());
+    }
+
+    #[test]
+    fn glob_braces_preserve_literal_singleton_groups() {
+        assert_eq!(
+            expand_glob_braces("{generated}.txt").unwrap(),
+            ["[{]generated[}].txt"]
+        );
+        assert_eq!(
+            expand_glob_braces("{generated}/{a,b}.txt").unwrap(),
+            ["[{]generated[}]/a.txt", "[{]generated[}]/b.txt"]
+        );
+        assert_eq!(
+            expand_glob_braces("{generated}.{txt,out}").unwrap(),
+            ["[{]generated[}].txt", "[{]generated[}].out"]
+        );
+        assert_eq!(
+            expand_glob_braces("{prefix-{a,b}}.txt").unwrap(),
+            ["[{]prefix-a[}].txt", "[{]prefix-b[}].txt"]
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn glob_braces_preserve_escaped_unix_braces() {
+        assert_eq!(
+            expand_glob_braces(r"src/\{literal\}/[{}].txt").unwrap(),
+            [r"src/\{literal\}/[{}].txt"]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn glob_braces_treat_windows_backslashes_as_separators() {
+        assert_eq!(
+            expand_glob_braces(r"C:\build\{debug,release}\*.exe").unwrap(),
+            [r"C:\build\debug\*.exe", r"C:\build\release\*.exe"]
+        );
+    }
+
+    #[test]
+    fn source_and_output_matchers_support_ordered_brace_globs() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source_matcher = build_source_matcher(
+            root,
+            root,
+            &[
+                "{Cargo.toml,README.md}".to_string(),
+                "!README.md".to_string(),
+                "README.md".to_string(),
+            ],
+        );
+        let output_matcher = build_output_matcher(
+            root,
+            &[
+                "{Cargo.toml,README.md}".to_string(),
+                "!README.md".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert!(is_source(&source_matcher, &root.join("Cargo.toml")));
+        assert!(is_source(&source_matcher, &root.join("README.md")));
+        assert!(is_output(&output_matcher, &root.join("Cargo.toml"), false));
+        assert!(!is_output(&output_matcher, &root.join("README.md"), false));
+    }
+
+    #[test]
+    fn output_hash_supports_brace_globs() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a.out"), "a").unwrap();
+        fs::write(root.path().join("b.out"), "b").unwrap();
+        let task = Task {
+            outputs: crate::task::task_sources::TaskOutputs::Files(vec!["{a,b}.out".to_string()]),
+            ..Default::default()
+        };
+
+        assert!(compute_output_hash(&task, root.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn output_mtime_includes_selected_directories() {
+        let root = tempfile::tempdir().unwrap();
+        let dist = root.path().join("dist");
+        let output = dist.join("result.txt");
+        fs::create_dir(&dist).unwrap();
+        fs::write(&output, "result").unwrap();
+        let file_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let directory_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_secs(200);
+        crate::file::set_times(&output, None, Some(file_mtime)).unwrap();
+        crate::file::set_times(&dist, None, Some(directory_mtime)).unwrap();
+
+        let modified = get_last_modified(root.path(), &["dist".to_string()])
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(modified, directory_mtime);
+    }
+
+    #[test]
+    fn output_mtime_requires_all_selected_static_paths() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("present.txt"), "present").unwrap();
+
+        let modified = get_last_modified(
+            root.path(),
+            &["present.txt".to_string(), "missing.txt".to_string()],
+        )
+        .unwrap();
+
+        assert!(modified.is_none());
+    }
+
+    #[test]
+    fn output_mtime_requires_each_positive_glob_to_match() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("present.txt"), "present").unwrap();
+
+        let modified = get_last_modified(
+            root.path(),
+            &["present.txt".to_string(), "*.generated".to_string()],
+        )
+        .unwrap();
+
+        assert!(modified.is_none());
+    }
+
+    #[test]
+    fn output_mtime_allows_missing_excluded_static_paths() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("present.txt"), "present").unwrap();
+
+        let modified = get_last_modified(
+            root.path(),
+            &[
+                "present.txt".to_string(),
+                "missing.txt".to_string(),
+                "!missing.txt".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert!(modified.is_some());
+    }
+
+    #[test]
+    fn output_mtime_brace_alternatives_require_any_match() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("a.out"), "a").unwrap();
+
+        let modified = get_last_modified(root.path(), &["{a,b}.out".to_string()]).unwrap();
+
+        assert!(modified.is_some());
+    }
+
+    #[test]
+    fn output_mtime_allows_glob_matches_that_are_all_excluded() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("present.txt"), "present").unwrap();
+        fs::create_dir(root.path().join("dist")).unwrap();
+        fs::write(root.path().join("dist/vendor.js"), "vendor").unwrap();
+
+        let modified = get_last_modified(
+            root.path(),
+            &[
+                "present.txt".to_string(),
+                "dist/*.js".to_string(),
+                "!dist/vendor.js".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert!(modified.is_some());
+    }
+
+    #[test]
+    fn output_hash_allows_missing_excluded_static_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let task = Task {
+            outputs: crate::task::task_sources::TaskOutputs::Files(vec![
+                "missing.txt".to_string(),
+                "!missing.txt".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        assert!(compute_output_hash(&task, root.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn output_hash_allows_glob_matches_that_are_all_excluded() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("dist")).unwrap();
+        fs::write(root.path().join("dist/vendor.js"), "vendor").unwrap();
+        let task = Task {
+            outputs: crate::task::task_sources::TaskOutputs::Files(vec![
+                "dist/*.js".to_string(),
+                "!dist/vendor.js".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        assert!(compute_output_hash(&task, root.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn task_state_key_includes_all_definition_sources() {
+        let root = Path::new("/project");
+        let mut task = Task {
+            name: "build".to_string(),
+            config_source: PathBuf::from(".mise/tasks/build"),
+            ..Default::default()
+        };
+        let primary_key = task_state_key(&task, root);
+
+        task.additional_config_sources
+            .push(PathBuf::from("mise.toml"));
+
+        assert_ne!(primary_key, task_state_key(&task, root));
+    }
+
+    #[test]
+    fn task_state_key_changes_when_run_changes() {
+        use crate::task::RunEntry;
+        let root = Path::new("/project");
+        let mut task = Task {
+            name: "build".to_string(),
+            config_source: PathBuf::from("mise.toml"),
+            run: vec![RunEntry::Script("echo v1".to_string())],
+            ..Default::default()
+        };
+        let key_v1 = task_state_key(&task, root);
+        task.run = vec![RunEntry::Script("echo v2".to_string())];
+        assert_ne!(key_v1, task_state_key(&task, root));
+    }
+
+    #[test]
+    fn task_state_key_changes_when_sources_change() {
+        let root = Path::new("/project");
+        let mut task = Task {
+            name: "build".to_string(),
+            config_source: PathBuf::from("mise.toml"),
+            sources: vec!["src.txt".to_string()],
+            ..Default::default()
+        };
+        let key_v1 = task_state_key(&task, root);
+        task.sources = vec!["other.txt".to_string()];
+        assert_ne!(key_v1, task_state_key(&task, root));
+    }
+
+    #[test]
+    fn glob_patterns_drops_excludes_and_unescapes() {
+        let inputs = vec![
+            "src/**/*.ts".to_string(),
+            "!src/**/*.test.ts".to_string(),
+            "\\!literal.txt".to_string(),
+            "tsconfig.json".to_string(),
+        ];
+        assert_eq!(
+            source_glob_patterns(&inputs),
+            vec!["src/**/*.ts", "!literal.txt", "tsconfig.json"],
+        );
+    }
+
+    #[test]
+    fn matcher_includes_plain_pattern() {
+        assert!(matches(&["src/**/*.ts"], "src/foo.ts"));
+        assert!(matches(&["src/**/*.ts"], "src/sub/foo.ts"));
+        assert!(!matches(&["src/**/*.ts"], "lib/foo.ts"));
+    }
+
+    #[test]
+    fn matcher_negation_excludes() {
+        let pats = &["src/**/*.ts", "!src/**/*.test.ts"];
+        assert!(matches(pats, "src/foo.ts"));
+        assert!(!matches(pats, "src/foo.test.ts"));
+    }
+
+    #[test]
+    fn matcher_reincludes_after_negation() {
+        // Re-inclusion semantics: a later non-negated entry wins over an
+        // earlier `!`-negation, just like a gitignore whitelist.
+        let pats = &["src/**/*.ts", "!src/**/*.test.ts", "src/keep.test.ts"];
+        assert!(matches(pats, "src/foo.ts"));
+        assert!(!matches(pats, "src/foo.test.ts"));
+        assert!(matches(pats, "src/keep.test.ts"));
+    }
+
+    #[test]
+    fn matcher_escaped_literal_bang() {
+        let pats = &["\\!important.txt", "!ignored.txt"];
+        assert!(matches(pats, "!important.txt"));
+        assert!(!matches(pats, "ignored.txt"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn matcher_absolute_literal_bang_under_root() {
+        let root = Path::new("/project");
+        let sources = vec!["/project/!important.txt".to_string()];
+        let matcher = build_source_matcher(root, root, &sources);
+        assert!(is_source(&matcher, Path::new("/project/!important.txt")));
+        assert!(!is_source(&matcher, Path::new("/project/other.txt")));
+    }
+
+    #[test]
+    fn matcher_braced_alternative_starting_with_bang_is_a_filename() {
+        let root = Path::new("/ws");
+        let task_cwd = Path::new("/ws/pkg");
+        let sources = vec!["{!important,other}.txt".to_string()];
+        let matcher = build_source_matcher(root, task_cwd, &sources);
+        assert!(is_source(&matcher, Path::new("/ws/pkg/!important.txt")));
+        assert!(is_source(&matcher, Path::new("/ws/pkg/other.txt")));
+        assert!(!is_source(&matcher, Path::new("/ws/pkg/third.txt")));
+
+        let sources = vec!["**".to_string(), "!{!important,other}.txt".to_string()];
+        let matcher = build_source_matcher(root, root, &sources);
+        assert!(!is_source(&matcher, Path::new("/ws/!important.txt")));
+        assert!(!is_source(&matcher, Path::new("/ws/other.txt")));
+        assert!(is_source(&matcher, Path::new("/ws/third.txt")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn matcher_absolute_pattern_under_root() {
+        // Patterns that resolve to absolute paths under the matcher root
+        // (e.g. from `{{cwd}}/input` after templating) are normalized to
+        // root-relative so gitignore semantics work correctly.
+        // Unix-only because Windows uses `C:\...` for absolute paths and
+        // `Path::is_absolute` returns false for `/proj` there.
+        let root = Path::new("/proj");
+        let sources = vec!["/proj/input".to_string()];
+        let matcher = build_source_matcher(root, root, &sources);
+        assert!(is_source(&matcher, Path::new("/proj/input")));
+        assert!(!is_source(&matcher, Path::new("/proj/other")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn matcher_absolute_negation_under_root() {
+        let root = Path::new("/proj");
+        let sources = vec![
+            "/proj/src/**/*.ts".to_string(),
+            "!/proj/src/**/*.test.ts".to_string(),
+        ];
+        let matcher = build_source_matcher(root, root, &sources);
+        assert!(is_source(&matcher, Path::new("/proj/src/foo.ts")));
+        assert!(!is_source(&matcher, Path::new("/proj/src/foo.test.ts")));
+    }
+
+    /// Regression: an absolute path outside the matcher's root must not be
+    /// silently dropped. `Override::matched` returns `Match::None` for such
+    /// paths and (with positive patterns present) promotes them to
+    /// `Match::Ignore`, which would silently exclude legitimate sources
+    /// (e.g. a workspace-root file referenced from a sub-package task).
+    #[test]
+    #[cfg(unix)]
+    fn matcher_absolute_path_outside_root_passes_through() {
+        let root = Path::new("/proj");
+        let sources = vec!["/elsewhere/Cargo.toml".to_string()];
+        let matcher = build_source_matcher(root, root, &sources);
+        assert!(is_source(&matcher, Path::new("/elsewhere/Cargo.toml")));
+    }
+
+    /// Workspace-rooted absolute pattern in a subproject task must match files
+    /// both inside and outside the subproject CWD.
+    #[test]
+    #[cfg(unix)]
+    fn matcher_subproject_absolute_workspace_pattern() {
+        let match_root = Path::new("/workspace");
+        let task_cwd = Path::new("/workspace/lib/worker");
+        let sources = vec!["/workspace/lib/**/*".to_string()];
+        let matcher = build_source_matcher(match_root, task_cwd, &sources);
+        assert!(is_source(
+            &matcher,
+            Path::new("/workspace/lib/worker/worker.go")
+        ));
+        assert!(is_source(&matcher, Path::new("/workspace/lib/shared.go")));
+        assert!(!is_source(&matcher, Path::new("/workspace/other/file.go")));
+    }
+
+    #[test]
+    fn absolute_source_patterns_are_enumerated_from_a_subproject() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path();
+        let task_cwd = workspace.join("packages/app");
+        let source = task_cwd.join("src/input.txt");
+        let global = workspace.join("workspace.txt");
+        fs::create_dir_all(source.parent().unwrap())?;
+        fs::write(&source, "source")?;
+        fs::write(&global, "global")?;
+
+        let sources = vec![
+            format!("{}/packages/app/src/**/*", workspace.display()),
+            global.to_string_lossy().to_string(),
+        ];
+        let matcher = build_source_matcher(workspace, &task_cwd, &sources);
+        let metadatas = get_file_metadatas(
+            &task_cwd,
+            &source_glob_patterns(&sources),
+            &matcher,
+            &DirPruner::none(),
+        )?;
+        let paths = metadatas
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+
+        assert!(paths.contains(&source), "{paths:?}");
+        assert!(paths.contains(&global), "{paths:?}");
+        Ok(())
+    }
+
+    /// Relative pattern in a subproject task must be anchored at the task CWD,
+    /// not the workspace root.
+    #[test]
+    #[cfg(unix)]
+    fn matcher_subproject_relative_pattern() {
+        let match_root = Path::new("/workspace");
+        let task_cwd = Path::new("/workspace/lib/worker");
+        let sources = vec!["src/**/*.go".to_string()];
+        let matcher = build_source_matcher(match_root, task_cwd, &sources);
+        assert!(is_source(
+            &matcher,
+            Path::new("/workspace/lib/worker/src/main.go")
+        ));
+        assert!(!is_source(&matcher, Path::new("/workspace/src/other.go")));
+    }
+
+    /// `..` in a relative pattern climbs out of the task CWD while the pattern
+    /// stays anchored inside the workspace root.
+    #[test]
+    #[cfg(unix)]
+    fn matcher_subproject_parent_relative_pattern() {
+        let match_root = Path::new("/workspace");
+        let task_cwd = Path::new("/workspace/lib/worker");
+        let sources = vec!["../shared/**/*.go".to_string()];
+        let matcher = build_source_matcher(match_root, task_cwd, &sources);
+        assert!(is_source(
+            &matcher,
+            Path::new("/workspace/lib/shared/util.go")
+        ));
+        assert!(!is_source(&matcher, Path::new("/workspace/other.go")));
+    }
+
+    /// `glob` builds its results from the raw pattern, so a `../` source
+    /// enumerates paths that still contain `..`. They must survive the matcher
+    /// that no longer holds one.
+    #[test]
+    #[cfg(unix)]
+    fn matcher_accepts_enumerated_paths_containing_parent_dirs() {
+        let match_root = Path::new("/workspace");
+        let task_cwd = Path::new("/workspace/lib/worker");
+        let sources = vec!["../shared/**/*.go".to_string()];
+        let matcher = build_source_matcher(match_root, task_cwd, &sources);
+        assert!(is_source(
+            &matcher,
+            Path::new("/workspace/lib/worker/../shared/util.go")
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn matcher_parent_pattern_above_match_root_passes_through() {
+        let match_root = Path::new("/workspace");
+        let task_cwd = Path::new("/workspace/lib");
+        let sources = vec!["../../outside/**".to_string()];
+        let matcher = build_source_matcher(match_root, task_cwd, &sources);
+        assert!(is_source(&matcher, Path::new("/outside/x")));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn matcher_leaves_parent_dirs_that_would_collapse_a_glob() {
+        let root = Path::new("/workspace");
+        let sources = vec!["**/../x".to_string()];
+        let matcher = build_source_matcher(root, root, &sources);
+        assert!(!is_source(&matcher, Path::new("/workspace/x")));
+    }
+
+    /// The glob guard inspects the pattern as written. A task directory may
+    /// contain a glob metacharacter as a literal name, and folding it into the
+    /// inspected path would make this ordinary `../` entry look like a `..`
+    /// popping a glob, silently leaving the pattern unanchored.
+    #[test]
+    #[cfg(unix)]
+    fn matcher_parent_relative_pattern_from_a_task_dir_containing_a_glob_char() {
+        let match_root = Path::new("/workspace");
+        let task_cwd = Path::new("/workspace/pkg*");
+        let sources = vec!["../shared/**".to_string()];
+        let matcher = build_source_matcher(match_root, task_cwd, &sources);
+        assert!(is_source(&matcher, Path::new("/workspace/shared/util.go")));
+    }
+
+    /// `[task_config.input_groups]` anchors a group entry by joining it onto
+    /// the defining config's root without normalizing, so absolute patterns
+    /// reach the matcher with `..` still in them.
+    #[test]
+    #[cfg(unix)]
+    fn matcher_normalizes_absolute_pattern_with_parent_dirs() {
+        let root = Path::new("/workspace");
+        let sources = vec!["/workspace/lib/../shared/x".to_string()];
+        let matcher = build_source_matcher(root, root, &sources);
+        assert!(is_source(&matcher, Path::new("/workspace/shared/x")));
+    }
+
+    #[test]
+    fn lexical_normalize_resolves_dot_segments() {
+        assert_eq!(lexical_normalize(Path::new("../x")), PathBuf::from("../x"));
+        assert_eq!(
+            lexical_normalize(Path::new("a/b/../c")),
+            PathBuf::from("a/c")
+        );
+        assert_eq!(lexical_normalize(Path::new("./a")), PathBuf::from("a"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lexical_normalize_stops_climbing_at_the_root() {
+        assert_eq!(lexical_normalize(Path::new("/a/../..")), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn relative_sources_match_when_task_dir_starts_with_dot() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path();
+        let task_cwd = normalize_task_cwd(workspace.join("./sub"));
+        let source = workspace.join("sub/input.txt");
+        fs::create_dir_all(source.parent().unwrap())?;
+        fs::write(&source, "source")?;
+
+        let sources = vec!["input.txt".to_string()];
+        let matcher = build_source_matcher(workspace, &task_cwd, &sources);
+        let metadatas = get_file_metadatas(&task_cwd, &sources, &matcher, &DirPruner::none())?;
+
+        assert_eq!(
+            metadatas.into_iter().map(|(path, _)| path).collect_vec(),
+            [source]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn content_hash_cache_reuses_unchanged_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, "hello").unwrap();
+        std::fs::write(&b, "world").unwrap();
+        let metadatas = vec![
+            (a.clone(), a.metadata().unwrap()),
+            (b.clone(), b.metadata().unwrap()),
+        ];
+
+        let mut cache = ContentHashCache::new();
+        let first = file_contents_to_hash(&metadatas, &mut cache).unwrap();
+        assert_eq!(cache.len(), 2);
+        let a_hash_v1 = cache.get(&a).unwrap().hash.clone();
+
+        // Re-run with same files: hashes should be reused, aggregate unchanged.
+        let second = file_contents_to_hash(&metadatas, &mut cache).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(cache.get(&a).unwrap().hash, a_hash_v1);
+
+        // Mutate `a` so size differs; aggregate hash must change.
+        std::fs::write(&a, "hello world").unwrap();
+        let metadatas = vec![
+            (a.clone(), a.metadata().unwrap()),
+            (b.clone(), b.metadata().unwrap()),
+        ];
+        let third = file_contents_to_hash(&metadatas, &mut cache).unwrap();
+        assert_ne!(second, third);
+        assert_ne!(cache.get(&a).unwrap().hash, a_hash_v1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_hash_cache_notices_same_size_edit_with_restored_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        std::fs::write(&a, "good\n").unwrap();
+        let before = a.metadata().unwrap();
+        let mut cache = ContentHashCache::new();
+        let first = file_contents_to_hash(&[(a.clone(), before.clone())], &mut cache).unwrap();
+
+        // Same size, mtime restored: only ctime betrays the edit. Retry until the filesystem's
+        // ctime clock has ticked so a coarse timestamp can't make the edit invisible.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let after = loop {
+            std::fs::write(&a, "fail\n").unwrap();
+            crate::file::set_times(&a, None, Some(before.modified().unwrap())).unwrap();
+            let after = a.metadata().unwrap();
+            if metadata_ctime(&after) != metadata_ctime(&before) {
+                break after;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "ctime did not advance within 10s; this filesystem's ctime resolution is too coarse for the test"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        assert_eq!(before.len(), after.len());
+        let second = file_contents_to_hash(&[(a.clone(), after)], &mut cache).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn content_hash_cache_prunes_dropped_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, "hello").unwrap();
+        std::fs::write(&b, "world").unwrap();
+
+        let mut cache = ContentHashCache::new();
+        let metadatas = vec![
+            (a.clone(), a.metadata().unwrap()),
+            (b.clone(), b.metadata().unwrap()),
+        ];
+        file_contents_to_hash(&metadatas, &mut cache).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        // Only `a` is a source this run — `b` should drop out of the cache.
+        let metadatas = vec![(a.clone(), a.metadata().unwrap())];
+        file_contents_to_hash(&metadatas, &mut cache).unwrap();
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&a));
+        assert!(!cache.contains_key(&b));
+    }
+
+    #[test]
+    fn content_hash_cache_round_trips_through_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        std::fs::write(&a, "hello").unwrap();
+
+        let mut cache = ContentHashCache::new();
+        let metadatas = vec![(a.clone(), a.metadata().unwrap())];
+        file_contents_to_hash(&metadatas, &mut cache).unwrap();
+
+        let cache_path = tmp.path().join("cache.bin");
+        save_content_hash_cache(&cache_path, &cache).unwrap();
+        let loaded = load_content_hash_cache(&cache_path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get(&a).unwrap().hash, cache.get(&a).unwrap().hash,);
+
+        // Corrupt the file: loader must silently fall back to empty.
+        std::fs::write(&cache_path, b"not a valid msgpack stream").unwrap();
+        let loaded = load_content_hash_cache(&cache_path);
+        assert!(loaded.is_empty());
+    }
+}

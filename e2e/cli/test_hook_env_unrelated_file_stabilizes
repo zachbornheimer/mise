@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+
+# Files that come and go in a config-search directory that are not config files
+# (zsh's ~/.zsh_history.LOCK with share_history, editor swap files) bump the
+# directory's mtime. That must not force a full hook-env run: before, every such
+# change forced one, and a shell that writes one after every command ran in full
+# at every prompt.
+#
+# Note that hook-env prints nothing when the slow path returns early, so an
+# empty stdout does not distinguish "fast-path skipped the work" from "the work
+# ran and was thrown away". Counting env._.source executions does.
+
+export MISE_ENV_CACHE=0
+
+cat >env.sh <<'EOF'
+echo ran >>"$COUNTER_FILE"
+export FROM_SOURCE=1
+EOF
+
+cat >mise.toml <<'EOF'
+[env]
+_.source = "env.sh"
+EOF
+
+export COUNTER_FILE="$PWD/source-runs.txt"
+: >"$COUNTER_FILE"
+
+eval "$(mise activate bash 2>/dev/null)"
+eval "$(mise hook-env -s bash 2>/dev/null)"
+before_touch=$(wc -l <"$COUNTER_FILE")
+
+# Creating and deleting non-config files bumps the directory mtime, but must
+# leave the fast path alone: env._.source does not run again.
+for _ in 1 2 3; do
+  sleep 1
+  touch unrelated.lock
+  eval "$(mise hook-env -s bash 2>/dev/null)"
+  rm unrelated.lock
+  eval "$(mise hook-env -s bash 2>/dev/null)"
+done
+after=$(wc -l <"$COUNTER_FILE")
+
+if [[ $after -eq $before_touch ]]; then
+  ok "env._.source did not re-run when unrelated files came and went"
+else
+  fail "env._.source re-ran: $before_touch -> $after"
+fi
+
+output=$(mise hook-env -s bash 2>&1)
+if [[ -z $output ]]; then
+  ok "fast-path works after unrelated file churn"
+else
+  fail "expected fast-path (no output) but got: '$output'"
+fi
+
+# A new config file in the same directory is still noticed.
+sleep 1
+cat >mise.local.toml <<'EOF'
+[env]
+LOCAL_VAR = "yes"
+EOF
+output=$(mise hook-env -s bash 2>/dev/null)
+assert_contains "echo '$output'" "LOCAL_VAR"
+
+# A new lockfile beside an unchanged config is still noticed.
+eval "$(mise hook-env -s bash 2>/dev/null)"
+before_lock=$(wc -l <"$COUNTER_FILE")
+sleep 1
+touch mise.lock
+eval "$(mise hook-env -s bash 2>/dev/null)"
+after_lock=$(wc -l <"$COUNTER_FILE")
+if [[ $after_lock -gt $before_lock ]]; then
+  ok "a new mise.lock forces a full run"
+else
+  fail "a new mise.lock did not force a full run"
+fi

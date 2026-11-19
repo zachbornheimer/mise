@@ -1,0 +1,1797 @@
+use crate::args::BackendArg;
+use crate::backend::VersionInfo;
+use crate::backend::{
+    Backend, VersionCacheManager, normalize_idiomatic_contents, platform_target::PlatformTarget,
+};
+use crate::build_time::built_info;
+use crate::cache::CacheManagerBuilder;
+use crate::cmd::CmdLineRunner;
+use crate::config::settings::DEFAULT_NODE_MIRROR_URL;
+use crate::config::settings::SettingsNodeExt;
+use crate::config::{CompilePurpose, Config, Settings, SettingsExt};
+use crate::file::{ExtractOptions, ExtractionFormat};
+use crate::http::{HTTP, HTTP_FETCH};
+use crate::install_context::InstallContext;
+use crate::lockfile::PlatformInfo;
+use crate::platform::Platform;
+use crate::toolset::{ToolRequest, ToolVersion};
+use crate::ui::progress_report::SingleReport;
+use crate::{env, file, gpg, hash, http, plugins};
+use async_trait::async_trait;
+use eyre::{Result, WrapErr, bail, ensure};
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::OnceLock;
+use tempfile::tempdir_in;
+use tokio::sync::Mutex;
+use url::Url;
+use xx::regex;
+
+#[derive(Debug)]
+pub(super) struct NodePlugin {
+    ba: Arc<BackendArg>,
+}
+
+enum FetchOutcome {
+    Downloaded,
+    NotFound,
+}
+
+impl NodePlugin {
+    pub(super) fn new() -> Self {
+        Self {
+            ba: plugins::core::new_backend_arg("node").into(),
+        }
+    }
+
+    async fn fetch_binary(
+        &self,
+        ctx: &InstallContext,
+        tv: &mut ToolVersion,
+        opts: &BuildOpts,
+        extract: impl FnOnce() -> Result<()>,
+    ) -> Result<FetchOutcome> {
+        debug!("{:?}: we will fetch a precompiled version", self);
+
+        match self
+            .fetch_tarball(
+                ctx,
+                tv,
+                &opts.binary_tarball_url,
+                &opts.binary_tarball_path,
+                &opts.version,
+                None,
+            )
+            .await
+        {
+            Ok(()) => {
+                debug!("{:?}: successfully downloaded node archive", self);
+            }
+            Err(e) if matches!(http::error_code(&e), Some(404)) => {
+                debug!("{:?}: precompiled node archive not found {e}", self);
+                return Ok(FetchOutcome::NotFound);
+            }
+            Err(e) => return Err(e),
+        };
+
+        ctx.pr.next_operation();
+        let tarball_name = &opts.binary_tarball_name;
+        ctx.pr.set_message(format!("extract {tarball_name}"));
+        debug!("{:?}: extracting precompiled node", self);
+
+        if let Err(e) = extract() {
+            debug!("{:?}: extraction failed: {e}", self);
+            return Err(e);
+        }
+
+        debug!("{:?}: precompiled node extraction was successful", self);
+        Ok(FetchOutcome::Downloaded)
+    }
+
+    fn extract_zip(&self, opts: &BuildOpts, _ctx: &InstallContext) -> Result<()> {
+        let tmp_extract_path = tempdir_in(opts.install_path.parent().unwrap())?;
+        file::unzip(
+            &opts.binary_tarball_path,
+            tmp_extract_path.path(),
+            &Default::default(),
+        )?;
+        file::remove_all(&opts.install_path)?;
+        file::rename(
+            tmp_extract_path.path().join(slug(&opts.version)),
+            &opts.install_path,
+        )?;
+        Ok(())
+    }
+
+    async fn install_precompiled(
+        &self,
+        ctx: &InstallContext,
+        tv: &mut ToolVersion,
+        opts: &BuildOpts,
+    ) -> Result<()> {
+        match self
+            .fetch_binary(ctx, tv, opts, || {
+                file::untar(
+                    &opts.binary_tarball_path,
+                    &opts.install_path,
+                    ExtractionFormat::TarGz,
+                    &ExtractOptions {
+                        strip_components: 1,
+                        pr: Some(ctx.pr.as_ref()),
+                        ..Default::default()
+                    },
+                )?;
+                Ok(())
+            })
+            .await?
+        {
+            FetchOutcome::Downloaded => {
+                warn_patches_not_applied();
+                Ok(())
+            }
+            FetchOutcome::NotFound => {
+                if ctx.locked {
+                    if let Some(message) = node_flavor_not_found_message(opts) {
+                        bail!("{message}\nlocked mode requires the locked precompiled artifact")
+                    }
+                    bail!(
+                        "precompiled node archive not found and locked mode requires the locked precompiled artifact"
+                    )
+                } else if lock_pins_precompiled(
+                    &tv.lock_platforms,
+                    &self.get_platform_key(),
+                    &opts.binary_tarball_url,
+                ) {
+                    // The source tarball is another artifact, which the locked checksum
+                    // does not cover, so the download host must not be able to choose it
+                    // by answering 404 for the archive the lockfile pins.
+                    bail!(
+                        "precompiled node archive not found but mise.lock pins its checksum: {}\n\
+                         refusing to compile from source instead; run `mise lock node` to lock another artifact",
+                        opts.binary_tarball_url
+                    )
+                } else if Settings::get().node_compile(CompilePurpose::Inspect) != Some(false) {
+                    if let Some(message) = node_flavor_not_found_message(opts) {
+                        warn!("{message}");
+                    }
+                    self.install_compiling(ctx, tv, opts).await
+                } else {
+                    if let Some(message) = node_flavor_not_found_message(opts) {
+                        bail!("{message}\ncompilation is disabled")
+                    }
+                    bail!("precompiled node archive not found and compilation is disabled")
+                }
+            }
+        }
+    }
+
+    async fn install_windows(
+        &self,
+        ctx: &InstallContext,
+        tv: &mut ToolVersion,
+        opts: &BuildOpts,
+    ) -> Result<()> {
+        match self
+            .fetch_binary(ctx, tv, opts, || self.extract_zip(opts, ctx))
+            .await?
+        {
+            FetchOutcome::Downloaded => {
+                warn_patches_not_applied();
+                Ok(())
+            }
+            FetchOutcome::NotFound => bail!("precompiled node archive not found (404)"),
+        }
+    }
+
+    async fn install_compiling(
+        &self,
+        ctx: &InstallContext,
+        tv: &mut ToolVersion,
+        opts: &BuildOpts,
+    ) -> Result<()> {
+        debug!("{:?}: we will fetch the source and compile", self);
+        let tarball_name = &opts.source_tarball_name;
+        if let Err(err) = self
+            .fetch_tarball(
+                ctx,
+                tv,
+                &opts.source_tarball_url,
+                &opts.source_tarball_path,
+                &opts.version,
+                Some("source"),
+            )
+            .await
+        {
+            if let Some(reqwest_err) = err.root_cause().downcast_ref::<reqwest::Error>()
+                && reqwest_err.status() == Some(reqwest::StatusCode::NOT_FOUND)
+                && let Ok(Some(msg)) = self
+                    .suggest_available_flavors(&opts.version, &Settings::get())
+                    .await
+            {
+                return Err(eyre::eyre!("{err}\n{msg}"));
+            }
+            return Err(err);
+        }
+        ctx.pr.next_operation();
+        ctx.pr.set_message(format!("extract {tarball_name}"));
+        file::remove_all(&opts.build_dir)?;
+        file::untar(
+            &opts.source_tarball_path,
+            opts.build_dir.parent().unwrap(),
+            ExtractionFormat::TarGz,
+            &ExtractOptions {
+                pr: Some(ctx.pr.as_ref()),
+                ..Default::default()
+            },
+        )?;
+        self.exec_patches(ctx, opts, tv).await?;
+        self.exec_configure(ctx, opts, tv)?;
+        self.exec_make(ctx, opts, tv)?;
+        self.exec_make_install(ctx, opts, tv)?;
+        Ok(())
+    }
+
+    /// Apply `node.apply_patches` to the extracted source, before `./configure` sees it.
+    ///
+    /// Each patch is applied on its own rather than concatenated, because the `-p` strip level is
+    /// decided per patch — a git-style patch and a plain one in the same blob cannot both be right.
+    async fn exec_patches(
+        &self,
+        ctx: &InstallContext,
+        opts: &BuildOpts,
+        tv: &ToolVersion,
+    ) -> Result<()> {
+        let sources = plugins::core::patch_sources(Settings::get().node.apply_patches.as_deref());
+        if sources.is_empty() {
+            return Ok(());
+        }
+        let patches = plugins::core::fetch_patch_contents(&sources).await?;
+        file::create_dir_all(&*env::MISE_TMP_DIR)?;
+        for (source, patch) in sources.iter().zip(patches) {
+            ctx.pr.set_message(format!("patch {source}"));
+            let patch_file = env::MISE_TMP_DIR.join(format!(
+                "node-v{}-{}.patch",
+                opts.version,
+                hash::hash_to_str(source)
+            ));
+            file::write(&patch_file, &patch)?;
+            CmdLineRunner::new("patch")
+                .with_pr(ctx.pr.as_ref())
+                .prepend_path(opts.path.clone())?
+                .current_dir(&opts.build_dir)
+                .env_values(tv.install_env())
+                .arg(format!("-p{}", patch_strip_level(&patch)))
+                .arg("--force")
+                .arg("-i")
+                .arg(&patch_file)
+                .execute()
+                .wrap_err_with(|| format!("failed to apply patch {source}"))?;
+        }
+        Ok(())
+    }
+
+    async fn fetch_tarball(
+        &self,
+        ctx: &InstallContext,
+        tv: &mut ToolVersion,
+        url: &Url,
+        local: &Path,
+        version: &str,
+        lockfile_install: Option<&str>,
+    ) -> Result<()> {
+        let settings = Settings::get();
+        let platform_key = self.get_platform_key();
+        let tarball_name = local.file_name().unwrap().to_string_lossy().to_string();
+        // Safe mode drops a project lockfile's URL and keeps its checksum. Locked mode
+        // then downloads from the mirror, and the kept checksum still pins the file.
+        let pinned_by_checksum = ctx.locked
+            && tv.lock_platforms.get(&platform_key).is_some_and(|info| {
+                info.is_pinned_without_url() && info.install.as_deref() == lockfile_install
+            });
+        if local.exists() {
+            ctx.pr.set_message(format!("cached {tarball_name}"));
+        } else {
+            ctx.pr.set_message(format!("download {tarball_name}"));
+            // The lock entry holds one artifact per platform, the binary or the
+            // source. Its checksum pins this download only if it describes it.
+            let pinned = tv
+                .lock_platforms
+                .get(&platform_key)
+                .filter(|info| {
+                    (info.url.as_deref() == Some(url.as_str()) || pinned_by_checksum)
+                        && info.install.as_deref() == lockfile_install
+                })
+                .and_then(|info| info.pin_checksum().cloned());
+            HTTP.download_file_stored(url.clone(), local, pinned.as_deref(), Some(ctx.pr.as_ref()))
+                .await?;
+        }
+        ctx.pr.next_operation();
+        let url = url.to_string();
+        let needs_checksum = settings.node.verify
+            && !pinned_by_checksum
+            && tv
+                .lock_platforms
+                .get(&platform_key)
+                .map(|platform_info| {
+                    platform_info.checksum.is_none()
+                        || platform_info.url.as_deref() != Some(url.as_str())
+                        || platform_info.install.as_deref() != lockfile_install
+                })
+                .unwrap_or(true);
+        let checksum = if needs_checksum {
+            Some(self.get_checksum(ctx, tv, local, version).await?)
+        } else {
+            None
+        };
+        let platform_info = tv.lock_platforms.entry(platform_key).or_default();
+        let artifact_changed = (platform_info.url.as_deref() != Some(url.as_str())
+            && !pinned_by_checksum)
+            || platform_info.install.as_deref() != lockfile_install;
+        if artifact_changed {
+            platform_info.checksum = None;
+            platform_info.size = None;
+            platform_info.url_api = None;
+            platform_info.provenance = None;
+            platform_info.github_attestations = None;
+        }
+        platform_info.install = lockfile_install.map(str::to_string);
+        platform_info.url = Some(url);
+        if let Some(checksum) = checksum {
+            platform_info.checksum = Some(checksum);
+        }
+        self.verify_checksum(ctx, tv, local)?;
+        Ok(())
+    }
+
+    fn sh<'a>(
+        &self,
+        ctx: &'a InstallContext,
+        opts: &BuildOpts,
+        tv: &ToolVersion,
+    ) -> eyre::Result<CmdLineRunner<'a>> {
+        let settings = Settings::get();
+        let mut cmd = CmdLineRunner::new("sh")
+            .prepend_path(opts.path.clone())?
+            .with_pr(ctx.pr.as_ref())
+            .current_dir(&opts.build_dir)
+            .arg("-c");
+        if let Some(cflags) = settings.node.cflags() {
+            cmd = cmd.env("CFLAGS", cflags);
+        }
+        cmd = cmd.env_values(tv.install_env());
+        Ok(cmd)
+    }
+
+    fn exec_configure(
+        &self,
+        ctx: &InstallContext,
+        opts: &BuildOpts,
+        tv: &ToolVersion,
+    ) -> Result<()> {
+        self.sh(ctx, opts, tv)?.arg(&opts.configure_cmd).execute()
+    }
+    fn exec_make(&self, ctx: &InstallContext, opts: &BuildOpts, tv: &ToolVersion) -> Result<()> {
+        self.sh(ctx, opts, tv)?.arg(&opts.make_cmd).execute()
+    }
+    fn exec_make_install(
+        &self,
+        ctx: &InstallContext,
+        opts: &BuildOpts,
+        tv: &ToolVersion,
+    ) -> Result<()> {
+        self.sh(ctx, opts, tv)?
+            .arg(&opts.make_install_cmd)
+            .execute()
+    }
+
+    async fn get_checksum(
+        &self,
+        ctx: &InstallContext,
+        tv: &ToolVersion,
+        tarball: &Path,
+        version: &str,
+    ) -> Result<String> {
+        let tarball_name = tarball.file_name().unwrap().to_string_lossy().to_string();
+        let shasums_file = tarball.parent().unwrap().join("SHASUMS256.txt");
+        HTTP.download_file(
+            self.shasums_url(version, &tarball_name)?,
+            &shasums_file,
+            Some(ctx.pr.as_ref()),
+        )
+        .await?;
+        // Node publishes SHASUMS256.txt.sig for releases on every line, not only 20 and later.
+        if Settings::get().node.gpg_verify != Some(false) {
+            self.verify_with_gpg(ctx, tv, &shasums_file, version, &tarball_name)
+                .await?;
+        }
+        let shasums = file::read_to_string(&shasums_file)?;
+        let shasums = hash::parse_shasums(&shasums);
+        let shasum = shasums
+            .get(&tarball_name)
+            .ok_or_else(|| eyre::eyre!("{tarball_name} not found in SHASUMS256.txt"))?;
+        Ok(format!("sha256:{shasum}"))
+    }
+
+    async fn verify_with_gpg(
+        &self,
+        ctx: &InstallContext,
+        _tv: &ToolVersion,
+        shasums_file: &Path,
+        v: &str,
+        tarball_name: &str,
+    ) -> Result<()> {
+        let sig_file = shasums_file.with_extension("asc");
+        let shasums_url = self.shasums_url(v, tarball_name)?;
+        let sig_url = format!("{shasums_url}.sig");
+        if let Err(e) = HTTP
+            .download_file(sig_url, &sig_file, Some(ctx.pr.as_ref()))
+            .await
+        {
+            if matches!(http::error_code(&e), Some(404)) {
+                return missing_signature(&shasums_url);
+            }
+            return Err(e);
+        }
+        let shasums = file::read(shasums_file)?;
+        let signature = file::read(&sig_file)?;
+        gpg::verify_node(&shasums, &signature)?;
+        Ok(())
+    }
+
+    fn node_path(&self, tv: &ToolVersion) -> PathBuf {
+        if cfg!(windows) {
+            tv.install_path().join("node.exe")
+        } else {
+            tv.install_path().join("bin").join("node")
+        }
+    }
+
+    fn npm_path(&self, tv: &ToolVersion) -> PathBuf {
+        if cfg!(windows) {
+            tv.install_path().join("npm.cmd")
+        } else {
+            tv.install_path().join("bin").join("npm")
+        }
+    }
+
+    async fn npm<'a>(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+        pr: &'a dyn SingleReport,
+    ) -> Result<CmdLineRunner<'a>> {
+        Ok(CmdLineRunner::new(self.npm_path(tv))
+            .with_pr(pr)
+            .envs(config.env().await?)
+            .env_values(tv.install_env())
+            .env(&*env::PATH_KEY, plugins::core::path_env_with_tv_path(tv)?)
+            .env("NPM_CONFIG_UPDATE_NOTIFIER", "false"))
+    }
+
+    fn corepack_path(&self, tv: &ToolVersion) -> PathBuf {
+        if cfg!(windows) {
+            tv.install_path().join("corepack.cmd")
+        } else {
+            tv.install_path().join("bin").join("corepack")
+        }
+    }
+
+    async fn install_default_packages(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+        pr: &dyn SingleReport,
+    ) -> Result<()> {
+        let settings = Settings::get();
+        let default_packages_file = file::replace_path(settings.node.default_packages_file());
+        let body = file::read_to_string(&default_packages_file).unwrap_or_default();
+        let mut packages = body
+            .lines()
+            .filter_map(Settings::parse_default_package_line)
+            .peekable();
+        if packages.peek().is_some() {
+            Settings::warn_default_package_file_deprecated(
+                "node.default_packages_file",
+                "npm package",
+            );
+        }
+        for package in packages {
+            pr.set_message(format!("install default package: {package}"));
+            self.npm(config, tv, pr)
+                .await?
+                .arg("install")
+                .arg("--global")
+                .arg(package)
+                .execute()?;
+        }
+        Ok(())
+    }
+
+    fn install_npm_shim(&self, tv: &ToolVersion) -> Result<()> {
+        file::remove_file(self.npm_path(tv)).ok();
+        file::write(self.npm_path(tv), include_str!("assets/node_npm_shim"))?;
+        file::make_executable(self.npm_path(tv))?;
+        Ok(())
+    }
+
+    fn enable_default_corepack_shims(&self, tv: &ToolVersion, pr: &dyn SingleReport) -> Result<()> {
+        pr.set_message("enable corepack shims".into());
+        let corepack = self.corepack_path(tv);
+        CmdLineRunner::new(corepack)
+            .with_pr(pr)
+            .arg("enable")
+            .env_values(tv.install_env())
+            .env(&*env::PATH_KEY, plugins::core::path_env_with_tv_path(tv)?)
+            .execute()?;
+        Ok(())
+    }
+
+    fn enable_npm_corepack_shim(&self, tv: &ToolVersion, pr: &dyn SingleReport) -> Result<()> {
+        pr.set_message("enable corepack npm shim".into());
+        let corepack = self.corepack_path(tv);
+        CmdLineRunner::new(corepack)
+            .with_pr(pr)
+            .arg("enable")
+            .arg("npm")
+            .env("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0")
+            .env_values(tv.install_env())
+            .env(&*env::PATH_KEY, plugins::core::path_env_with_tv_path(tv)?)
+            .execute()?;
+        Ok(())
+    }
+
+    async fn test_node(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+        pr: &dyn SingleReport,
+    ) -> Result<()> {
+        pr.set_message("node -v".into());
+        CmdLineRunner::new(self.node_path(tv))
+            .with_pr(pr)
+            .arg("-v")
+            .envs(config.env().await?)
+            .env_values(tv.install_env())
+            .execute()
+    }
+
+    async fn test_npm(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+        pr: &dyn SingleReport,
+    ) -> Result<()> {
+        pr.set_message("npm -v".into());
+        self.npm(config, tv, pr).await?.arg("-v").execute()
+    }
+
+    fn shasums_url(&self, v: &str, tarball_name: &str) -> Result<Url> {
+        // let url = MISE_NODE_MIRROR_URL.join(&format!("v{v}/SHASUMS256.txt.asc"))?;
+        let settings = Settings::get();
+        let url =
+            mirror_url_for(&settings.node, tarball_name).join(&format!("v{v}/SHASUMS256.txt"))?;
+        Ok(url)
+    }
+
+    async fn suggest_available_flavors(
+        &self,
+        v: &str,
+        settings: &Settings,
+    ) -> Result<Option<String>> {
+        let base = settings.node.mirror_url();
+        // If using default mirror, we don't need to suggest anything as it's likely a real 404
+        if base.to_string() == DEFAULT_NODE_MIRROR_URL {
+            return Ok(None);
+        }
+
+        let versions: Vec<NodeVersion> = HTTP_FETCH
+            .json(base.join("index.json")?)
+            .await
+            .unwrap_or_default();
+
+        if let Some(version) = versions.iter().find(|nv| {
+            nv.version == format!("v{v}") || nv.version == v || nv.version == format!("v{v}.")
+        }) {
+            let os = os();
+            let arch = arch(settings);
+            let candidates: Vec<&String> = version
+                .files
+                .iter()
+                .filter(|f| f.starts_with(&format!("{os}-{arch}-")))
+                .collect();
+
+            if !candidates.is_empty() {
+                let mut msg = format!("Could not find node@{v} with the current settings.\n");
+                msg.push_str(&format!(
+                    "However, the following flavors are available on the mirror for {os}-{arch}:\n"
+                ));
+                for candidate in candidates {
+                    // Extract flavor from "linux-x64-musl" -> "musl"
+                    // format is {os}-{arch}-{flavor}
+                    let prefix = format!("{os}-{arch}-");
+                    if let Some(flavor) = candidate.strip_prefix(&prefix) {
+                        msg.push_str(&format!("  - {flavor}\n"));
+                    } else {
+                        msg.push_str(&format!("  - {candidate} (unknown format)\n"));
+                    }
+                }
+                msg.push_str("\nYou can try setting the flavor using:\n");
+                msg.push_str("  mise settings node.flavor=<flavor>\n");
+                return Ok(Some(msg));
+            } else {
+                // Fallback: list all files for that version if no arch match
+                let mut msg = format!("Could not find node@{v} for {os}-{arch}.\n");
+                msg.push_str("Available files for this version on the mirror:\n");
+                for file in &version.files {
+                    msg.push_str(&format!("  - {file}\n"));
+                }
+                return Ok(Some(msg));
+            }
+        }
+        Ok(None)
+    }
+}
+
+#[async_trait]
+impl Backend for NodePlugin {
+    fn ba(&self) -> &Arc<BackendArg> {
+        &self.ba
+    }
+
+    fn resolves_locked_url_from_checksum(&self) -> bool {
+        true
+    }
+
+    async fn security_info(&self) -> Vec<crate::backend::SecurityFeature> {
+        use crate::backend::SecurityFeature;
+
+        let mut features = vec![SecurityFeature::Checksum {
+            algorithm: Some("sha256".to_string()),
+        }];
+
+        // GPG verification is built in (no external gpg required)
+        if Settings::get().node.gpg_verify != Some(false) {
+            features.push(SecurityFeature::Gpg);
+        }
+
+        features
+    }
+
+    async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
+        let settings = Settings::get();
+        let base = settings.node.mirror_url();
+        let versions = HTTP_FETCH
+            .json::<Vec<NodeVersion>, _>(base.join("index.json")?)
+            .await?
+            .into_iter()
+            .filter(|v| {
+                if let Some(flavor) = &settings.node.flavor {
+                    v.files
+                        .iter()
+                        .any(|f| f == &format!("{}-{}-{}", os(), arch(&settings), flavor))
+                } else {
+                    true
+                }
+            })
+            .map(|v| {
+                let version = if regex!(r"^v\d+\.").is_match(&v.version) {
+                    v.version.strip_prefix('v').unwrap().to_string()
+                } else {
+                    v.version
+                };
+                VersionInfo {
+                    version,
+                    created_at: v.date,
+                    ..Default::default()
+                }
+            })
+            .rev()
+            .collect();
+        Ok(versions)
+    }
+
+    fn get_aliases(&self) -> Result<BTreeMap<String, String>> {
+        let aliases = [
+            ("lts/argon", "4"),
+            ("lts/boron", "6"),
+            ("lts/carbon", "8"),
+            ("lts/dubnium", "10"),
+            ("lts/erbium", "12"),
+            ("lts/fermium", "14"),
+            ("lts/gallium", "16"),
+            ("lts/hydrogen", "18"),
+            ("lts/iron", "20"),
+            ("lts/jod", "22"),
+            ("lts/krypton", "24"),
+            ("lts/lithium", "26"),
+            ("lts-argon", "4"),
+            ("lts-boron", "6"),
+            ("lts-carbon", "8"),
+            ("lts-dubnium", "10"),
+            ("lts-erbium", "12"),
+            ("lts-fermium", "14"),
+            ("lts-gallium", "16"),
+            ("lts-hydrogen", "18"),
+            ("lts-iron", "20"),
+            ("lts-jod", "22"),
+            ("lts-krypton", "24"),
+            ("lts-lithium", "26"),
+            ("lts", "26"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        Ok(aliases)
+    }
+
+    async fn _parse_idiomatic_file(&self, path: &Path) -> Result<Vec<String>> {
+        let contents = file::read_to_string(path)?;
+        let body = normalize_idiomatic_contents(&contents);
+
+        let versions = body
+            .lines()
+            .map(|line| {
+                let mut version = line.trim().strip_prefix('v').unwrap_or(line).to_string();
+                version = version.replace("lts/*", "lts");
+                version
+            })
+            .collect();
+        Ok(versions)
+    }
+
+    async fn install_version_(
+        &self,
+        ctx: &InstallContext,
+        mut tv: ToolVersion,
+    ) -> eyre::Result<ToolVersion> {
+        ensure!(
+            tv.version != "latest",
+            "version should not be 'latest' for node, something is wrong"
+        );
+        let settings = Settings::get();
+        let opts = BuildOpts::new(ctx, &tv).await?;
+        trace!("node build opts: {:#?}", opts);
+        let platform_key = self.get_platform_key();
+        let node_compile = if ctx.locked {
+            settings.node_compile(CompilePurpose::Inspect)
+        } else {
+            settings.node_compile(CompilePurpose::Install)
+        };
+        let compile_from_source =
+            should_compile_from_source(ctx.locked, &tv.lock_platforms, &platform_key, node_compile);
+
+        if cfg!(windows) {
+            self.install_windows(ctx, &mut tv, &opts).await?;
+        } else if compile_from_source {
+            self.install_compiling(ctx, &mut tv, &opts).await?;
+        } else {
+            self.install_precompiled(ctx, &mut tv, &opts).await?;
+        }
+        debug!("{:?}: checking installation is working as expected", self);
+        self.test_node(&ctx.config, &tv, ctx.pr.as_ref()).await?;
+        if !cfg!(windows) && settings.node.npm_shim {
+            self.install_npm_shim(&tv)?;
+        }
+        self.test_npm(&ctx.config, &tv, ctx.pr.as_ref()).await?;
+        if let Err(err) = self
+            .install_default_packages(&ctx.config, &tv, ctx.pr.as_ref())
+            .await
+        {
+            warn!("failed to install default npm packages: {err:#}");
+        }
+        if settings.node.corepack && self.corepack_path(&tv).exists() {
+            self.enable_default_corepack_shims(&tv, ctx.pr.as_ref())?;
+            if !settings.node.npm_shim {
+                self.enable_npm_corepack_shim(&tv, ctx.pr.as_ref())?;
+            }
+        }
+
+        Ok(tv)
+    }
+
+    #[cfg(windows)]
+    async fn list_bin_paths(
+        &self,
+        _config: &Arc<Config>,
+        tv: &ToolVersion,
+    ) -> eyre::Result<Vec<PathBuf>> {
+        Ok(vec![tv.install_path()])
+    }
+
+    fn get_remote_version_cache(&self) -> Arc<Mutex<VersionCacheManager>> {
+        static CACHE: OnceLock<Arc<Mutex<VersionCacheManager>>> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                let settings = Settings::get();
+                Mutex::new(
+                    CacheManagerBuilder::new(
+                        self.ba().cache_path().join("remote_versions.msgpack.z"),
+                    )
+                    .with_fresh_duration(settings.fetch_remote_versions_cache())
+                    .with_cache_key(settings.node.mirror_url.clone().unwrap_or_default())
+                    .with_cache_key(settings.node.flavor.clone().unwrap_or_default())
+                    .build(),
+                )
+                .into()
+            })
+            .clone()
+    }
+
+    // ========== Lockfile Metadata Fetching Implementation ==========
+
+    async fn get_tarball_url(
+        &self,
+        tv: &ToolVersion,
+        target: &PlatformTarget,
+    ) -> Result<Option<String>> {
+        let version = &tv.version;
+        let settings = Settings::get();
+
+        // Build platform-specific filename like Node.js does
+        let slug = self.build_platform_slug(version, target);
+        let filename = if target.os_name() == "windows" {
+            format!("{slug}.zip")
+        } else {
+            format!("{slug}.tar.gz")
+        };
+
+        // Use Node.js mirror URL to construct download URL.
+        // Musl tarballs live on unofficial-builds, not nodejs.org/dist.
+        let url = mirror_url_for(&settings.node, &filename)
+            .join(&format!("v{version}/{filename}"))
+            .map_err(|e| eyre::eyre!("Failed to construct Node.js download URL: {e}"))?;
+
+        Ok(Some(url.to_string()))
+    }
+
+    fn resolve_lockfile_options(
+        &self,
+        _request: &ToolRequest,
+        _target: &PlatformTarget,
+    ) -> Result<BTreeMap<String, String>> {
+        let mut opts = BTreeMap::new();
+        let settings = Settings::get();
+        let node = &settings.node;
+
+        let mirror = node.mirror_url();
+        if mirror.as_str() != DEFAULT_NODE_MIRROR_URL {
+            opts.insert("mirror_url".to_string(), mirror.to_string());
+        }
+
+        let compile = node.compile;
+        match compile {
+            Some(true) => {
+                opts.insert("compile".to_string(), "true".to_string());
+            }
+            Some(false) => {
+                opts.insert("compile".to_string(), "false".to_string());
+            }
+            None => {}
+        }
+
+        if compile != Some(false) {
+            if let Some(cflags) = node.cflags().filter(|cflags| !cflags.is_empty()) {
+                opts.insert("cflags".to_string(), cflags);
+            }
+            if let Some(configure_opts) = node.configure_opts().filter(|opts| !opts.is_empty()) {
+                opts.insert("configure_opts".to_string(), configure_opts);
+            }
+            if let Some(make_opts) = node.make_opts().filter(|opts| !opts.is_empty()) {
+                opts.insert("make_opts".to_string(), make_opts);
+            }
+            if let Some(make_install_opts) =
+                node.make_install_opts().filter(|opts| !opts.is_empty())
+            {
+                opts.insert("make_install_opts".to_string(), make_install_opts);
+            }
+            // Patches change what the build produces, so they belong to the artifact's identity.
+            if let Some(apply_patches) = node
+                .apply_patches
+                .clone()
+                .filter(|patches| !patches.is_empty())
+            {
+                opts.insert("apply_patches".to_string(), apply_patches);
+            }
+        }
+
+        // Flavor affects which binary variant is downloaded.
+        // Apply to all platforms to avoid splitting lockfile entries (#8390).
+        if let Some(flavor) = node.flavor.clone().filter(|flavor| !flavor.is_empty()) {
+            opts.insert("flavor".to_string(), flavor);
+        }
+
+        Ok(opts)
+    }
+
+    /// The lockfile options say which node is downloaded or built. Two settings also change
+    /// the files mise adds to that node after it is unpacked: the `bin/npm` wrapper
+    /// (`node.npm_shim`, on by default, and not installed on Windows) and the corepack shims
+    /// (`node.corepack`, off by default). Only a non-default value is an input, so the
+    /// identity of an install made with the defaults does not carry them.
+    fn install_identity_options(&self, tv: &ToolVersion) -> BTreeMap<String, String> {
+        let mut options = crate::backend::static_helpers::request_identity_options(self, tv);
+        let node = &Settings::get().node;
+        if !cfg!(windows) && !node.npm_shim {
+            options.insert("node.npm_shim".to_string(), "false".to_string());
+        }
+        if node.corepack {
+            options.insert("node.corepack".to_string(), "true".to_string());
+        }
+        options
+    }
+
+    async fn resolve_lock_info(
+        &self,
+        tv: &ToolVersion,
+        target: &PlatformTarget,
+    ) -> Result<PlatformInfo> {
+        let version = &tv.version;
+        let settings = Settings::get();
+
+        // Build platform-specific filename
+        let slug = self.build_platform_slug(version, target);
+        let filename = if target.os_name() == "windows" {
+            format!("{slug}.zip")
+        } else {
+            format!("{slug}.tar.gz")
+        };
+
+        // Build download URL. Musl tarballs live on unofficial-builds; pick the
+        // mirror once and use it for both the tarball URL and SHASUMS so the
+        // recorded checksum matches the recorded URL.
+        let mirror = mirror_url_for(&settings.node, &filename);
+        let url = mirror
+            .join(&format!("v{version}/{filename}"))
+            .map_err(|e| eyre::eyre!("Failed to construct Node.js download URL: {e}"))?;
+
+        let node_compile = if target.is_current() {
+            settings.node_compile(CompilePurpose::Inspect)
+        } else {
+            settings.explicit_compile(settings.node.compile)
+        };
+        if node_compile == Some(true) && target.os_name() != "windows" {
+            return self.resolve_source_lock_info(version).await;
+        }
+
+        // Fetch SHASUMS256.txt to get checksum without downloading the tarball.
+        // If the file is absent from SHASUMS in fallback mode, lock the source
+        // compile outcome instead of recording a binary URL that install would 404.
+        let checksum = match self.resolve_shasum(&mirror, version, &filename).await {
+            Ok(Some(shasum)) => Some(shasum),
+            Ok(None) => {
+                if node_compile != Some(false) && target.os_name() != "windows" {
+                    return self.resolve_source_lock_info(version).await;
+                }
+                debug!(
+                    "precompiled node archive {filename} not found in {} and compilation is disabled",
+                    mirror.join(&format!("v{version}/SHASUMS256.txt"))?
+                );
+                return Ok(PlatformInfo::default());
+            }
+            Err(e) => {
+                debug!(
+                    "Failed to fetch SHASUMS from {}: {e}",
+                    mirror.join(&format!("v{version}/SHASUMS256.txt"))?
+                );
+                None
+            }
+        };
+
+        Ok(PlatformInfo {
+            url: Some(url.to_string()),
+            checksum,
+            size: None,
+            url_api: None,
+            conda_deps: None,
+            ..Default::default()
+        })
+    }
+}
+
+impl NodePlugin {
+    async fn resolve_source_lock_info(&self, version: &str) -> Result<PlatformInfo> {
+        let settings = Settings::get();
+        let filename = source_tarball_name(version);
+        let mirror = settings.node.mirror_url();
+        let url = mirror
+            .join(&format!("v{version}/{filename}"))
+            .map_err(|e| eyre::eyre!("Failed to construct Node.js source URL: {e}"))?;
+        let checksum = match self.resolve_shasum(&mirror, version, &filename).await {
+            Ok(checksum) => checksum,
+            Err(e) => {
+                debug!(
+                    "Failed to fetch source SHASUMS from {}: {e}",
+                    mirror.join(&format!("v{version}/SHASUMS256.txt"))?
+                );
+                None
+            }
+        };
+
+        Ok(PlatformInfo {
+            install: Some("source".to_string()),
+            checksum,
+            url: Some(url.to_string()),
+            ..Default::default()
+        })
+    }
+
+    async fn resolve_shasum(
+        &self,
+        mirror: &Url,
+        version: &str,
+        filename: &str,
+    ) -> Result<Option<String>> {
+        let shasums_url = mirror.join(&format!("v{version}/SHASUMS256.txt"))?;
+        let shasums_content = HTTP.get_text_cached(shasums_url.as_str()).await?;
+        // An install that finds a checksum in the lockfile does not call get_checksum,
+        // so this is where the signature behind a locked checksum is checked.
+        let settings = Settings::get();
+        if settings.node.verify && settings.node.gpg_verify != Some(false) {
+            self.verify_shasums_with_gpg(&shasums_url, &shasums_content)
+                .await?;
+        }
+        Ok(hash::parse_shasums(&shasums_content)
+            .get(filename)
+            .map(|shasum| format!("sha256:{shasum}")))
+    }
+
+    /// `verify_with_gpg` for the `SHASUMS256.txt` that `mise lock` holds in memory. On an
+    /// error the caller locks the artifact without a checksum, so the install that follows
+    /// checks the signature itself and fails the same way.
+    async fn verify_shasums_with_gpg(&self, shasums_url: &Url, shasums: &str) -> Result<()> {
+        // unofficial-builds signs nothing, and `mise lock` records its musl entries from any
+        // host, so a warning here would print on every lock with nothing to act on. An
+        // install from it still warns (`missing_signature`).
+        if !publishes_signatures(shasums_url) {
+            debug!("{shasums_url} is not signed, skipping signature verification");
+            return Ok(());
+        }
+        // `mise lock` asks once per target platform; fetch and check each signature once.
+        static VERIFIED: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+        let mut verified = VERIFIED.get_or_init(Default::default).lock().await;
+        let key = shasums_url.to_string();
+        let digest = hash::hash_to_str(&shasums);
+        if verified.get(&key) == Some(&digest) {
+            return Ok(());
+        }
+        let result = match HTTP.get_bytes(format!("{shasums_url}.sig")).await {
+            Ok(signature) => gpg::verify_node(shasums.as_bytes(), signature.as_ref()),
+            Err(e) if matches!(http::error_code(&e), Some(404)) => missing_signature(shasums_url),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = result {
+            warn_once!("not locking checksums from {shasums_url}: {e}");
+            return Err(e);
+        }
+        verified.insert(key, digest);
+        Ok(())
+    }
+
+    /// Map OS name from Platform to Node.js convention
+    fn map_os(os_name: &str) -> &str {
+        match os_name {
+            "macos" => "darwin",
+            "linux" => "linux",
+            "windows" => "win",
+            other => other,
+        }
+    }
+
+    /// Map arch name from Platform to Node.js convention
+    fn map_arch(arch_name: &str) -> &str {
+        match arch_name {
+            "x86" => "x86",
+            "x64" => "x64",
+            "arm" => "armv7l",
+            "arm64" => "arm64",
+            "aarch64" => "arm64",
+            "loongarch64" => "loong64",
+            "riscv64" => "riscv64",
+            other => other,
+        }
+    }
+
+    /// Build platform-specific slug for Node.js downloads
+    /// This mirrors the logic from BuildOpts::new() and slug() function
+    fn build_platform_slug(&self, version: &str, target: &PlatformTarget) -> String {
+        let settings = Settings::get();
+
+        let os = Self::map_os(target.os_name());
+        let arch = Self::map_arch(target.arch_name());
+
+        // Only Linux has Node flavors. The node-specific flavor is for the
+        // current host; lock targets use their own libc qualifier.
+        let flavor = match (target.os_name(), target.is_current()) {
+            ("linux", true) => settings
+                .node
+                .flavor
+                .as_deref()
+                .or_else(|| target.libc().filter(|libc| *libc == "musl")),
+            ("linux", false) => target.libc().filter(|libc| *libc == "musl"),
+            _ => None,
+        };
+        if let Some(flavor) = flavor {
+            return format!("node-v{version}-{os}-{arch}-{flavor}");
+        }
+        format!("node-v{version}-{os}-{arch}")
+    }
+}
+
+#[derive(Debug)]
+struct BuildOpts {
+    version: String,
+    path: Vec<PathBuf>,
+    install_path: PathBuf,
+    build_dir: PathBuf,
+    configure_cmd: String,
+    make_cmd: String,
+    make_install_cmd: String,
+    source_tarball_name: String,
+    source_tarball_path: PathBuf,
+    source_tarball_url: Url,
+    binary_tarball_name: String,
+    binary_tarball_path: PathBuf,
+    binary_tarball_url: Url,
+}
+
+impl BuildOpts {
+    async fn new(ctx: &InstallContext, tv: &ToolVersion) -> Result<Self> {
+        let v = &tv.version;
+        let install_path = tv.install_path();
+        let default_source_tarball_name = source_tarball_name(v);
+
+        let slug = slug(v);
+        #[cfg(windows)]
+        let binary_tarball_name = format!("{slug}.zip");
+        #[cfg(not(windows))]
+        let binary_tarball_name = format!("{slug}.tar.gz");
+
+        let settings = Settings::get();
+        let default_binary_tarball_url = mirror_url_for(&settings.node, &binary_tarball_name)
+            .join(&format!("v{v}/{binary_tarball_name}"))?;
+        let platform_key = Platform::current().to_key();
+        let locked_platform_info = if ctx.locked {
+            tv.lock_platforms.get(&platform_key)
+        } else {
+            None
+        };
+        let locked_source_compile =
+            locked_platform_info.is_some_and(|pi| pi.install.as_deref() == Some("source"));
+        let binary_tarball_url = if locked_source_compile {
+            default_binary_tarball_url
+        } else {
+            locked_platform_info
+                .and_then(|pi| pi.url.as_deref())
+                .map(Url::parse)
+                .transpose()?
+                .unwrap_or(default_binary_tarball_url)
+        };
+        let binary_tarball_name = binary_tarball_url
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&binary_tarball_name)
+            .to_string();
+        let default_source_tarball_url = settings
+            .node
+            .mirror_url()
+            .join(&format!("v{v}/{default_source_tarball_name}"))?;
+        let source_tarball_url = if locked_source_compile {
+            locked_platform_info
+                .and_then(|pi| pi.url.as_deref())
+                .map(Url::parse)
+                .transpose()?
+                .or_else(|| {
+                    locked_platform_info
+                        .filter(|pi| pi.is_pinned_without_url())
+                        .map(|_| default_source_tarball_url.clone())
+                })
+                .ok_or_else(|| {
+                    eyre::eyre!(
+                        "Invalid lockfile entry for node@{v} on platform {platform_key}: install = \"source\" requires url"
+                    )
+                })?
+        } else {
+            default_source_tarball_url
+        };
+        let source_tarball_name = source_tarball_url
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&default_source_tarball_name)
+            .to_string();
+        Ok(Self {
+            version: v.clone(),
+            path: ctx.ts.list_paths(&ctx.config).await,
+            build_dir: env::MISE_TMP_DIR.join(format!("node-v{v}")),
+            configure_cmd: settings.node.configure_cmd(&install_path),
+            make_cmd: settings.node.make_cmd(),
+            make_install_cmd: settings.node.make_install_cmd(),
+            source_tarball_path: tv.download_path().join(&source_tarball_name),
+            source_tarball_url,
+            source_tarball_name,
+            binary_tarball_path: tv.download_path().join(&binary_tarball_name),
+            binary_tarball_url,
+            binary_tarball_name,
+            install_path,
+        })
+    }
+}
+
+/// `nodejs.org/dist` does not host musl tarballs; they live at unofficial-builds.
+/// When a filename references a musl artifact and the user has not explicitly set
+/// `node.mirror_url`, route URL construction (and the matching `SHASUMS256.txt`)
+/// to the unofficial-builds host so the URL and checksum stay consistent.
+const UNOFFICIAL_NODE_MIRROR_URL: &str = "https://unofficial-builds.nodejs.org/download/release/";
+
+fn mirror_url_for(node: &crate::config::settings::SettingsNode, filename: &str) -> Url {
+    let mirror = node.mirror_url();
+    if filename.contains("-musl") && mirror.as_str() == DEFAULT_NODE_MIRROR_URL {
+        return Url::parse(UNOFFICIAL_NODE_MIRROR_URL).unwrap();
+    }
+    mirror
+}
+
+/// What to do when `SHASUMS256.txt.sig` is missing next to `shasums_url`.
+///
+/// The host that serves the archive and `SHASUMS256.txt` also answers the signature request,
+/// so its 404 cannot be what decides that a release is unsigned: a host that replaced both
+/// would only have to withhold the signature. A missing signature therefore fails, except on
+/// unofficial-builds, which signs none of its checksum files. Mirrors that do not copy the
+/// signatures need `node.gpg_verify = false`.
+///
+/// The error must not mention 404, not even in a URL: `fetch_binary` would take it for a
+/// missing archive and fall back to compiling from source.
+fn missing_signature(shasums_url: &Url) -> Result<()> {
+    ensure!(
+        !publishes_signatures(shasums_url),
+        "SHASUMS256.txt.sig not found, so SHASUMS256.txt cannot be verified\n\
+         A few early releases (such as 4.0.0 and 5.12.0) never published a signature.\n\
+         For those, or for a mirror that does not copy the signatures, skip the check with:\n  \
+         mise settings node.gpg_verify=false"
+    );
+    warn_once!("{shasums_url} is not signed, skipping signature verification");
+    Ok(())
+}
+
+/// Whether the host of `shasums_url` signs its `SHASUMS256.txt`. unofficial-builds does not;
+/// nodejs.org and every `node.mirror_url` are held to what nodejs.org publishes.
+fn publishes_signatures(shasums_url: &Url) -> bool {
+    let unofficial = Url::parse(UNOFFICIAL_NODE_MIRROR_URL).unwrap();
+    shasums_url.host_str() != unofficial.host_str()
+}
+
+fn node_flavor_not_found_message(opts: &BuildOpts) -> Option<String> {
+    let settings = Settings::get();
+    let flavor = settings.node.flavor.as_deref()?;
+    Some(format!(
+        "precompiled node archive not found for node.flavor={flavor:?}: {}\n\
+         Node flavors are published by the unofficial builds project. Try:\n  \
+         mise settings node.mirror_url={UNOFFICIAL_NODE_MIRROR_URL}\n  \
+         mise settings node.flavor={flavor}\n\
+         or unset node.flavor to use official Node binaries.",
+        opts.binary_tarball_url
+    ))
+}
+
+fn os() -> &'static str {
+    NodePlugin::map_os(built_info::CFG_OS)
+}
+
+fn arch(settings: &Settings) -> &str {
+    let arch = settings.arch();
+    // Special handling for ARM with target features
+    if arch == "arm" && cfg!(target_feature = "v6") {
+        return "armv6l";
+    }
+    NodePlugin::map_arch(arch)
+}
+
+fn slug(v: &str) -> String {
+    let settings = Settings::get();
+    let current = Platform::current();
+    let flavor = if current.os == "linux" {
+        settings
+            .node
+            .flavor
+            .as_deref()
+            .or_else(|| current.libc().filter(|libc| *libc == "musl"))
+    } else {
+        None
+    };
+    if let Some(flavor) = flavor {
+        format!("node-v{v}-{}-{}-{flavor}", os(), arch(&settings))
+    } else {
+        format!("node-v{v}-{}-{}", os(), arch(&settings))
+    }
+}
+
+fn source_tarball_name(v: &str) -> String {
+    format!("node-v{v}.tar.gz")
+}
+
+/// How far to strip leading path components when applying `patch`.
+///
+/// python-build and ruby-build both default to `-p0` and bump to `-p1` when the patch looks
+/// git-generated, but they sniff for different markers — `diff --git a/` and `--- a/`
+/// respectively. Accepting either means a patch written for python or for ruby applies the same
+/// way here, rather than the user having to know which tool a patch was authored against.
+fn patch_strip_level(patch: &str) -> u8 {
+    let git_style = patch
+        .lines()
+        .any(|line| line.starts_with("diff --git a/") || line.starts_with("--- a/"));
+    if git_style { 1 } else { 0 }
+}
+
+/// `node.apply_patches` only reaches the source build, so say so rather than let the patches
+/// vanish silently when a precompiled binary is what actually got installed.
+fn warn_patches_not_applied() {
+    if Settings::get()
+        .node
+        .apply_patches
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        warn!(
+            "node.apply_patches is set but a precompiled node was installed, so no patch was applied. \
+             Set node.compile=true to build from source."
+        );
+    }
+}
+
+fn should_compile_from_source(
+    locked: bool,
+    lock_platforms: &BTreeMap<String, PlatformInfo>,
+    platform_key: &str,
+    node_compile: Option<bool>,
+) -> bool {
+    if locked {
+        lock_platforms
+            .get(platform_key)
+            .is_some_and(|pi| pi.install.as_deref() == Some("source"))
+    } else {
+        node_compile == Some(true)
+    }
+}
+
+/// Whether mise.lock pins the checksum of the precompiled archive at `url`.
+///
+/// A source build is a different artifact, so `fetch_tarball` drops this pin and checks the
+/// tarball against the server's own SHASUMS256.txt. That is right when the user asked for a
+/// source build, but a 404 for the pinned archive must not be what selects it.
+fn lock_pins_precompiled(
+    lock_platforms: &BTreeMap<String, PlatformInfo>,
+    platform_key: &str,
+    url: &Url,
+) -> bool {
+    lock_platforms
+        .get(platform_key)
+        .filter(|pi| pi.install.is_none() && pi.url.as_deref() == Some(url.as_str()))
+        .is_some_and(|pi| pi.checksum.is_some())
+}
+
+#[derive(Debug, Deserialize)]
+struct NodeVersion {
+    version: String,
+    date: Option<String>,
+    files: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::settings::{SettingsNode, SettingsPartial};
+    use crate::toolset::ToolSource;
+    use confique::Layer;
+
+    struct NodeEnvResetGuard {
+        vars: BTreeMap<String, String>,
+    }
+
+    impl NodeEnvResetGuard {
+        fn clear() -> Self {
+            let vars = env::vars_safe()
+                .filter(|(key, _)| key.starts_with("NODE_"))
+                .collect::<BTreeMap<_, _>>();
+            for key in vars.keys() {
+                env::remove_var(key);
+            }
+            Self { vars }
+        }
+    }
+
+    impl Drop for NodeEnvResetGuard {
+        fn drop(&mut self) {
+            for key in env::vars_safe()
+                .map(|(key, _)| key)
+                .filter(|key| key.starts_with("NODE_"))
+                .collect::<Vec<_>>()
+            {
+                env::remove_var(key);
+            }
+            for (key, value) in &self.vars {
+                env::set_var(key, value);
+            }
+        }
+    }
+
+    fn resolve_node_lockfile_options(
+        configure_settings: impl FnOnce(&mut SettingsPartial),
+    ) -> BTreeMap<String, String> {
+        let _guard = crate::test::SettingsGuard::lock();
+        let _env_guard = NodeEnvResetGuard::clear();
+        let mut settings = SettingsPartial::empty();
+        configure_settings(&mut settings);
+        Settings::reset(Some(settings));
+
+        let backend = NodePlugin::new();
+        let request = ToolRequest::new(backend.ba().clone(), "22.0.0", ToolSource::Unknown)
+            .expect("valid node request");
+        backend
+            .resolve_lockfile_options(&request, &PlatformTarget::from_current())
+            .expect("node lockfile options")
+    }
+
+    #[test]
+    fn test_locked_node_install_uses_source_marker() {
+        let platform_key = Platform::current().to_key();
+        let lock_platforms = BTreeMap::from([(
+            platform_key.clone(),
+            PlatformInfo {
+                install: Some("source".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        assert!(should_compile_from_source(
+            true,
+            &lock_platforms,
+            &platform_key,
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn test_locked_node_install_ignores_compile_setting_for_binary_lock() {
+        let platform_key = Platform::current().to_key();
+        let lock_platforms = BTreeMap::from([(
+            platform_key.clone(),
+            PlatformInfo {
+                url: Some("https://nodejs.org/dist/v22.0.0/node-v22.0.0-linux-x64.tar.gz".into()),
+                ..Default::default()
+            },
+        )]);
+
+        assert!(!should_compile_from_source(
+            true,
+            &lock_platforms,
+            &platform_key,
+            Some(true)
+        ));
+    }
+
+    #[test]
+    fn test_unlocked_node_install_uses_compile_setting() {
+        assert!(should_compile_from_source(
+            false,
+            &BTreeMap::new(),
+            "linux-x64",
+            Some(true)
+        ));
+        assert!(!should_compile_from_source(
+            false,
+            &BTreeMap::new(),
+            "linux-x64",
+            None
+        ));
+    }
+
+    #[test]
+    fn test_lock_pins_precompiled_only_for_the_pinned_binary_archive() {
+        let url = "https://nodejs.org/dist/v22.0.0/node-v22.0.0-linux-x64.tar.gz";
+        let mut lock_platforms = BTreeMap::from([(
+            "linux-x64".to_string(),
+            PlatformInfo {
+                url: Some(url.to_string()),
+                checksum: Some("sha256:abc".to_string()),
+                ..Default::default()
+            },
+        )]);
+        let url = Url::parse(url).unwrap();
+        assert!(lock_pins_precompiled(&lock_platforms, "linux-x64", &url));
+        assert!(!lock_pins_precompiled(&lock_platforms, "linux-arm64", &url));
+
+        // Another mirror or flavor: the entry does not describe the archive asked for
+        let mirror = Url::parse("https://corp.example/node-v22.0.0-linux-x64.tar.gz").unwrap();
+        assert!(!lock_pins_precompiled(
+            &lock_platforms,
+            "linux-x64",
+            &mirror
+        ));
+
+        // A platform locked as a source build still compiles
+        lock_platforms.get_mut("linux-x64").unwrap().install = Some("source".to_string());
+        assert!(!lock_pins_precompiled(&lock_platforms, "linux-x64", &url));
+
+        let info = lock_platforms.get_mut("linux-x64").unwrap();
+        info.install = None;
+        info.checksum = None;
+        assert!(!lock_pins_precompiled(&lock_platforms, "linux-x64", &url));
+    }
+
+    #[test]
+    fn test_missing_signature_fails_except_on_unofficial_builds() {
+        let official = Url::parse("https://nodejs.org/dist/v20.11.0/SHASUMS256.txt").unwrap();
+        let err = missing_signature(&official).unwrap_err();
+        assert!(err.to_string().contains("node.gpg_verify=false"));
+        // fetch_binary reads any error that mentions 404 as a missing archive
+        assert_eq!(http::error_code(&err), None);
+        // A mirror is held to what nodejs.org publishes
+        let mirror = Url::parse("https://corp.example:404/node/v18.20.8/SHASUMS256.txt").unwrap();
+        let err = missing_signature(&mirror).unwrap_err();
+        assert_eq!(http::error_code(&err), None);
+        let unofficial = Url::parse(UNOFFICIAL_NODE_MIRROR_URL)
+            .unwrap()
+            .join("v24.14.0/SHASUMS256.txt")
+            .unwrap();
+        assert!(missing_signature(&unofficial).is_ok());
+    }
+
+    #[test]
+    fn test_mirror_url_for_routes_musl_to_unofficial_builds() {
+        let node = SettingsNode::default();
+        let url = mirror_url_for(&node, "node-v24.14.0-linux-x64-musl.tar.gz");
+        assert_eq!(url.as_str(), UNOFFICIAL_NODE_MIRROR_URL);
+    }
+
+    #[test]
+    fn test_mirror_url_for_keeps_default_for_glibc() {
+        let node = SettingsNode::default();
+        let url = mirror_url_for(&node, "node-v24.14.0-linux-x64.tar.gz");
+        assert_eq!(url.as_str(), DEFAULT_NODE_MIRROR_URL);
+    }
+
+    #[test]
+    fn test_mirror_url_for_respects_explicit_mirror() {
+        // If the user has a custom mirror, route everything through it —
+        // they may be using a corporate mirror that does host musl builds.
+        let node = SettingsNode {
+            mirror_url: Some("https://corp.example/node/".to_string()),
+            ..Default::default()
+        };
+        let glibc = mirror_url_for(&node, "node-v24.14.0-linux-x64.tar.gz");
+        let musl = mirror_url_for(&node, "node-v24.14.0-linux-x64-musl.tar.gz");
+        assert_eq!(glibc.as_str(), "https://corp.example/node/");
+        assert_eq!(musl.as_str(), "https://corp.example/node/");
+    }
+
+    #[test]
+    fn test_node_flavor_not_found_message_is_flavor_specific() {
+        let _guard = crate::test::SettingsGuard::lock();
+        let mut settings = SettingsPartial::empty();
+        settings.node.flavor = Some("glibc-217".to_string());
+        Settings::reset(Some(settings));
+
+        let opts = BuildOpts {
+            version: "24.14.0".to_string(),
+            path: vec![],
+            install_path: PathBuf::from("node-v24.14.0"),
+            build_dir: PathBuf::from("node-v24.14.0"),
+            configure_cmd: "./configure".to_string(),
+            make_cmd: "make".to_string(),
+            make_install_cmd: "make install".to_string(),
+            source_tarball_name: "node-v24.14.0.tar.gz".to_string(),
+            source_tarball_path: PathBuf::from("node-v24.14.0.tar.gz"),
+            source_tarball_url: Url::parse("https://nodejs.org/dist/v24.14.0/node-v24.14.0.tar.gz")
+                .unwrap(),
+            binary_tarball_name: "node-v24.14.0-linux-x64-glibc-217.tar.gz".to_string(),
+            binary_tarball_path: PathBuf::from("node-v24.14.0-linux-x64-glibc-217.tar.gz"),
+            binary_tarball_url: Url::parse(
+                "https://nodejs.org/dist/v24.14.0/node-v24.14.0-linux-x64-glibc-217.tar.gz",
+            )
+            .unwrap(),
+        };
+
+        let message = node_flavor_not_found_message(&opts).unwrap();
+        assert!(message.contains("node.flavor=\"glibc-217\""));
+        assert!(message.contains(UNOFFICIAL_NODE_MIRROR_URL));
+    }
+
+    fn node_identity_options(
+        configure_settings: impl FnOnce(&mut SettingsPartial),
+    ) -> BTreeMap<String, String> {
+        let _guard = crate::test::SettingsGuard::lock();
+        let _env_guard = NodeEnvResetGuard::clear();
+        let mut settings = SettingsPartial::empty();
+        configure_settings(&mut settings);
+        Settings::reset(Some(settings));
+        crate::backend::static_helpers::test_identity_options(&NodePlugin::new(), "22.0.0", &[])
+    }
+
+    #[test]
+    fn test_node_identity_options_include_only_non_default_post_install_settings() {
+        assert_eq!(node_identity_options(|_| {}), BTreeMap::new());
+        assert_eq!(
+            node_identity_options(|settings| {
+                settings.node.npm_shim = Some(true);
+                settings.node.corepack = Some(false);
+            }),
+            BTreeMap::new()
+        );
+
+        let corepack = node_identity_options(|settings| settings.node.corepack = Some(true));
+        assert_eq!(
+            corepack,
+            BTreeMap::from([("node.corepack".to_string(), "true".to_string())])
+        );
+
+        let no_shim = node_identity_options(|settings| settings.node.npm_shim = Some(false));
+        if cfg!(windows) {
+            // No npm wrapper is ever installed there.
+            assert_eq!(no_shim, BTreeMap::new());
+        } else {
+            assert_eq!(
+                no_shim,
+                BTreeMap::from([("node.npm_shim".to_string(), "false".to_string())])
+            );
+        }
+
+        // What node itself is built or downloaded from stays in.
+        let flavor = node_identity_options(|settings| settings.node.flavor = Some("musl".into()));
+        assert_eq!(
+            flavor,
+            BTreeMap::from([("flavor".to_string(), "musl".to_string())])
+        );
+    }
+
+    #[test]
+    fn test_node_lockfile_options_omit_default_precompiled_settings() {
+        let opts = resolve_node_lockfile_options(|_| {});
+
+        assert_eq!(opts, BTreeMap::new());
+    }
+
+    #[test]
+    fn test_node_lockfile_options_include_binary_settings() {
+        let opts = resolve_node_lockfile_options(|settings| {
+            settings.node.compile = Some(false);
+            settings.node.mirror_url = Some("https://corp.example/node/".to_string());
+            settings.node.flavor = Some("musl".to_string());
+        });
+
+        assert_eq!(
+            opts,
+            BTreeMap::from([
+                ("flavor".to_string(), "musl".to_string()),
+                ("compile".to_string(), "false".to_string()),
+                (
+                    "mirror_url".to_string(),
+                    "https://corp.example/node/".to_string()
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_node_lockfile_options_include_source_build_settings() {
+        let opts = resolve_node_lockfile_options(|settings| {
+            settings.node.compile = Some(true);
+            settings.node.cflags = Some("-O2".to_string());
+            settings.node.configure_opts = Some("--openssl-no-asm".to_string());
+            settings.node.make = Some("gmake".to_string());
+            settings.node.make_opts = Some("-s".to_string());
+            settings.node.make_install_opts = Some("--no-strip".to_string());
+            settings.node.concurrency = Some(16);
+            settings.node.ninja = Some(false);
+        });
+
+        assert_eq!(
+            opts,
+            BTreeMap::from([
+                ("cflags".to_string(), "-O2".to_string()),
+                ("compile".to_string(), "true".to_string()),
+                ("configure_opts".to_string(), "--openssl-no-asm".to_string()),
+                ("make_install_opts".to_string(), "--no-strip".to_string()),
+                ("make_opts".to_string(), "-s".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_node_lockfile_options_include_auto_source_build_settings() {
+        let opts = resolve_node_lockfile_options(|settings| {
+            settings.node.configure_opts = Some("--openssl-no-asm".to_string());
+            settings.node.make_opts = Some("-s".to_string());
+        });
+
+        assert_eq!(
+            opts,
+            BTreeMap::from([
+                ("configure_opts".to_string(), "--openssl-no-asm".to_string()),
+                ("make_opts".to_string(), "-s".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_node_lockfile_options_include_apply_patches() {
+        let opts = resolve_node_lockfile_options(|settings| {
+            settings.node.compile = Some(true);
+            settings.node.apply_patches = Some("https://example.com/node.patch".to_string());
+        });
+
+        assert_eq!(
+            opts,
+            BTreeMap::from([
+                (
+                    "apply_patches".to_string(),
+                    "https://example.com/node.patch".to_string(),
+                ),
+                ("compile".to_string(), "true".to_string()),
+            ])
+        );
+    }
+
+    /// With compilation off the patches never run, so recording them would split lockfile entries
+    /// for artifacts that are in fact identical.
+    #[test]
+    fn test_node_lockfile_options_omit_apply_patches_when_not_compiling() {
+        let opts = resolve_node_lockfile_options(|settings| {
+            settings.node.compile = Some(false);
+            settings.node.apply_patches = Some("https://example.com/node.patch".to_string());
+        });
+
+        assert_eq!(
+            opts,
+            BTreeMap::from([("compile".to_string(), "false".to_string())])
+        );
+    }
+
+    /// Mirrors what python-build and ruby-build sniff for, taking either marker so a patch written
+    /// against either tool lands the same way.
+    #[test]
+    fn test_patch_strip_level() {
+        assert_eq!(
+            patch_strip_level("diff --git a/src/node.cc b/src/node.cc\n--- a/src/node.cc\n"),
+            1
+        );
+        // ruby-build's marker on its own, with no `diff --git` header
+        assert_eq!(patch_strip_level("--- a/configure\n+++ b/configure\n"), 1);
+        // a plain `diff -u` between two trees
+        assert_eq!(
+            patch_strip_level("--- configure.orig\n+++ configure\n@@ -1 +1 @@\n"),
+            0
+        );
+        assert_eq!(patch_strip_level(""), 0);
+        // the marker only counts at the start of a line, not inside the diff body
+        assert_eq!(patch_strip_level("--- old\n+++ new\n+// --- a/nope\n"), 0);
+    }
+
+    #[test]
+    fn test_node_lockfile_options_include_legacy_source_build_env() {
+        let _guard = crate::test::SettingsGuard::lock();
+        let _env_guard = NodeEnvResetGuard::clear();
+        env::set_var("NODE_CONFIGURE_OPTS", "--openssl-no-asm");
+        env::set_var("NODE_MAKE_OPTS", "-s");
+        env::set_var("NODE_MAKE_INSTALL_OPTS", "--no-strip");
+        Settings::reset(Some(SettingsPartial::empty()));
+
+        let backend = NodePlugin::new();
+        let request = ToolRequest::new(backend.ba().clone(), "22.0.0", ToolSource::Unknown)
+            .expect("valid node request");
+        let opts = backend
+            .resolve_lockfile_options(&request, &PlatformTarget::from_current())
+            .expect("node lockfile options");
+
+        assert_eq!(
+            opts,
+            BTreeMap::from([
+                ("configure_opts".to_string(), "--openssl-no-asm".to_string()),
+                ("make_install_opts".to_string(), "--no-strip".to_string()),
+                ("make_opts".to_string(), "-s".to_string()),
+            ])
+        );
+    }
+}

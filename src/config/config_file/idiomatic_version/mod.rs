@@ -1,0 +1,422 @@
+use std::path::{Path, PathBuf};
+
+use eyre::{Result, eyre};
+
+use crate::args::{BackendArg, BackendResolution};
+use crate::backend::BackendList;
+use crate::config::config_file::{ConfigFile, trust_check, version_requires_trust};
+use crate::config::{Settings, is_global_config};
+use crate::file;
+use crate::plugins;
+use crate::toolset::{ToolRequest, ToolRequestSet, ToolSource};
+use crate::watch_files::WatchFile;
+
+pub mod package_json;
+
+#[derive(Debug, Clone)]
+pub(crate) struct IdiomaticVersionFile {
+    path: PathBuf,
+    tools: ToolRequestSet,
+}
+
+impl IdiomaticVersionFile {
+    #[allow(dead_code)]
+    #[cfg(test)]
+    pub(crate) fn init(path: PathBuf) -> Self {
+        Self {
+            path,
+            tools: ToolRequestSet::new(),
+        }
+    }
+
+    /// Whether the file needs trust before it is parsed. These files only pick
+    /// versions, so nothing but a `path:` one does (see
+    /// [`version_requires_trust`]).
+    pub(crate) async fn path_requires_trust(path: &Path, plugins: &BackendList) -> bool {
+        if is_global_config(path) {
+            return false;
+        }
+        // Before any plugin reads it whole: each reads the file unbounded.
+        // `parse` refuses the oversized file once trust is settled.
+        if file::ensure_config_file_size(path).is_err() {
+            return true;
+        }
+        for plugin in plugins {
+            if let Ok(versions) = plugin.parse_idiomatic_file_with_options(path).await
+                && versions
+                    .iter()
+                    .any(|(version, _)| version_requires_trust(version))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) async fn parse(path: PathBuf, plugins: BackendList) -> Result<Self> {
+        let source = ToolSource::IdiomaticVersionFile(path.clone());
+        let mut tools = ToolRequestSet::new();
+        file::ensure_config_file_size(&path)?;
+        if super::diagnostic::links_to_another_name(&path) {
+            // Only filenames discovery still looks for: a disabled one is not read
+            // under its own name either.
+            let disable_files = &Settings::get().idiomatic_version_file_disable_files;
+            let mut filenames = vec![];
+            for plugin in &plugins {
+                filenames.extend(
+                    plugin
+                        .idiomatic_filenames()
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|f| {
+                            !crate::config::idiomatic_version_file_disabled(
+                                disable_files,
+                                plugin.id(),
+                                f,
+                            )
+                        }),
+                );
+            }
+            super::diagnostic::warn_linked_version_file(&path, |target| {
+                !super::matching_idiomatic_filenames(target, filenames.iter().map(String::as_str))
+                    .is_empty()
+            });
+            return Ok(Self { tools, path });
+        }
+
+        for plugin in plugins {
+            match plugin.parse_idiomatic_file_with_options(&path).await {
+                Ok(versions) => {
+                    for (version, mut options) in versions {
+                        if version_requires_trust(&version) && !is_global_config(&path) {
+                            trust_check(&path)?;
+                        }
+                        let backend = package_manager_checksum_backend(
+                            plugin.ba(),
+                            &version,
+                            &mut options,
+                            &path,
+                        )?;
+                        let mut tr = ToolRequest::new(backend, &version, source.clone())?;
+                        tr.set_options(options);
+                        tools.add_version(tr, &source);
+                    }
+                }
+                Err(e) => {
+                    trace!("skipping {} for {}: {}", path.display(), plugin.id(), e);
+                    continue;
+                }
+            }
+        }
+
+        Ok(Self { tools, path })
+    }
+
+    fn read_only_error(&self, action: &str) -> eyre::Report {
+        eyre!(
+            "cannot {action} idiomatic version file {}; use mise.toml, .tool-versions, or --path to choose a writable config file",
+            file::display_path(&self.path)
+        )
+    }
+}
+
+fn package_manager_checksum_backend(
+    backend: &std::sync::Arc<BackendArg>,
+    version: &str,
+    options: &mut crate::toolset::ToolVersionOptions,
+    path: &Path,
+) -> Result<std::sync::Arc<BackendArg>> {
+    if !package_json::is_package_json(path) {
+        return Ok(backend.clone());
+    }
+    let Some(checksum) = options.opts.shift_remove("package_manager_checksum") else {
+        return Ok(backend.clone());
+    };
+    options.opts.insert("checksum".to_string(), checksum);
+
+    let full = match backend.short.as_str() {
+        "bun" => {
+            options
+                .opts
+                .insert("allow_builds".to_string(), toml::Value::Boolean(true));
+            "npm:bun"
+        }
+        "npm" => "npm:npm",
+        "pnpm" => {
+            // pnpm 12 installs its native binary from an install script; without it
+            // pnpm falls back to Node.js and warns on every run. A per-package
+            // `["pnpm"]` approval is ignored for the archive a checksum installs
+            // from, so approve all builds; pnpm's only dependencies are its
+            // platform binaries.
+            options
+                .opts
+                .insert("allow_builds".to_string(), toml::Value::Boolean(true));
+            "npm:pnpm"
+        }
+        "yarn" => {
+            let version = semver::Version::parse(version).map_err(|error| {
+                eyre!("packageManager checksum requires an exact Yarn version: {error}")
+            })?;
+            if version.major < 2 {
+                "npm:yarn"
+            } else {
+                options.opts.insert(
+                    "url".to_string(),
+                    toml::Value::String(format!(
+                        "https://repo.yarnpkg.com/{version}/packages/yarnpkg-cli/bin/yarn.js"
+                    )),
+                );
+                options
+                    .opts
+                    .insert("bin".to_string(), toml::Value::String("yarn".to_string()));
+                options.opts.insert(
+                    "windows_script_interpreter".to_string(),
+                    toml::Value::String("node".to_string()),
+                );
+                "http:yarn"
+            }
+        }
+        _ => return Ok(backend.clone()),
+    };
+    let tool_name = full
+        .split_once(':')
+        .map(|(_, tool_name)| tool_name)
+        .unwrap_or(full);
+    Ok(std::sync::Arc::new(BackendArg::new_raw(
+        backend.short.clone(),
+        Some(full.to_string()),
+        tool_name.to_string(),
+        None,
+        BackendResolution::forced(),
+    )))
+}
+
+impl ConfigFile for IdiomaticVersionFile {
+    fn get_path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    fn remove_tool(&self, _fa: &BackendArg) -> Result<()> {
+        Err(self.read_only_error("remove tools from"))
+    }
+
+    fn replace_versions(
+        &self,
+        _plugin_name: &BackendArg,
+        _versions: Vec<ToolRequest>,
+    ) -> Result<()> {
+        Err(self.read_only_error("update"))
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn save(&self) -> Result<()> {
+        Ok(())
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn dump(&self) -> Result<String> {
+        file::read_config_to_string(&self.path)
+    }
+
+    fn source(&self) -> ToolSource {
+        ToolSource::IdiomaticVersionFile(self.path.clone())
+    }
+
+    fn to_tool_request_set(&self) -> Result<ToolRequestSet> {
+        Ok(self.tools.clone())
+    }
+
+    fn watch_files(&self) -> Result<Vec<WatchFile>> {
+        Ok(plugins::core::gemfile_watch_patterns(&self.path)
+            .into_iter()
+            .map(|pattern| WatchFile {
+                patterns: vec![pattern],
+                run: None,
+                shell: None,
+                task: None,
+            })
+            .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::{BackendArg, BackendResolution};
+    use crate::backend::{Backend, VersionInfo};
+    use crate::config::Config;
+    use crate::install_context::InstallContext;
+    use crate::toolset::ToolVersion;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct MockBackend {
+        ba: Arc<BackendArg>,
+        fail: bool,
+        version: Option<String>,
+        read: std::sync::atomic::AtomicBool,
+    }
+
+    impl MockBackend {
+        fn new(short: &str, fail: bool, version: Option<String>) -> Self {
+            let ba = BackendArg::new_raw(
+                short.to_string(),
+                None,
+                short.to_string(),
+                None,
+                BackendResolution::new(false),
+            );
+            Self {
+                ba: Arc::new(ba),
+                fail,
+                version,
+                read: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Backend for MockBackend {
+        fn ba(&self) -> &Arc<BackendArg> {
+            &self.ba
+        }
+
+        async fn _list_remote_versions(&self, _config: &Arc<Config>) -> Result<Vec<VersionInfo>> {
+            Ok(vec![])
+        }
+
+        async fn install_version_(
+            &self,
+            _ctx: &InstallContext,
+            _tv: ToolVersion,
+        ) -> Result<ToolVersion> {
+            unimplemented!()
+        }
+
+        async fn parse_idiomatic_file(&self, _path: &Path) -> Result<Vec<String>> {
+            self.read.store(true, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                eyre::bail!("mock error");
+            }
+            if let Some(v) = &self.version {
+                Ok(vec![v.clone()])
+            } else {
+                Ok(vec![])
+            }
+        }
+    }
+
+    /// The trust check runs before `parse`, and plugins read the whole file,
+    /// so an oversized one must not reach them there either.
+    #[tokio::test]
+    async fn test_trust_check_does_not_read_an_oversized_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join(".node-version");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(file::CONFIG_FILE_LIMIT + 1)
+            .unwrap();
+        let backend = Arc::new(MockBackend::new("node", false, Some("20".to_string())));
+        let plugins: BackendList = vec![backend.clone()];
+
+        assert!(IdiomaticVersionFile::path_requires_trust(&path, &plugins).await);
+        assert!(
+            !backend.read.load(std::sync::atomic::Ordering::SeqCst),
+            "a plugin read the oversized file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_idiomatic_parse_error_propagation() {
+        let _config = Config::get().await.unwrap();
+        let path = PathBuf::from(".tool-versions");
+        let backend1 = Arc::new(MockBackend::new("node", true, None));
+        let backend2 = Arc::new(MockBackend::new(
+            "python",
+            false,
+            Some("3.10.0".to_string()),
+        ));
+        let plugins: BackendList = vec![backend1, backend2];
+
+        let result = IdiomaticVersionFile::parse(path, plugins).await;
+
+        assert!(result.is_ok(), "Should not propagate error from backend1");
+
+        let file = result.unwrap();
+        let trs = file.to_tool_request_set().unwrap();
+        let tools: Vec<_> = trs.into_tools().collect();
+        assert_eq!(tools.len(), 1);
+        let (ba, versions, _) = &tools[0];
+        assert_eq!(ba.short, "python");
+        assert_eq!(versions[0].version(), "3.10.0");
+    }
+
+    #[test]
+    fn test_idiomatic_mutations_return_errors() {
+        let file = IdiomaticVersionFile::init(PathBuf::from("package.json"));
+        let ba = MockBackend::new("node", false, None).ba;
+
+        let err = file.replace_versions(&ba, vec![]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot update idiomatic version file")
+        );
+
+        let err = file.remove_tool(&ba).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cannot remove tools from idiomatic version file")
+        );
+    }
+
+    #[test]
+    fn test_package_manager_checksums_use_matching_corepack_artifacts() {
+        let path = Path::new("package.json");
+        for (tool, version, expected) in [
+            ("bun", "1.3.14", "npm:bun"),
+            ("npm", "11.0.0", "npm:npm"),
+            ("pnpm", "10.0.0", "npm:pnpm"),
+            ("yarn", "1.22.22", "npm:yarn"),
+            ("yarn", "4.0.0", "http:yarn"),
+        ] {
+            let mut options = crate::toolset::ToolVersionOptions::default();
+            options.opts.insert(
+                "package_manager_checksum".to_string(),
+                toml::Value::String("sha224:abc".to_string()),
+            );
+            let backend = MockBackend::new(tool, false, None).ba;
+            let backend =
+                package_manager_checksum_backend(&backend, version, &mut options, path).unwrap();
+            assert_eq!(backend.full(), expected);
+            // The backend is pinned for this request but never recorded as the
+            // tool's explicit choice, so later requests follow the registry.
+            assert!(backend.has_explicit_backend());
+            assert!(!backend.records_explicit_backend());
+            if tool == "bun" || tool == "pnpm" {
+                assert_eq!(
+                    options.opts.get("allow_builds"),
+                    Some(&toml::Value::Boolean(true))
+                );
+            }
+            if expected == "http:yarn" {
+                assert_eq!(
+                    options.opts.get("url").and_then(toml::Value::as_str),
+                    Some("https://repo.yarnpkg.com/4.0.0/packages/yarnpkg-cli/bin/yarn.js")
+                );
+                assert_eq!(
+                    options.opts.get("bin").and_then(toml::Value::as_str),
+                    Some("yarn")
+                );
+                assert_eq!(
+                    options
+                        .opts
+                        .get("windows_script_interpreter")
+                        .and_then(toml::Value::as_str),
+                    Some("node")
+                );
+            }
+        }
+    }
+}

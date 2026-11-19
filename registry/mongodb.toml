@@ -1,0 +1,5 @@
+backends = ["conda:mongodb", "vfox:jdx/vfox-mongod"]
+bins = ["mongod", "mongos"]
+description = "MongoDB"
+test = { cmd = "mongod --version", expected = "db version v{{version}}" }
+version_order = "semver"

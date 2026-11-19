@@ -1,0 +1,6 @@
+backends = [{ full = "github:uber/mockolo", attestations_since = "2.6.1" }]
+bins = ["mockolo"]
+description = "Efficient Mock Generator for Swift"
+version_order = "semver"
+# TODO: re-enable once the e2e image has a practical Swift runtime for libswiftCore.so.
+# test = { cmd = "mockolo --help", expected = "Show help information" }

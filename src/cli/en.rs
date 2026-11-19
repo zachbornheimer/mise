@@ -1,0 +1,64 @@
+use crate::cli::exec::Exec;
+use std::path::PathBuf;
+
+use crate::env;
+
+/// Start a subshell with mise's tools and environment
+///
+/// This is an alternative to `mise activate` for starting a mise session explicitly.
+/// The new shell has the tools and environment variables from the config loaded.
+/// Unlike an activated shell, changing directories does not update the environment.
+/// Type `exit` to leave it.
+#[derive(Debug, usage_rs::Args)]
+#[usage(
+    verbatim_doc_comment,
+    example(
+        "mise en",
+        help = "Start a shell with the project's tools and environment"
+    ),
+    example("mise en ~/work/api", help = "Start the shell in another project"),
+    example(r#"mise en -s "bash --norc""#, help = "Skip loading .bashrc"),
+    example(r#"mise en -s "zsh -f""#, help = "Skip loading .zshrc")
+)]
+pub(crate) struct En {
+    /// Directory to start the shell in
+    #[usage(default = ".", verbatim_doc_comment, value_hint = usage_rs::ValueHint::DirPath)]
+    pub dir: PathBuf,
+
+    /// Shell to start; defaults to $SHELL
+    #[usage(verbatim_doc_comment, long, short = 's')]
+    pub shell: Option<String>,
+}
+
+impl En {
+    pub(crate) async fn run(self) -> eyre::Result<()> {
+        env::set_current_dir(&self.dir)?;
+        let shell = self.shell.unwrap_or((*env::SHELL).clone());
+        let command = shell_words::split(&shell).map_err(|e| eyre::eyre!(e))?;
+
+        Exec {
+            tool: vec![],
+            raw: false,
+            jobs: None,
+            c: None,
+            command: Some(command),
+            no_deps: false,
+            fresh_env: false,
+            deny_all: false,
+            deny_read: false,
+            deny_write: false,
+            deny_net: false,
+            deny_unix: false,
+            deny_env: false,
+            allow_read: vec![],
+            allow_write: vec![],
+            allow_net: vec![],
+            allow_unix: vec![],
+            allow_env: vec![],
+            secrets: vec![],
+            secrets_all: false,
+        }
+        .run()
+        .await
+    }
+}

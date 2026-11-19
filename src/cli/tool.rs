@@ -1,0 +1,339 @@
+use crate::backend::SecurityFeature;
+use crate::ui::style;
+use eyre::Result;
+use itertools::Itertools;
+use serde::Serialize;
+
+use crate::args::BackendArg;
+use crate::config::Config;
+use crate::toolset::{ToolSource, ToolVersionOptions, ToolsetBuilder, redact_tool_options};
+use crate::ui::table;
+use mise_util::redactions::redact_url_userinfo_in_arg;
+
+/// Show information about a tool
+///
+/// Shows the tool's backend, its description and project URL when known, the
+/// installed, active, and requested versions, the config file that requests it,
+/// its tool options, and the backend's security features. Pass a field flag
+/// such as `--backend` to print one field, or `--json` for all of them.
+#[derive(Debug, usage_rs::Args)]
+#[usage(
+    verbatim_doc_comment,
+    example(
+        r###"mise tool node
+Backend:            core:node
+Installed Versions: 22.0.0 24.0.0
+Active Version:     24.0.0
+Requested Version:  24
+Config Source:      ~/.config/mise/config.toml
+Tool Options:       [none]
+Security:           checksum (sha256), gpg"###,
+        help = "Show everything mise knows about node"
+    ),
+    example(
+        r###"mise tool node --backend
+core:node"###,
+        help = "Print only the backend"
+    )
+)]
+pub(crate) struct Tool {
+    /// The tool, such as `node` or `aqua:jqlang/jq`
+    tool: BackendArg,
+    /// Output in JSON format
+    #[usage(long, short = 'J')]
+    json: bool,
+
+    #[usage(flatten)]
+    filter: ToolInfoFilter,
+}
+
+#[derive(Debug, Clone, usage_rs::Args)]
+#[usage(group("tool-info-filter"))]
+pub(super) struct ToolInfoFilter {
+    /// Only show active versions
+    #[usage(long, group = "tool-info-filter")]
+    active: bool,
+
+    /// Only show backend field
+    #[usage(long, group = "tool-info-filter")]
+    backend_: bool,
+
+    /// Only show config source
+    #[usage(long, group = "tool-info-filter")]
+    config_source: bool,
+
+    /// Only show description field
+    #[usage(long, group = "tool-info-filter")]
+    description: bool,
+
+    /// Only show installed versions
+    #[usage(long, group = "tool-info-filter")]
+    installed: bool,
+
+    /// Only show requested versions
+    #[usage(long, group = "tool-info-filter")]
+    requested: bool,
+
+    /// Only show tool options
+    #[usage(long, group = "tool-info-filter")]
+    tool_options: bool,
+
+    /// Only show the project URL from the registry
+    #[usage(long, group = "tool-info-filter")]
+    url: bool,
+}
+
+impl Tool {
+    pub(crate) async fn run(self) -> Result<()> {
+        let config = Config::get().await?;
+        let mut ts = ToolsetBuilder::new().build(&config).await?;
+        ts.resolve(&config).await?;
+        let tvl = ts.versions.get(&self.tool);
+        let tv = tvl.and_then(|tvl| tvl.os_supported_versions().next());
+        let ba = tv.map(|tv| tv.ba()).unwrap_or_else(|| &self.tool);
+
+        // Check if the backend exists and fail if it doesn't
+        let backend = match ba.backend() {
+            Ok(b) => Some(b),
+            Err(e) => {
+                // If no versions are configured for this tool, it's likely invalid
+                if tvl.is_none() {
+                    return Err(e);
+                }
+                None
+            }
+        };
+
+        let (description, security) = if let Some(backend) = &backend {
+            (backend.description().await, backend.security_info().await)
+        } else {
+            (None, vec![])
+        };
+        // Printed outside the logger, and the tool's spelling, its backend and
+        // its options can carry credentials.
+        let redact = |s: &str| config.redact(&redact_url_userinfo_in_arg(s));
+        let redact_all = |v: Vec<String>| v.iter().map(|s| redact(s)).collect::<Vec<_>>();
+        let info = ToolInfo {
+            backend: redact(&ba.full()),
+            description: description.map(|d| redact(&d)),
+            url: ba.registry_tool().and_then(|rt| rt.url).map(str::to_string),
+            installed_versions: ts
+                .list_installed_versions(&config)
+                .await?
+                .into_iter()
+                .filter(|(b, _)| b.ba().as_ref() == ba)
+                .map(|(_, tv)| redact(&tv.version))
+                .unique()
+                .collect::<Vec<_>>(),
+            active_versions: tvl.map(|tvl| {
+                redact_all(
+                    tvl.os_supported_versions()
+                        .map(|tv| tv.version.clone())
+                        .collect(),
+                )
+            }),
+            requested_versions: tvl
+                .map(|tvl| redact_all(tvl.requests.iter().map(|tr| tr.version()).collect())),
+            config_source: tvl.map(|tvl| tvl.source.clone()),
+            tool_options: redact_tool_options(ba.opts(), &redact),
+            security,
+        };
+
+        if self.json {
+            self.output_json(info)
+        } else {
+            self.output_user(info)
+        }
+    }
+
+    fn output_json(&self, info: ToolInfo) -> Result<()> {
+        if self.filter.backend_ {
+            miseprintln!("{}", serde_json::to_string_pretty(&info.backend)?);
+        } else if self.filter.description {
+            miseprintln!("{}", serde_json::to_string_pretty(&info.description)?);
+        } else if self.filter.installed {
+            miseprintln!(
+                "{}",
+                serde_json::to_string_pretty(&info.installed_versions)?
+            );
+        } else if self.filter.active {
+            miseprintln!("{}", serde_json::to_string_pretty(&info.active_versions)?);
+        } else if self.filter.requested {
+            miseprintln!(
+                "{}",
+                serde_json::to_string_pretty(&info.requested_versions)?
+            );
+        } else if self.filter.config_source {
+            miseprintln!("{}", serde_json::to_string_pretty(&info.config_source)?);
+        } else if self.filter.tool_options {
+            miseprintln!("{}", serde_json::to_string_pretty(&info.tool_options)?);
+        } else if self.filter.url {
+            miseprintln!("{}", serde_json::to_string_pretty(&info.url)?);
+        } else {
+            miseprintln!("{}", serde_json::to_string_pretty(&info)?);
+        }
+        Ok(())
+    }
+
+    fn output_user(&self, info: ToolInfo) -> Result<()> {
+        if self.filter.backend_ {
+            miseprintln!("{}", info.backend);
+        } else if self.filter.description {
+            if let Some(description) = info.description {
+                miseprintln!("{}", description);
+            } else {
+                miseprintln!("[none]");
+            }
+        } else if self.filter.installed {
+            let active_set = info
+                .active_versions
+                .as_ref()
+                .map(|v| v.iter().collect::<std::collections::HashSet<_>>())
+                .unwrap_or_default();
+            let installed_with_bold = info
+                .installed_versions
+                .iter()
+                .map(|v| {
+                    if active_set.contains(v) {
+                        style::nbold(v).to_string()
+                    } else {
+                        v.to_string()
+                    }
+                })
+                .join(" ");
+            miseprintln!("{}", installed_with_bold);
+        } else if self.filter.active {
+            if let Some(active_versions) = info.active_versions {
+                miseprintln!("{}", active_versions.join(" "));
+            } else {
+                miseprintln!("[none]");
+            }
+        } else if self.filter.requested {
+            if let Some(requested_versions) = info.requested_versions {
+                miseprintln!("{}", requested_versions.join(" "));
+            } else {
+                miseprintln!("[none]");
+            }
+        } else if self.filter.config_source {
+            if let Some(config_source) = info.config_source {
+                miseprintln!("{}", config_source);
+            } else {
+                miseprintln!("[none]");
+            }
+        } else if self.filter.tool_options {
+            if info.tool_options.is_empty() {
+                miseprintln!("[none]");
+            } else {
+                for (k, v) in info.tool_options.opts {
+                    miseprintln!("{k}={v:?}");
+                }
+            }
+        } else if self.filter.url {
+            if let Some(url) = info.url {
+                miseprintln!("{}", url);
+            } else {
+                miseprintln!("[none]");
+            }
+        } else {
+            let mut table = vec![];
+            table.push(("Backend:", info.backend));
+            if let Some(description) = info.description {
+                table.push(("Description:", description));
+            }
+            if let Some(url) = info.url {
+                table.push(("URL:", url));
+            }
+            // Bold currently active versions within the installed list for clarity
+            let active_set = info
+                .active_versions
+                .as_ref()
+                .map(|v| v.iter().collect::<std::collections::HashSet<_>>())
+                .unwrap_or_default();
+            let installed_with_bold = info
+                .installed_versions
+                .iter()
+                .map(|v| {
+                    if active_set.contains(v) {
+                        style::nbold(v).to_string()
+                    } else {
+                        v.to_string()
+                    }
+                })
+                .join(" ");
+            table.push(("Installed Versions:", installed_with_bold));
+            if let Some(active_versions) = info.active_versions {
+                table.push((
+                    "Active Version:",
+                    style::nbold(active_versions.join(" ")).to_string(),
+                ));
+            }
+            if let Some(requested_versions) = info.requested_versions {
+                table.push(("Requested Version:", requested_versions.join(" ")));
+            }
+            if let Some(config_source) = info.config_source {
+                table.push(("Config Source:", config_source.to_string()));
+            }
+            if info.tool_options.is_empty() {
+                table.push(("Tool Options:", "[none]".to_string()));
+            } else {
+                table.push((
+                    "Tool Options:",
+                    info.tool_options
+                        .opts
+                        .into_iter()
+                        .map(|(k, v)| format!("{k}={v:?}"))
+                        .join(","),
+                ));
+            }
+            if info.security.is_empty() {
+                table.push(("Security:", "[none]".to_string()));
+            } else {
+                let security_str = info
+                    .security
+                    .iter()
+                    .map(|f| match f {
+                        SecurityFeature::Checksum { algorithm } => {
+                            if let Some(alg) = algorithm {
+                                format!("checksum ({})", alg)
+                            } else {
+                                "checksum".to_string()
+                            }
+                        }
+                        SecurityFeature::GithubAttestations { .. } => {
+                            "github_attestations".to_string()
+                        }
+                        SecurityFeature::Slsa { level } => {
+                            if let Some(l) = level {
+                                format!("slsa (level {})", l)
+                            } else {
+                                "slsa".to_string()
+                            }
+                        }
+                        SecurityFeature::Cosign => "cosign".to_string(),
+                        SecurityFeature::Packslip => "packslip".to_string(),
+                        SecurityFeature::Minisign { .. } => "minisign".to_string(),
+                        SecurityFeature::Gpg => "gpg".to_string(),
+                    })
+                    .join(", ");
+                table.push(("Security:", security_str));
+            }
+            let mut table = tabled::Table::new(table);
+            table::print(&mut table, true)?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct ToolInfo {
+    backend: String,
+    description: Option<String>,
+    url: Option<String>,
+    installed_versions: Vec<String>,
+    requested_versions: Option<Vec<String>>,
+    active_versions: Option<Vec<String>>,
+    config_source: Option<ToolSource>,
+    tool_options: ToolVersionOptions,
+    security: Vec<SecurityFeature>,
+}

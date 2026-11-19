@@ -1,0 +1,1307 @@
+//! Native source builds for formulae without a usable bottle.
+//!
+//! Building a formula means running its Ruby `install` method. mise does
+//! this without Homebrew: it provisions a mise-managed ruby (precompiled,
+//! via the normal tool machinery), downloads the formula's .rb from
+//! homebrew/core (sha256-verified against the API metadata), stages the
+//! sha256-verified source archive, and evaluates the formula with the
+//! Formula-DSL shim in shim.rb. Build dependencies are poured as bottles
+//! beforehand by the regular closure machinery (see resolve.rs), so the
+//! build environment points at real kegs in the canonical prefix.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use eyre::{WrapErr, bail};
+
+use super::api::Formula;
+use super::pour;
+use super::prefix;
+use super::resolve::ResolvedFormula;
+use super::tag;
+use eyre::Result;
+use mise_settings::Settings;
+use mise_ui::progress_report::SingleReport;
+use mise_util::cmd::CmdLineRunner;
+use mise_util::file::{ExtractOptions, ExtractionFormat};
+use mise_util::http::HTTP_FETCH;
+
+const SHIM_RB: &str = include_str!("shim.rb");
+const HOMEBREW_CORE_RAW: &str = "https://raw.githubusercontent.com/Homebrew/homebrew-core";
+
+/// does this formula have a bottle that can be poured on this machine?
+pub(super) fn has_bottle(formula: &Formula) -> bool {
+    // undocumented override for testing the source-build pipeline with
+    // formulae that do have bottles (comma-separated names)
+    if let Ok(force) = mise_util::env::var("MISE_SYSTEM_BREW_FORCE_SOURCE")
+        && force.split(',').any(|f| f.trim() == formula.name)
+    {
+        return false;
+    }
+    formula
+        .bottle_files()
+        .and_then(|files| tag::select(files))
+        .is_some()
+}
+
+/// why `has_bottle` is false, for log/dry-run output
+pub(super) fn missing_bottle_reason(formula: &Formula) -> String {
+    match formula.bottle_files() {
+        Some(files) if !files.is_empty() => {
+            let mut tags: Vec<String> = files.keys().cloned().collect();
+            tags.sort();
+            format!("bottles exist only for: {}", tags.join(", "))
+        }
+        _ => "source-only formula, no bottles".to_string(),
+    }
+}
+
+/// Reject early what the source builder cannot handle, with the reason —
+/// checked before any work happens so dry-run and real runs fail alike.
+pub(super) fn check_buildable(formula: &Formula) -> Result<()> {
+    let Some(src) = formula.stable_url() else {
+        bail!("{}: formula has no stable source URL", formula.name);
+    };
+    if let Some(using) = &src.using {
+        bail!(
+            "{}: source uses the {using:?} download strategy, which mise cannot build from \
+             (and no bottle exists for this machine)",
+            formula.name,
+        );
+    }
+    if src.checksum.is_none() {
+        bail!("{}: source archive has no sha256 in the API", formula.name);
+    }
+    // the formula .rb must be pinned to the API snapshot's commit and
+    // verifiable — evaluating a newer/unverified formula against older
+    // source metadata would build the wrong thing
+    if formula.ruby_source_path.is_none() {
+        bail!("{}: API metadata has no ruby_source_path", formula.name);
+    }
+    if formula.tap_git_head.is_none() {
+        bail!("{}: API metadata has no tap_git_head", formula.name);
+    }
+    if formula
+        .ruby_source_checksum
+        .as_ref()
+        .and_then(|c| c.sha256.as_deref())
+        .is_none()
+    {
+        bail!("{}: API metadata has no formula checksum", formula.name);
+    }
+    Ok(())
+}
+
+/// Build a formula from source into its keg and link it.
+pub(super) async fn build(
+    rf: &ResolvedFormula,
+    closure: &[ResolvedFormula],
+    pr: &dyn SingleReport,
+) -> Result<()> {
+    let formula = &rf.formula;
+    let name = &formula.name;
+    let pkg_version = formula.pkg_version()?;
+    check_buildable(formula)?;
+
+    pr.set_message("resolve ruby".to_string());
+    let ruby = crate::host::provision_ruby().await?;
+    let formula_rb = fetch_formula_rb(rf, pr).await?;
+    let archive = fetch_source(formula, pr).await?;
+
+    // Formula builds share a build root and write directly into the final
+    // Cellar, so keep the commit lock until the child exits and linking is
+    // complete. Recheck after locking because another process may have
+    // installed this formula while the downloads above were in progress.
+    let _commit_lock = pour::commit_lock(pr)?;
+    if pour::keg_installed(name, &pkg_version) {
+        return Ok(());
+    }
+
+    let build_root = mise_util::dirs::CACHE
+        .join("system-brew")
+        .join("build")
+        .join(format!("{name}-{pkg_version}"));
+    if build_root.exists() {
+        mise_util::file::remove_all(&build_root)?;
+    }
+    mise_util::file::create_dir_all(&build_root)?;
+    pr.set_message("extract source".to_string());
+    let buildpath = stage_source(&archive, &build_root, &source_basename(formula))?;
+    let shim_path = build_root.join("mise-brew-shim.rb");
+    mise_util::file::write(&shim_path, SHIM_RB)?;
+
+    // Formulae bake the final keg path into binaries, so the build installs
+    // straight into the Cellar (same as brew); a failed build removes the keg.
+    let keg = pour::keg_path(name, &pkg_version);
+    if keg.exists() {
+        mise_util::file::remove_all(&keg)?;
+    }
+
+    pr.set_message("build from source".to_string());
+    // Like `brew`, start from a clean environment: toolchain variables from the
+    // caller's shell (GOROOT, CC, GOFLAGS, CARGO_HOME, ...) must not reach the build.
+    let cmd = CmdLineRunner::new(&ruby)
+        .arg(&shim_path)
+        .current_dir(&buildpath)
+        .env_clear()
+        .envs(allowed_inherited_env(std::env::vars_os()))
+        .envs(build_env(
+            rf,
+            closure,
+            &pkg_version,
+            &buildpath,
+            &formula_rb,
+        ))
+        .with_pr(pr);
+    // Keep the synchronous child wait inside this future so cancellation
+    // cannot drop the commit lock while the child is still mutating Cellar.
+    // run_blocking hands the Tokio worker core off on mise's multithreaded
+    // runtime while the build runs.
+    let built = mise_util::file::run_blocking(|| cmd.execute());
+    if let Err(err) = built {
+        let _ = mise_util::file::remove_all(&keg);
+        return Err(err.wrap_err(format!("failed to build {name} {pkg_version} from source")));
+    }
+    if !keg.is_dir() {
+        bail!(
+            "build of {name} finished but produced no keg at {}",
+            keg.display()
+        );
+    }
+
+    let host_tag = tag::host_tag();
+    let receipt = pour::write_receipt(
+        rf,
+        &host_tag,
+        &keg,
+        &Default::default(),
+        closure,
+        /* poured_from_bottle */ false,
+    );
+    let linked =
+        receipt.and_then(|()| pour::link_keg(name, &pkg_version, formula.keg_only_for_target()));
+    if let Err(err) = linked {
+        if let Err(rm_err) = mise_util::file::remove_all(&keg) {
+            warn!(
+                "failed to remove {} after link failure: {rm_err}\n\
+                 remove it manually, then re-run `mise bootstrap packages apply`",
+                keg.display(),
+            );
+        }
+        return Err(err);
+    }
+    mise_util::file::remove_all(&build_root)?;
+    Ok(())
+}
+
+/// Download the formula's .rb from homebrew/core, pinned to the commit the
+/// API metadata was generated from and verified against its sha256.
+async fn fetch_formula_rb(rf: &ResolvedFormula, pr: &dyn SingleReport) -> Result<PathBuf> {
+    let downloaded = fetch_formula_rb_file(rf, pr).await?;
+    // A tap formula that reads other files from its tap is loaded from a
+    // checkout of the tap, where `require_relative` finds them.
+    let (Some(raw_base), Some(commit), Some(rb_path), Some(sha256)) = (
+        rf.tap_raw_base.as_deref(),
+        rf.formula.tap_git_head.as_deref(),
+        rf.formula.ruby_source_path.as_deref(),
+        rf.formula
+            .ruby_source_checksum
+            .as_ref()
+            .and_then(|c| c.sha256.as_deref()),
+    ) else {
+        return Ok(downloaded);
+    };
+    if !super::tap::needs_tap_checkout(&mise_util::file::read_to_string(&downloaded)?) {
+        return Ok(downloaded);
+    }
+    let checkout = super::tap::tap_checkout(raw_base, commit, Some(pr)).await?;
+    // `rb_path` comes from the tap's metadata, so keep it inside the checkout.
+    if Path::new(rb_path)
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        bail!(
+            "{}: formula source path '{rb_path}' is not a relative path inside its tap",
+            rf.formula.name
+        );
+    }
+    let in_tap = checkout.join(rb_path);
+    mise_util::hash::ensure_checksum(&in_tap, sha256, Some(pr), "sha256")?;
+    Ok(in_tap)
+}
+
+/// Download the formula's .rb on its own into the cache.
+async fn fetch_formula_rb_file(rf: &ResolvedFormula, pr: &dyn SingleReport) -> Result<PathBuf> {
+    let formula = &rf.formula;
+    // all guaranteed present by check_buildable
+    let rb_path = formula.ruby_source_path.as_ref().unwrap();
+    let sha256 = formula
+        .ruby_source_checksum
+        .as_ref()
+        .and_then(|c| c.sha256.as_deref())
+        .unwrap();
+    let commit = formula.tap_git_head.as_deref().unwrap();
+    let cache_dir = mise_util::dirs::CACHE.join("system-brew").join("formula");
+    let dest = cache_dir.join(format!("{}-{}.rb", formula.name, &sha256[..12]));
+    if dest.exists() && mise_util::hash::ensure_checksum(&dest, sha256, None, "sha256").is_ok() {
+        return Ok(dest);
+    }
+    let raw_base = rf
+        .tap_raw_base
+        .as_deref()
+        .map(|base| base.trim_end_matches("/HEAD"))
+        .unwrap_or(HOMEBREW_CORE_RAW);
+    let url = super::tap::ruby_source_url(&format!("{raw_base}/{commit}"), rb_path);
+    pr.set_message(format!("download {rb_path}"));
+    HTTP_FETCH.download_file(&url, &dest, Some(pr)).await?;
+    mise_util::hash::ensure_checksum(&dest, sha256, Some(pr), "sha256")?;
+    Ok(dest)
+}
+
+/// Download the stable source archive, verified against the API's sha256.
+/// the source archive's upstream file name
+fn source_basename(formula: &Formula) -> String {
+    formula
+        .stable_url()
+        .map(|src| src.url.as_str())
+        .and_then(|url| url.rsplit('/').next())
+        .filter(|b| !b.is_empty())
+        .unwrap_or("source")
+        .to_string()
+}
+
+async fn fetch_source(formula: &Formula, pr: &dyn SingleReport) -> Result<PathBuf> {
+    let src = formula.stable_url().unwrap(); // check_buildable
+    let sha256 = src.checksum.as_deref().unwrap(); // check_buildable
+    let basename = source_basename(formula);
+    let cache_dir = mise_util::dirs::CACHE.join("system-brew").join("sources");
+    let dest = cache_dir.join(format!("{}-{basename}", &sha256[..12]));
+    if dest.exists() && mise_util::hash::ensure_checksum(&dest, sha256, None, "sha256").is_ok() {
+        debug!("source cache hit: {}", dest.display());
+        return Ok(dest);
+    }
+    pr.set_message(format!("download {basename}"));
+    // GNU formulae point at ftpmirror.gnu.org, which may redirect to a
+    // plain-HTTP mirror; brew follows it, and the pinned sha256 makes it safe.
+    mise_util::http::download_file_checksum_pinned(&src.url, &dest, sha256, Some(pr)).await?;
+    Ok(dest)
+}
+
+/// Unpack the source archive the way brew stages it: when the archive holds
+/// a single top-level directory, that directory is the buildpath.
+fn stage_source(archive: &Path, build_root: &Path, basename: &str) -> Result<PathBuf> {
+    let stage = build_root.join("src");
+    mise_util::file::create_dir_all(&stage)?;
+    // `basename` is the upstream file name — the cache entry's own name
+    // carries a checksum prefix that must not leak into the build tree
+    let format = ExtractionFormat::detect(archive, basename)?;
+    if format.is_archive() {
+        mise_util::file::extract_archive(archive, &stage, format, &ExtractOptions::default())
+            .wrap_err_with(|| format!("failed to extract {}", archive.display()))?;
+    } else {
+        // a bare file (script, single binary): stage it as-is
+        mise_util::file::copy(archive, stage.join(basename))?;
+    }
+    let entries: Vec<PathBuf> = mise_util::file::ls(&stage)?.into_iter().collect();
+    match entries.as_slice() {
+        [single] if single.is_dir() => Ok(single.clone()),
+        _ => Ok(stage),
+    }
+}
+
+/// Variables a formula build still inherits from the caller, mirroring the
+/// allowlist `brew` keeps when it re-execs under `env -i`.
+fn is_inherited_var(name: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "TMPDIR",
+        "LANG",
+        "SSH_AUTH_SOCK",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "CURL_CA_BUNDLE",
+        "REQUESTS_CA_BUNDLE",
+        "SOURCE_DATE_EPOCH",
+        // selects the Xcode / Command Line Tools install on macOS
+        "DEVELOPER_DIR",
+        // the shim prints Ruby backtraces on failure only when this is set
+        "MISE_DEBUG",
+    ];
+    EXACT.contains(&name)
+        || name.starts_with("LC_")
+        || name.starts_with("HOMEBREW_")
+        || matches!(
+            name.to_ascii_lowercase().as_str(),
+            "http_proxy" | "https_proxy" | "all_proxy" | "ftp_proxy" | "no_proxy"
+        )
+}
+
+fn allowed_inherited_env(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    vars.into_iter()
+        .filter(|(k, _)| k.to_str().is_some_and(is_inherited_var))
+        .collect()
+}
+
+/// The environment the formula builds in: dependency kegs first on PATH,
+/// pkg-config/include/lib flags pointing into the prefix, and the shim's
+/// own variables. Mirrors the spirit of brew's superenv without the
+/// compiler shims.
+fn build_env(
+    rf: &ResolvedFormula,
+    closure: &[ResolvedFormula],
+    pkg_version: &str,
+    buildpath: &Path,
+    formula_rb: &Path,
+) -> HashMap<String, String> {
+    let prefix = prefix::prefix();
+    let opt = prefix.join("opt");
+    // only this formula's transitive dependencies — unrelated formulae from
+    // the same install batch must not leak into the build environment
+    let by_name = super::resolve::formulae_by_name(closure);
+    // walk each formula's deps under the same variations tag the closure
+    // resolution used (the dep's selected bottle tag, not the host's)
+    let host_tag = tag::host_tag();
+    let rf_tag = super::resolve::dep_tag(&rf.formula, &host_tag);
+    let mut deps: Vec<&ResolvedFormula> = vec![];
+    let mut seen: std::collections::HashSet<&str> =
+        std::iter::once(rf.formula.name.as_str()).collect();
+    let mut queue = super::resolve::install_deps(&rf.formula, &rf_tag);
+    while let Some(dep) = queue.pop() {
+        let Some(other) = by_name.get(dep.as_str()) else {
+            continue;
+        };
+        if !seen.insert(other.formula.name.as_str()) {
+            continue;
+        }
+        deps.push(other);
+        let other_tag = super::resolve::dep_tag(&other.formula, &host_tag);
+        queue.extend(super::resolve::runtime_deps(&other.formula, &other_tag));
+    }
+    let dep_opts: Vec<PathBuf> = deps
+        .iter()
+        .map(|other| opt.join(&other.formula.name))
+        .filter(|p| p.is_dir())
+        .collect();
+
+    let mut path: Vec<String> = dep_opts
+        .iter()
+        .map(|p| p.join("bin"))
+        .filter(|p| p.is_dir())
+        .map(|p| p.display().to_string())
+        .collect();
+    path.push(prefix.join("bin").display().to_string());
+    for dir in ["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        path.push(dir.to_string());
+    }
+
+    let pkg_config_path: Vec<String> = dep_opts
+        .iter()
+        .flat_map(|p| [p.join("lib/pkgconfig"), p.join("share/pkgconfig")])
+        .chain([prefix.join("lib/pkgconfig"), prefix.join("share/pkgconfig")])
+        .filter(|p| p.is_dir())
+        .map(|p| p.display().to_string())
+        .collect();
+
+    let mut cppflags: Vec<String> = vec![];
+    let mut ldflags: Vec<String> = vec![];
+    for dir in dep_opts.iter().chain([&prefix]) {
+        let include = dir.join("include");
+        if include.is_dir() {
+            cppflags.push(format!("-I{}", include.display()));
+        }
+        let lib = dir.join("lib");
+        if lib.is_dir() {
+            ldflags.push(format!("-L{}", lib.display()));
+        }
+    }
+    if cfg!(target_os = "linux") {
+        // binaries must find brewed libraries at runtime without ldconfig
+        ldflags.push(format!("-Wl,-rpath,{}", prefix.join("lib").display()));
+    }
+
+    let jobs = mise_util::jobs::normalize(Settings::get().jobs);
+    let stable_version = rf.formula.versions.stable.clone().unwrap_or_default();
+    let mut env = HashMap::from(
+        [
+            ("MISE_BREW_PREFIX", prefix.display().to_string()),
+            ("MISE_BREW_CELLAR", prefix::cellar().display().to_string()),
+            (
+                "MISE_BREW_REPOSITORY",
+                prefix::repository().display().to_string(),
+            ),
+            ("MISE_BREW_FORMULA_FILE", formula_rb.display().to_string()),
+            ("MISE_BREW_NAME", rf.formula.name.clone()),
+            ("MISE_BREW_VERSION", stable_version),
+            ("MISE_BREW_PKG_VERSION", pkg_version.to_string()),
+            ("MISE_BREW_BUILDPATH", buildpath.display().to_string()),
+            (
+                "MISE_BREW_CACHE",
+                mise_util::dirs::CACHE
+                    .join("system-brew")
+                    .join("downloads")
+                    .display()
+                    .to_string(),
+            ),
+            ("MISE_BREW_MAKE_JOBS", jobs.to_string()),
+            ("PATH", path.join(":")),
+            ("MAKEFLAGS", format!("-j{jobs}")),
+            ("HOMEBREW_PREFIX", prefix.display().to_string()),
+            ("HOMEBREW_CELLAR", prefix::cellar().display().to_string()),
+            (
+                "CMAKE_PREFIX_PATH",
+                std::iter::once(prefix.clone())
+                    .chain(dep_opts.iter().cloned())
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(":"),
+            ),
+        ]
+        .map(|(k, v)| (k.to_string(), v)),
+    );
+    if !pkg_config_path.is_empty() {
+        env.insert("PKG_CONFIG_PATH".into(), pkg_config_path.join(":"));
+    }
+    if !cppflags.is_empty() {
+        env.insert("CPPFLAGS".into(), cppflags.join(" "));
+        env.insert("CFLAGS".into(), cppflags.join(" "));
+        env.insert("CXXFLAGS".into(), cppflags.join(" "));
+    }
+    if !ldflags.is_empty() {
+        env.insert("LDFLAGS".into(), ldflags.join(" "));
+    }
+    env
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    #[test]
+    fn build_env_drops_toolchain_vars_but_keeps_essentials() {
+        let vars = [
+            ("GOROOT", "/mise/go"),
+            ("CC", "/nonexistent/cc"),
+            ("GOFLAGS", "-x"),
+            ("PYTHONPATH", "/x"),
+            ("HOME", "/home/u"),
+            ("MISE_DEBUG", "1"),
+            ("HTTPS_PROXY", "http://p"),
+            ("no_proxy", "localhost"),
+            ("LC_ALL", "C"),
+            ("HOMEBREW_NO_ANALYTICS", "1"),
+        ]
+        .map(|(k, v)| (k.into(), v.into()));
+        let kept: Vec<String> = allowed_inherited_env(vars)
+            .into_iter()
+            .map(|(k, _)| k.into_string().unwrap())
+            .collect();
+        assert_eq!(
+            kept,
+            [
+                "HOME",
+                "MISE_DEBUG",
+                "HTTPS_PROXY",
+                "no_proxy",
+                "LC_ALL",
+                "HOMEBREW_NO_ANALYTICS"
+            ]
+        );
+    }
+
+    use super::super::api::{BottleFile, BottleSpec, RubySourceChecksum, SourceUrl, Versions};
+    use super::*;
+
+    fn formula(tags: &[&str]) -> Formula {
+        let files: HashMap<String, BottleFile> = tags
+            .iter()
+            .map(|tag| {
+                (
+                    tag.to_string(),
+                    BottleFile {
+                        cellar: ":any".to_string(),
+                        url: "https://example.com/bottle.tar.gz".to_string(),
+                        sha256: "0".repeat(64),
+                    },
+                )
+            })
+            .collect();
+        let mut bottle = HashMap::new();
+        if !tags.is_empty() {
+            bottle.insert("stable".to_string(), BottleSpec { files });
+        }
+        Formula {
+            name: "test".to_string(),
+            tap: None,
+            aliases: vec![],
+            oldnames: vec![],
+            versions: Versions {
+                stable: Some("1.0.0".to_string()),
+            },
+            revision: 0,
+            keg_only: false,
+            keg_only_reason: None,
+            dependencies: vec![],
+            build_dependencies: vec![],
+            uses_from_macos: vec![],
+            bottle,
+            variations: HashMap::new(),
+            urls: HashMap::from([(
+                "stable".to_string(),
+                SourceUrl {
+                    url: "https://example.com/test-1.0.0.tar.gz".to_string(),
+                    checksum: Some("0".repeat(64)),
+                    using: None,
+                },
+            )]),
+            ruby_source_path: Some("Formula/t/test.rb".to_string()),
+            ruby_source_checksum: Some(RubySourceChecksum {
+                sha256: Some("1".repeat(64)),
+            }),
+            tap_git_head: Some("abc123".to_string()),
+            post_install_steps: vec![],
+        }
+    }
+
+    #[test]
+    fn test_has_bottle() {
+        // the version-independent "all" tag matches every machine
+        assert!(has_bottle(&formula(&["all"])));
+        assert!(!has_bottle(&formula(&[])));
+    }
+
+    #[test]
+    fn test_missing_bottle_reason() {
+        assert_eq!(
+            missing_bottle_reason(&formula(&[])),
+            "source-only formula, no bottles"
+        );
+        assert_eq!(
+            missing_bottle_reason(&formula(&["x86_64_linux", "arm64_sonoma"])),
+            "bottles exist only for: arm64_sonoma, x86_64_linux"
+        );
+    }
+
+    #[test]
+    fn test_check_buildable() {
+        assert!(check_buildable(&formula(&[])).is_ok());
+
+        let mut git_source = formula(&[]);
+        git_source.urls.get_mut("stable").unwrap().using = Some("git".to_string());
+        assert!(check_buildable(&git_source).is_err());
+
+        let mut no_checksum = formula(&[]);
+        no_checksum.urls.get_mut("stable").unwrap().checksum = None;
+        assert!(check_buildable(&no_checksum).is_err());
+
+        let mut no_url = formula(&[]);
+        no_url.urls.clear();
+        assert!(check_buildable(&no_url).is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shim_pathname_write_creates_parents() -> Result<()> {
+        let Some(ruby) = super::super::tap::test_ruby().await? else {
+            return Ok(());
+        };
+        let tmp = tempfile::tempdir()?;
+        let shim = tmp.path().join("shim.rb");
+        let formula_rb = tmp.path().join("example.rb");
+        let buildpath = tmp.path().join("build");
+        let cellar = tmp.path().join("Cellar");
+        mise_util::file::create_dir_all(&buildpath)?;
+        mise_util::file::write(&shim, SHIM_RB)?;
+        // both install-time helpers that write through Pathname#write
+        mise_util::file::write(
+            &formula_rb,
+            r#"class Example < Formula
+  def install
+    (share/"example/greeting").write("hello")
+    (share/"example/greeting").write(", world", mode: "a")
+    generate_completions_from_executable("echo", "completions", shells: [:fish])
+  end
+end
+"#,
+        )?;
+
+        let output = std::process::Command::new(ruby)
+            .arg(&shim)
+            .current_dir(&buildpath)
+            .env("MISE_BREW_PREFIX", tmp.path())
+            .env("MISE_BREW_CELLAR", &cellar)
+            .env("MISE_BREW_FORMULA_FILE", &formula_rb)
+            .env("MISE_BREW_NAME", "example")
+            .env("MISE_BREW_VERSION", "1.0.0")
+            .env("MISE_BREW_PKG_VERSION", "1.0.0")
+            .env("MISE_BREW_BUILDPATH", &buildpath)
+            .env("MISE_BREW_CACHE", tmp.path().join("cache"))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let keg = cellar.join("example/1.0.0");
+        assert_eq!(
+            mise_util::file::read_to_string(keg.join("share/example/greeting"))?,
+            "hello, world"
+        );
+        assert_eq!(
+            mise_util::file::read_to_string(
+                keg.join("share/fish/vendor_completions.d/example.fish")
+            )?,
+            "completions fish\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shim_defines_homebrew_constants() -> Result<()> {
+        let Some(ruby) = super::super::tap::test_ruby().await? else {
+            return Ok(());
+        };
+        let tmp = tempfile::tempdir()?;
+        let shim = tmp.path().join("shim.rb");
+        let formula_rb = tmp.path().join("example.rb");
+        let buildpath = tmp.path().join("build");
+        let cellar = tmp.path().join("Cellar");
+        mise_util::file::create_dir_all(&buildpath)?;
+        mise_util::file::write(&shim, SHIM_RB)?;
+        mise_util::file::write(
+            &formula_rb,
+            r#"class Example < Formula
+  def install
+    raise "prefix" unless HOMEBREW_PREFIX.to_s == ENV["MISE_BREW_PREFIX"]
+    raise "cellar" unless HOMEBREW_CELLAR.to_s == ENV["MISE_BREW_CELLAR"]
+    raise "repository" unless HOMEBREW_REPOSITORY.to_s == ENV["MISE_BREW_REPOSITORY"]
+    raise "library" unless HOMEBREW_LIBRARY.to_s == ENV["MISE_BREW_REPOSITORY"] + "/Library"
+    (prefix/"passed").write("ok")
+  end
+end
+"#,
+        )?;
+
+        let output = std::process::Command::new(ruby)
+            .arg(&shim)
+            .current_dir(&buildpath)
+            .env("MISE_BREW_PREFIX", tmp.path())
+            .env("MISE_BREW_CELLAR", &cellar)
+            .env("MISE_BREW_REPOSITORY", tmp.path().join("Homebrew"))
+            .env("MISE_BREW_FORMULA_FILE", &formula_rb)
+            .env("MISE_BREW_NAME", "example")
+            .env("MISE_BREW_VERSION", "1.0.0")
+            .env("MISE_BREW_PKG_VERSION", "1.0.0")
+            .env("MISE_BREW_BUILDPATH", &buildpath)
+            .env("MISE_BREW_CACHE", tmp.path().join("cache"))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(cellar.join("example/1.0.0/passed").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shim_with_env_scopes_values_and_restores_after_errors() -> Result<()> {
+        let Some(ruby) = super::super::tap::test_ruby().await? else {
+            return Ok(());
+        };
+        let tmp = tempfile::tempdir()?;
+        let shim = tmp.path().join("shim.rb");
+        let formula_rb = tmp.path().join("example.rb");
+        let buildpath = tmp.path().join("build");
+        mise_util::file::create_dir_all(&buildpath)?;
+        mise_util::file::write(&shim, SHIM_RB)?;
+        mise_util::file::write(
+            &formula_rb,
+            r#"class Example < Formula
+  def install
+    ENV["MISE_SCOPE_EXISTING"] = "original"
+    ENV.delete("MISE_SCOPE_NEW")
+    result = with_env(MISE_SCOPE_EXISTING: nil, MISE_SCOPE_NEW: buildpath) do
+      raise "nil must unset" if ENV.key?("MISE_SCOPE_EXISTING")
+      raise "Pathname value" unless ENV["MISE_SCOPE_NEW"] == buildpath.to_s
+      with_env("MISE_SCOPE_NEW" => 42) do
+        raise "nested value" unless ENV["MISE_SCOPE_NEW"] == "42"
+      end
+      raise "nested restore" unless ENV["MISE_SCOPE_NEW"] == buildpath.to_s
+      :result
+    end
+    raise "block result" unless result == :result
+    raise "restore existing" unless ENV["MISE_SCOPE_EXISTING"] == "original"
+    raise "remove new" if ENV.key?("MISE_SCOPE_NEW")
+    begin
+      with_env("MISE_SCOPE_EXISTING" => "temporary", MISE_SCOPE_NEW: "new") do
+        raise "expected failure"
+      end
+    rescue RuntimeError => e
+      raise unless e.message == "expected failure"
+    end
+    raise "restore after error" unless ENV["MISE_SCOPE_EXISTING"] == "original"
+    raise "remove after error" if ENV.key?("MISE_SCOPE_NEW")
+    (prefix/"passed").write("ok")
+  end
+end
+"#,
+        )?;
+        let output = std::process::Command::new(ruby)
+            .arg(&shim)
+            .current_dir(&buildpath)
+            .env("MISE_BREW_PREFIX", tmp.path())
+            .env("MISE_BREW_CELLAR", tmp.path().join("Cellar"))
+            .env("MISE_BREW_FORMULA_FILE", &formula_rb)
+            .env("MISE_BREW_NAME", "example")
+            .env("MISE_BREW_VERSION", "1.0.0")
+            .env("MISE_BREW_PKG_VERSION", "1.0.0")
+            .env("MISE_BREW_BUILDPATH", &buildpath)
+            .env("MISE_BREW_CACHE", tmp.path().join("cache"))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            mise_util::file::read_to_string(tmp.path().join("Cellar/example/1.0.0/passed"))?,
+            "ok"
+        );
+        Ok(())
+    }
+
+    /// `install_symlink` resolves a relative source against the receiving
+    /// directory, as Homebrew does. Without that, `relative_path_from` is
+    /// handed a relative path and an absolute base and raises "different
+    /// prefix", failing the whole build. A source that resolves to the link
+    /// itself fails the build instead of replacing the file with a self-link.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shim_install_symlink_resolves_relative_sources() -> Result<()> {
+        let Some(ruby) = super::super::tap::test_ruby().await? else {
+            return Ok(());
+        };
+        let tmp = tempfile::tempdir()?;
+        let shim = tmp.path().join("shim.rb");
+        let buildpath = tmp.path().join("build");
+        mise_util::file::create_dir_all(&buildpath)?;
+        mise_util::file::write(&shim, SHIM_RB)?;
+        // Each run gets its own Cellar so a keg left by one cannot affect the next.
+        let run = |cellar: &str, install: &str| -> Result<std::process::Output> {
+            let formula_rb = tmp.path().join("example.rb");
+            mise_util::file::write(
+                &formula_rb,
+                format!("class Example < Formula\n  def install\n{install}\n  end\nend\n"),
+            )?;
+            Ok(std::process::Command::new(&ruby)
+                .arg(&shim)
+                .current_dir(&buildpath)
+                .env("MISE_BREW_PREFIX", tmp.path())
+                .env("MISE_BREW_CELLAR", tmp.path().join(cellar))
+                .env("MISE_BREW_FORMULA_FILE", &formula_rb)
+                .env("MISE_BREW_NAME", "example")
+                .env("MISE_BREW_VERSION", "1.0.0")
+                .env("MISE_BREW_PKG_VERSION", "1.0.0")
+                .env("MISE_BREW_BUILDPATH", &buildpath)
+                .env("MISE_BREW_CACHE", tmp.path().join("cache"))
+                .output()?)
+        };
+
+        let output = run(
+            "Cellar",
+            r##"    (bin/"example").write("#!/bin/sh\n")
+    bin.install_symlink "example" => "example-alias"
+    (libexec/"tool").write("tool")
+    bin.install_symlink libexec/"tool"
+    (libexec/"other").write("other")
+    bin.install_symlink "../libexec/other""##,
+        )?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bin = tmp.path().join("Cellar/example/1.0.0/bin");
+        for (link, target) in [
+            ("example-alias", "example"),
+            ("tool", "../libexec/tool"),
+            ("other", "../libexec/other"),
+        ] {
+            assert_eq!(
+                std::fs::read_link(bin.join(link))?,
+                std::path::PathBuf::from(target)
+            );
+        }
+
+        let output = run(
+            "Cellar-self",
+            r##"    (bin/"example").write("#!/bin/sh\n")
+    bin.install_symlink "example""##,
+        )?;
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("to itself"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // The same entry reached through a parent that is a link back to bin.
+        let output = run(
+            "Cellar-alias",
+            r##"    (bin/"tool").write("#!/bin/sh\n")
+    (bin/"alias").make_symlink(".")
+    bin.install_symlink "alias/tool" => "tool""##,
+        )?;
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("to itself"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let tool = tmp.path().join("Cellar-alias/example/1.0.0/bin/tool");
+        assert!(tool.is_file() && !tool.is_symlink());
+        Ok(())
+    }
+
+    /// `bin.install` makes the installed file executable, as Homebrew does,
+    /// but keeps it writable so a later `inreplace` works, even when the source was a plain download with mode 0644. Other
+    /// directories keep the source's mode.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shim_bin_install_makes_files_executable() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(ruby) = super::super::tap::test_ruby().await? else {
+            return Ok(());
+        };
+        let tmp = tempfile::tempdir()?;
+        let shim = tmp.path().join("shim.rb");
+        let buildpath = tmp.path().join("build");
+        mise_util::file::create_dir_all(&buildpath)?;
+        mise_util::file::write(&shim, SHIM_RB)?;
+        for name in ["tool", "admin", "data", "nested"] {
+            let src = buildpath.join(name);
+            mise_util::file::write(&src, "#!/bin/sh\n")?;
+            std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644))?;
+        }
+        let formula_rb = tmp.path().join("example.rb");
+        mise_util::file::write(
+            &formula_rb,
+            "class Example < Formula\n  def install\n    bin.install \"tool\"\n    inreplace bin/\"tool\", \"sh\", \"bash\"\n    sbin.install \"admin\"\n    pkgshare.install \"data\"\n    (pkgshare/\"bin\").install \"nested\"\n  end\nend\n",
+        )?;
+        let output = std::process::Command::new(&ruby)
+            .arg(&shim)
+            .current_dir(&buildpath)
+            .env("MISE_BREW_PREFIX", tmp.path())
+            .env("MISE_BREW_CELLAR", tmp.path().join("Cellar"))
+            .env("MISE_BREW_FORMULA_FILE", &formula_rb)
+            .env("MISE_BREW_NAME", "example")
+            .env("MISE_BREW_VERSION", "1.0.0")
+            .env("MISE_BREW_PKG_VERSION", "1.0.0")
+            .env("MISE_BREW_BUILDPATH", &buildpath)
+            .env("MISE_BREW_CACHE", tmp.path().join("cache"))
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let keg = tmp.path().join("Cellar/example/1.0.0");
+        let mode = |p: &str| -> Result<u32> {
+            Ok(std::fs::metadata(keg.join(p))?.permissions().mode() & 0o777)
+        };
+        assert_eq!(mode("bin/tool")?, 0o755);
+        assert_eq!(mode("sbin/admin")?, 0o755);
+        assert_eq!(mode("share/example/data")?, 0o644);
+        assert_eq!(mode("share/example/bin/nested")?, 0o644);
+        Ok(())
+    }
+
+    /// A tap formula's `post_install` can rewrite install names through
+    /// Homebrew's vendored ruby-macho. mise has no equivalent, but it does not
+    /// relocate source-built kegs either, so each call is skipped with a
+    /// warning and the rest of `post_install` still runs. The same calls from
+    /// `install` must still fail the build.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shim_skips_macho_calls_in_post_install() -> Result<()> {
+        let Some(ruby) = super::super::tap::test_ruby().await? else {
+            return Ok(());
+        };
+        let tmp = tempfile::tempdir()?;
+        let shim = tmp.path().join("shim.rb");
+        let buildpath = tmp.path().join("build");
+        mise_util::file::create_dir_all(&buildpath)?;
+        mise_util::file::write(&shim, SHIM_RB)?;
+        let run = |body: &str| -> Result<std::process::Output> {
+            let formula_rb = tmp.path().join("example.rb");
+            mise_util::file::write(
+                &formula_rb,
+                format!("class Example < Formula\n{body}\nend\n"),
+            )?;
+            Ok(std::process::Command::new(&ruby)
+                .arg(&shim)
+                .current_dir(&buildpath)
+                .env("MISE_BREW_PREFIX", tmp.path())
+                .env("MISE_BREW_CELLAR", tmp.path().join("Cellar"))
+                .env("MISE_BREW_FORMULA_FILE", &formula_rb)
+                .env("MISE_BREW_NAME", "example")
+                .env("MISE_BREW_VERSION", "1.0.0")
+                .env("MISE_BREW_PKG_VERSION", "1.0.0")
+                .env("MISE_BREW_BUILDPATH", &buildpath)
+                .env("MISE_BREW_CACHE", tmp.path().join("cache"))
+                .output()?)
+        };
+        let calls = [
+            (
+                "MachO.open",
+                r#"MachO.open("lib.dylib").linked_dylibs.each { |dep| raise "unreachable" }"#,
+            ),
+            (
+                "MachO::Tools.change_install_name",
+                r#"MachO::Tools.change_install_name("lib.dylib", "a", "@loader_path/a")"#,
+            ),
+            (
+                "MachO::Tools.dylibs",
+                r#"MachO::Tools.dylibs("lib.dylib").each { |dep| raise "unreachable" }"#,
+            ),
+            ("MachO.codesign!", r#"MachO.codesign!("lib.dylib")"#),
+        ];
+
+        for (feature, call) in calls {
+            let marker = tmp.path().join("Cellar/example/1.0.0/bin/after");
+            let _ = std::fs::remove_file(&marker);
+            let output = run(&format!(
+                "  def install\n    (prefix/\"bin\").mkpath\n  end\n  def post_install\n    {call}\n    (prefix/\"bin/after\").write(\"ran\")\n  end"
+            ))?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{feature}: {stderr}");
+            assert!(
+                stderr.contains(&format!("skipping {feature}")),
+                "{feature}: {stderr}"
+            );
+            assert_eq!(
+                mise_util::file::read_to_string(&marker)?,
+                "ran",
+                "{feature}: rest of post_install did not run"
+            );
+
+            let output = run(&format!("  def install\n    {call}\n  end"))?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{feature}: {stderr}");
+            assert!(stderr.contains(feature), "{feature}: {stderr}");
+        }
+        Ok(())
+    }
+
+    /// GitHub's codeload URLs (`.../tar.gz/refs/tags/v1.0.0`) name no
+    /// extension; the tarball must still be unpacked rather than staged as an
+    /// opaque file the build then cannot find its sources in.
+    #[test]
+    fn test_stage_source_unpacks_suffixless_tarball() {
+        use flate2::{Compression, write::GzEncoder};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("0123456789ab-v1.0.0");
+        let mut builder = jdx_tar::Builder::new(GzEncoder::new(
+            std::fs::File::create(&archive).unwrap(),
+            Compression::default(),
+        ));
+        let mut header = jdx_tar::Header::new_gnu(jdx_tar::EntryType::File);
+        header.set_size(11);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, "test-1.0.0/go.mod", &b"module test"[..])
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let build_root = tmp.path().join("build");
+        let buildpath = stage_source(&archive, &build_root, "v1.0.0").unwrap();
+
+        assert_eq!(buildpath, build_root.join("src/test-1.0.0"));
+        assert_eq!(
+            std::fs::read(buildpath.join("go.mod")).unwrap(),
+            b"module test"
+        );
+    }
+
+    /// The shim stages `resource`s itself, so an extensionless resource URL
+    /// needs the same content fallback as the main source. The download cache
+    /// is pre-seeded so the shim never reaches the network.
+    #[tokio::test]
+    async fn test_shim_stages_suffixless_resources() {
+        use flate2::{Compression, write::GzEncoder};
+        use sha2::{Digest, Sha256};
+
+        let Some(ruby) = super::super::tap::test_ruby().await.unwrap() else {
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        mise_util::file::create_dir_all(&cache).unwrap();
+
+        let mut builder = jdx_tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+        let mut header = jdx_tar::Header::new_gnu(jdx_tar::EntryType::File);
+        header.set_size(11);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, "lib-1.0.0/go.mod", &b"module test"[..])
+            .unwrap();
+        let tarball = builder.into_inner().unwrap().finish().unwrap();
+
+        let mut resources = String::new();
+        for (name, basename, contents) in [
+            ("tarball", "v1.0.0", &tarball[..]),
+            ("script", "tool", &b"#!/bin/sh\necho hi\n"[..]),
+            // bsdtar lists an empty file as an empty archive
+            ("empty", "empty", &b""[..]),
+        ] {
+            let sha256 = hex::encode(Sha256::digest(contents));
+            std::fs::write(cache.join(format!("{sha256}--{basename}")), contents).unwrap();
+            resources.push_str(&format!(
+                "  resource \"{name}\" do\n    url \"https://example.invalid/{name}/{basename}\"\n    sha256 \"{sha256}\"\n  end\n"
+            ));
+        }
+        let formula = tmp.path().join("example.rb");
+        std::fs::write(
+            &formula,
+            format!(
+                r#"class Example < Formula
+{resources}
+  def install
+    resource("tarball").stage {{ cp "go.mod", prefix }}
+    resource("script").stage {{ cp Dir.children(".").first, prefix/"tool" }}
+    resource("empty").stage {{ cp Dir.children(".").first, prefix/"empty" }}
+  end
+end
+"#
+            ),
+        )
+        .unwrap();
+        let shim = tmp.path().join("shim.rb");
+        std::fs::write(&shim, SHIM_RB).unwrap();
+        let buildpath = tmp.path().join("build");
+        mise_util::file::create_dir_all(&buildpath).unwrap();
+
+        let output = std::process::Command::new(ruby)
+            .arg(&shim)
+            .env("MISE_BREW_PREFIX", tmp.path().join("prefix"))
+            .env("MISE_BREW_CELLAR", tmp.path().join("Cellar"))
+            .env("MISE_BREW_FORMULA_FILE", &formula)
+            .env("MISE_BREW_NAME", "example")
+            .env("MISE_BREW_VERSION", "1.0.0")
+            .env("MISE_BREW_PKG_VERSION", "1.0.0")
+            .env("MISE_BREW_BUILDPATH", &buildpath)
+            .env("MISE_BREW_CACHE", &cache)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let keg = tmp.path().join("Cellar/example/1.0.0");
+        assert_eq!(std::fs::read(keg.join("go.mod")).unwrap(), b"module test");
+        assert_eq!(
+            std::fs::read(keg.join("tool")).unwrap(),
+            b"#!/bin/sh\necho hi\n"
+        );
+        assert_eq!(std::fs::read(keg.join("empty")).unwrap(), b"");
+    }
+    /// A PEP 517 project that builds with an in-tree backend, so the sdist
+    /// needs no setuptools: `--no-build-isolation` installs only see the venv.
+    fn python_project(name: &str, module: &str, entry: &str, body: &str) -> Vec<(String, String)> {
+        const BACKEND: &str = r#"import base64, hashlib, os, zipfile
+
+NAME = "@NAME@"
+MODULE = "@MODULE@"
+ENTRY = "@ENTRY@"
+
+
+def get_requires_for_build_wheel(config_settings=None):
+    return []
+
+
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    dist = NAME + "-1.0.dist-info"
+    files = {
+        MODULE + ".py": open(MODULE + ".py", "rb").read(),
+        dist + "/METADATA": ("Metadata-Version: 2.1\nName: " + NAME + "\nVersion: 1.0\n").encode(),
+        dist + "/WHEEL": b"Wheel-Version: 1.0\nGenerator: t\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+    }
+    if ENTRY:
+        files[dist + "/entry_points.txt"] = ("[console_scripts]\n" + ENTRY + "\n").encode()
+    record = ""
+    for n, d in files.items():
+        digest = base64.urlsafe_b64encode(hashlib.sha256(d).digest()).rstrip(b"=").decode()
+        record += "%s,sha256=%s,%d\n" % (n, digest, len(d))
+    files[dist + "/RECORD"] = (record + dist + "/RECORD,,\n").encode()
+    wheel = NAME + "-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(os.path.join(wheel_directory, wheel), "w") as z:
+        for n, d in files.items():
+            z.writestr(n, d)
+    return wheel
+"#;
+        vec![
+            (
+                "pyproject.toml".into(),
+                "[build-system]\nrequires = []\nbuild-backend = \"backend\"\nbackend-path = [\".\"]\n"
+                    .into(),
+            ),
+            (
+                "backend.py".into(),
+                BACKEND
+                    .replace("@NAME@", name)
+                    .replace("@MODULE@", module)
+                    .replace("@ENTRY@", entry),
+            ),
+            (format!("{module}.py"), body.into()),
+        ]
+    }
+
+    /// `virtualenv_install_with_resources` (qmk, and most Python CLI formulae):
+    /// each resource sdist is verified and installed into a venv under the
+    /// keg's libexec, the formula's own source is installed after them, and its
+    /// console scripts are linked into the keg's bin. The download cache is
+    /// pre-seeded, and pip runs with `--no-index`, so nothing reaches a network.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shim_virtualenv_install_with_resources() {
+        use flate2::{Compression, write::GzEncoder};
+        use sha2::{Digest, Sha256};
+
+        let ruby = super::super::tap::test_ruby()
+            .await
+            .unwrap()
+            .expect("this test needs a ruby on PATH or an installed mise ruby");
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        mise_util::file::create_dir_all(&cache).unwrap();
+
+        let dep = python_project(
+            "fakedep",
+            "fakedep",
+            "",
+            "GREETING = 'hello from fakedep'\n",
+        );
+        let mut builder = jdx_tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+        for (path, content) in &dep {
+            let mut header = jdx_tar::Header::new_gnu(jdx_tar::EntryType::File);
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            builder
+                .append_data(
+                    &mut header,
+                    format!("fakedep-1.0/{path}"),
+                    content.as_bytes(),
+                )
+                .unwrap();
+        }
+        let sdist = builder.into_inner().unwrap().finish().unwrap();
+        let sha256 = hex::encode(Sha256::digest(&sdist));
+        std::fs::write(cache.join(format!("{sha256}--fakedep-1.0.tar.gz")), &sdist).unwrap();
+
+        // a pure-Python wheel resource must be installed as the file, not unzipped
+        let wheel_path = tmp.path().join("fakewheel-1.0-py3-none-any.whl");
+        let made = std::process::Command::new("python3")
+            .args(["-c", "import sys, zipfile\nz = zipfile.ZipFile(sys.argv[1], \"w\")\nz.writestr(\"fakewheel.py\", \"WHEEL_GREETING = \x27and fakewheel\x27\\n\")\nz.writestr(\"fakewheel-1.0.dist-info/METADATA\", \"Metadata-Version: 2.1\\nName: fakewheel\\nVersion: 1.0\\n\")\nz.writestr(\"fakewheel-1.0.dist-info/WHEEL\", \"Wheel-Version: 1.0\\nGenerator: t\\nRoot-Is-Purelib: true\\nTag: py3-none-any\\n\")\nz.writestr(\"fakewheel-1.0.dist-info/RECORD\", \"\")\nz.close()"])
+            .arg(&wheel_path)
+            .current_dir(tmp.path())
+            .status()
+            .unwrap();
+        assert!(made.success(), "this test needs python3 on PATH");
+        let wheel = std::fs::read(&wheel_path).unwrap();
+        let wheel_sha256 = hex::encode(Sha256::digest(&wheel));
+        std::fs::write(
+            cache.join(format!("{wheel_sha256}--fakewheel-1.0-py3-none-any.whl")),
+            &wheel,
+        )
+        .unwrap();
+
+        // the formula's own source, staged by Rust before the shim runs
+        let buildpath = tmp.path().join("build");
+        mise_util::file::create_dir_all(&buildpath).unwrap();
+        for (path, content) in python_project(
+            "fakeapp",
+            "fakeapp",
+            "fakeapp = fakeapp:main",
+            "import fakedep, fakewheel\n\n\ndef main():\n    print(fakedep.GREETING, fakewheel.WHEEL_GREETING)\n",
+        ) {
+            std::fs::write(buildpath.join(path), content).unwrap();
+        }
+
+        let formula = tmp.path().join("example.rb");
+        std::fs::write(
+            &formula,
+            format!(
+                r#"class Example < Formula
+  include Language::Python::Virtualenv
+  depends_on "python@3.99"
+
+  resource "fakedep" do
+    url "https://example.invalid/fakedep-1.0.tar.gz"
+    sha256 "{sha256}"
+  end
+
+  resource "fakewheel" do
+    url "https://example.invalid/fakewheel-1.0-py3-none-any.whl"
+    sha256 "{wheel_sha256}"
+  end
+
+  def install
+    virtualenv_install_with_resources
+  end
+end
+"#
+            ),
+        )
+        .unwrap();
+        let shim = tmp.path().join("shim.rb");
+        std::fs::write(&shim, SHIM_RB).unwrap();
+
+        let output = std::process::Command::new(ruby)
+            .arg(&shim)
+            .current_dir(&buildpath)
+            .env("MISE_BREW_PREFIX", tmp.path().join("prefix"))
+            .env("MISE_BREW_CELLAR", tmp.path().join("Cellar"))
+            .env("MISE_BREW_FORMULA_FILE", &formula)
+            .env("MISE_BREW_NAME", "example")
+            .env("MISE_BREW_VERSION", "1.0.0")
+            .env("MISE_BREW_PKG_VERSION", "1.0.0")
+            .env("MISE_BREW_BUILDPATH", &buildpath)
+            .env("MISE_BREW_CACHE", &cache)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let keg = tmp.path().join("Cellar/example/1.0.0");
+        let link = keg.join("bin/fakeapp");
+        assert!(
+            link.symlink_metadata().unwrap().file_type().is_symlink(),
+            "console script was not linked into bin"
+        );
+        assert!(
+            !keg.join("bin/python").exists(),
+            "only the formula's console scripts belong in bin"
+        );
+        let run = std::process::Command::new(&link).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout).trim(),
+            "hello from fakedep and fakewheel",
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}

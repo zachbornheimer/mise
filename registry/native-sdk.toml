@@ -1,0 +1,6 @@
+backends = ["npm:@native-sdk/cli"]
+bins = ["native"]
+description = "Toolkit for building native desktop apps"
+os = ["linux", "macos", "windows"]
+test = { cmd = "native --version", expected = "native {{version}}" }
+version_order = "semver"

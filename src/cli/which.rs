@@ -1,0 +1,149 @@
+use std::sync::Arc;
+
+use crate::args::ToolArg;
+use crate::config::Config;
+use crate::dirs;
+use crate::file;
+use crate::toolset::{Toolset, ToolsetBuilder};
+use eyre::{Result, bail};
+use itertools::Itertools;
+
+/// Show the path a tool's executable resolves to
+///
+/// Prints the real path of the executable mise would run for BIN_NAME in the
+/// current directory, bypassing shims. Use `--version` or `--plugin` to see
+/// which tool version provides it.
+#[derive(Debug, usage_rs::Args)]
+#[usage(
+    verbatim_doc_comment,
+    example(
+        r###"mise which node
+~/.local/share/mise/installs/node/20.0.0/bin/node"###,
+        help = "Show the path of the node executable"
+    ),
+    example(
+        r###"mise which node --plugin
+node"###,
+        help = "Show the tool that provides it"
+    ),
+    example(
+        r###"mise which node --version
+20.0.0"###,
+        help = "Show the version that provides it"
+    )
+)]
+pub(crate) struct Which {
+    /// The executable to look up
+    #[usage(required_unless = "complete")]
+    pub bin_name: Option<String>,
+
+    /// Look in a specific tool version, such as `mise which npm --tool=node@20`
+    #[usage(short, long, value_name = "TOOL@VERSION", verbatim_doc_comment)]
+    pub tool: Option<ToolArg>,
+
+    #[usage(long, hide = true)]
+    pub complete: bool,
+
+    /// Show the name of the tool that provides the executable
+    #[usage(long, conflicts = "version")]
+    pub plugin: bool,
+
+    /// Show the version instead of the path
+    #[usage(long, conflicts = "plugin")]
+    pub version: bool,
+}
+
+impl Which {
+    pub(crate) async fn run(self) -> Result<()> {
+        let config = Config::get().await?;
+        if self.complete {
+            return self.complete(&config).await;
+        }
+        let ts = self.get_toolset(&config).await?;
+
+        let bin_name = self.bin_name.clone().unwrap();
+        match ts.which(&config, &bin_name).await {
+            Some((p, tv)) => {
+                if self.version {
+                    miseprintln!("{}", tv.version);
+                } else if self.plugin {
+                    miseprintln!("{p}");
+                } else {
+                    let path = p.which(&config, &tv, &bin_name).await?;
+                    miseprintln!("{}", path.unwrap().display());
+                }
+                Ok(())
+            }
+            None => {
+                if let Some(msg) = self.uninstalled_tool_message(&config, &ts) {
+                    bail!(msg);
+                }
+                if let Some(msg) =
+                    crate::shims::unavailable_configured_tool_message(&config, &ts, &bin_name).await
+                {
+                    bail!(msg);
+                }
+                if self.has_shim(&bin_name) {
+                    bail!(
+                        "{bin_name} is a mise bin however it is not currently active. Use `mise use` to activate it in this directory."
+                    )
+                } else {
+                    bail!("{bin_name} is not a mise bin. Perhaps you need to install it first.",)
+                }
+            }
+        }
+    }
+    async fn complete(&self, config: &Arc<Config>) -> Result<()> {
+        let ts = self.get_toolset(config).await?;
+        let bins = ts
+            .list_paths(config)
+            .await
+            .into_iter()
+            .flat_map(|p| file::ls(&p).unwrap_or_default())
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .unique()
+            .sorted()
+            .collect_vec();
+        for bin in bins {
+            miseprintln!("{bin}");
+        }
+        Ok(())
+    }
+    async fn get_toolset(&self, config: &Arc<Config>) -> Result<Toolset> {
+        let mut tsb = ToolsetBuilder::new();
+        if let Some(tool) = &self.tool {
+            tsb = tsb
+                .with_args(std::slice::from_ref(tool))
+                .with_overridden_lockfile_warnings();
+        }
+        let ts = tsb.build(config).await?;
+        Ok(ts)
+    }
+    /// `--tool` replaces whatever the config requested, so a version that isn't
+    /// installed leaves nothing for [`Toolset::which`] to search. Saying the bin
+    /// "is not currently active" would blame the config instead of the flag.
+    fn uninstalled_tool_message(&self, config: &Arc<Config>, ts: &Toolset) -> Option<String> {
+        let tool = self.tool.as_ref()?;
+        let tv = ts
+            .list_current_versions()
+            .into_iter()
+            .find(|(b, tv)| {
+                tv.ba() == tool.ba.as_ref() && !b.is_version_installed(config, tv, true)
+            })
+            .map(|(_, tv)| tv)?;
+        let requested = tool.version.clone().unwrap_or_else(|| tv.version.clone());
+        let resolved = if requested == tv.version {
+            String::new()
+        } else {
+            format!(" (resolved to {})", tv.version)
+        };
+        Some(format!(
+            "{}@{requested} is not installed{resolved}\n\
+             hint: run `mise install {}@{requested}`, or `mise ls {}` to see installed versions",
+            tool.short, tool.short, tool.short
+        ))
+    }
+    fn has_shim(&self, shim: &str) -> bool {
+        dirs::shims().join(shim).exists() || dirs::system_shims().join(shim).exists()
+    }
+}

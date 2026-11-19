@@ -1,0 +1,13 @@
+description = "Odin Programming Language"
+version_order = "source"
+# test = { cmd = "odin version", expected = "version {{version}}" }
+
+bins = ["odin"]
+[[backends]]
+full = "github:odin-lang/Odin"
+
+[backends.options.platforms.windows-x64]
+bin_path = "dist"
+
+[[backends]]
+full = "asdf:jtakakura/asdf-odin"

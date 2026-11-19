@@ -1,0 +1,117 @@
+name: snapcraft-publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snapcraft-publish-${{ github.event_name == 'release' && 'release' || github.ref }}
+  # Release events can arrive out of version order, so let the shared gate decide.
+  cancel-in-progress: false
+
+jobs:
+  build-snapcraft:
+    strategy:
+      fail-fast: false
+      matrix:
+        runs-on: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79 # v1.3.0
+        with:
+          snapcraft-channel: stable
+        id: snapbuild
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: snap-${{ matrix.runs-on }}
+          path: ${{ steps.snapbuild.outputs.snap }}
+          retention-days: 1
+
+  check-release:
+    needs: build-snapcraft
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+    steps:
+      - name: Check release is current
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          publish=true
+          if [[ "$GITHUB_EVENT_NAME" == "release" ]]; then
+            latest_tag=""
+            for attempt in 1 2 3; do
+              if latest_tag="$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq .tag_name)"; then
+                break
+              fi
+              if [[ "$attempt" == 3 ]]; then
+                echo "::error::Failed to fetch the latest release after $attempt attempts"
+                exit 1
+              fi
+              sleep "$((attempt * 5))"
+            done
+            if [[ "$RELEASE_TAG" != "$latest_tag" ]]; then
+              echo "Skipping stale release $RELEASE_TAG; latest is $latest_tag"
+              publish=false
+            fi
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+  publish-snapcraft:
+    needs: check-release
+    if: needs.check-release.outputs.publish == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        artifact: [snap-ubuntu-24.04, snap-ubuntu-24.04-arm]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist
+
+      - name: Find snap package
+        id: snap
+        run: |
+          mapfile -t snaps < <(find dist -maxdepth 1 -type f -name '*.snap')
+          if [[ "${#snaps[@]}" != 1 ]]; then
+            echo "::error::Expected one snap package, found ${#snaps[@]}"
+            exit 1
+          fi
+          echo "path=${snaps[0]}" >> "$GITHUB_OUTPUT"
+
+      # Not snapcore/action-publish: it cannot retry, and the Snap Store
+      # occasionally drops the connection mid-upload.
+      - name: Publish snap
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+          SNAP_PATH: ${{ steps.snap.outputs.path }}
+        run: |
+          sudo snap install --classic snapcraft
+          for attempt in 1 2 3; do
+            if snapcraft upload "$SNAP_PATH" --release stable; then
+              exit 0
+            fi
+            if [[ "$attempt" != 3 ]]; then
+              echo "::warning::snapcraft upload failed (attempt $attempt); retrying"
+              sleep "$((attempt * 10))"
+            fi
+          done
+          echo "::error::snapcraft upload failed after 3 attempts"
+          exit 1

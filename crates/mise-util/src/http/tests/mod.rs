@@ -1,0 +1,1035 @@
+use super::*;
+use confique::Layer;
+use indexmap::IndexMap;
+use reqwest::dns::{Name, Resolve, Resolving};
+use std::path::PathBuf;
+use url::Url;
+
+mod auth;
+mod download;
+mod progress;
+mod request;
+mod retry;
+mod url_replacements;
+
+#[derive(Debug, Default)]
+struct RecordingReport {
+    positions: Mutex<Vec<u64>>,
+    lengths: Mutex<Vec<u64>>,
+}
+
+impl SingleReport for RecordingReport {
+    fn set_position(&self, position: u64) {
+        self.positions.lock().unwrap().push(position);
+    }
+
+    fn set_length(&self, length: u64) {
+        self.lengths.lock().unwrap().push(length);
+    }
+}
+
+struct FailingDnsResolver;
+
+impl Resolve for FailingDnsResolver {
+    fn resolve(&self, _name: Name) -> Resolving {
+        Box::pin(async {
+            Err(
+                std::io::Error::new(std::io::ErrorKind::NotFound, "test DNS resolution failure")
+                    .into(),
+            )
+        })
+    }
+}
+
+// Helper to create test settings with specific URL replacements
+fn with_test_settings<F, R>(replacements: IndexMap<String, String>, test_fn: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    // `SettingsGuard` holds the lock and calls `crate::testing::reset_settings(None)` in `Drop`, which runs
+    // while unwinding. Resetting after `test_fn` instead would leave the replacements behind
+    // for the next test whenever this one panics -- previously the lock's poison flag hid
+    // that by failing every later test outright.
+    let _guard = SettingsGuard {
+        _lock: crate::testing::lock_ignoring_poison(&crate::testing::SETTINGS_LOCK),
+    };
+
+    // Create settings with custom URL replacements
+    let mut settings = mise_settings::SettingsPartial::empty();
+    settings.url_replacements = Some(replacements);
+
+    // Set settings for this test
+    crate::testing::reset_settings(Some(settings));
+
+    test_fn()
+}
+
+// RAII guard that holds the global test lock and resets settings on drop.
+// Use this in async tests so the mutex stays held across .await points
+// without sync/async closure shenanigans.
+struct SettingsGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+impl Drop for SettingsGuard {
+    fn drop(&mut self) {
+        crate::testing::reset_settings(None);
+    }
+}
+fn set_test_http_retries(retries: i64) -> SettingsGuard {
+    let lock = crate::testing::lock_ignoring_poison(&crate::testing::SETTINGS_LOCK);
+    let mut settings = mise_settings::SettingsPartial::empty();
+    settings.http_retries = Some(retries);
+    crate::testing::reset_settings(Some(settings));
+    SettingsGuard { _lock: lock }
+}
+fn set_test_prefer_offline(http_retries: i64) -> SettingsGuard {
+    let lock = crate::testing::lock_ignoring_poison(&crate::testing::SETTINGS_LOCK);
+    let mut settings = mise_settings::SettingsPartial::empty();
+    settings.prefer_offline = Some(true);
+    settings.http_retries = Some(http_retries);
+    crate::testing::reset_settings(Some(settings));
+    SettingsGuard { _lock: lock }
+}
+fn set_test_offline() -> SettingsGuard {
+    let lock = crate::testing::lock_ignoring_poison(&crate::testing::SETTINGS_LOCK);
+    let mut settings = mise_settings::SettingsPartial::empty();
+    settings.offline = Some(true);
+    crate::testing::reset_settings(Some(settings));
+    SettingsGuard { _lock: lock }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_generation_shares_concurrent_artifact_downloads() {
+    let lock = crate::testing::lock_ignoring_poison(&crate::testing::SETTINGS_LOCK);
+    let mut settings = mise_settings::SettingsPartial::empty();
+    settings.lockfile_mode = Some("generate".into());
+    crate::testing::reset_settings(Some(settings));
+    let _settings = SettingsGuard { _lock: lock };
+    let _downloads = InvocationDownloads;
+    let (port, count) = spawn_canned_server(vec![ok_response()]).await;
+    let url = format!("http://127.0.0.1:{port}/artifact");
+    let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    let (a, b) = tokio::join!(
+        client.download_file(&url, &first, None),
+        client.download_file(&url, &second, None)
+    );
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(
+        std::fs::read(&first).unwrap(),
+        std::fs::read(&second).unwrap()
+    );
+    let (a, b) = tokio::join!(
+        client.download_file(&url, &first, None),
+        client.download_file(&url, &first, None)
+    );
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(
+        std::fs::read(first).unwrap(),
+        std::fs::read(second).unwrap()
+    );
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn shared_download_retention_evicts_idle_bytes_but_never_active_callers() {
+    let make_entry = || {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("artifact"), b"1234").unwrap();
+        Arc::new(tokio::sync::OnceCell::new_with(Some((
+            directory,
+            DownloadFileMetadata::default(),
+        ))))
+    };
+    let active = make_entry();
+    let idle = make_entry();
+    let idle_path = idle.get().unwrap().0.path().to_path_buf();
+    let mut downloads =
+        std::collections::HashMap::from([("active".into(), active.clone()), ("idle".into(), idle)]);
+    prune_shared_downloads(&mut downloads, 4, 64);
+    assert_eq!(downloads.len(), 1);
+    assert!(downloads.contains_key("active"));
+    assert!(!idle_path.exists());
+    prune_shared_downloads(&mut downloads, 0, 0);
+    assert_eq!(downloads.len(), 1);
+    drop(active);
+    prune_shared_downloads(&mut downloads, 0, 0);
+    assert!(downloads.is_empty());
+}
+
+struct AtomicBoolGuard {
+    value: &'static std::sync::atomic::AtomicBool,
+    previous: bool,
+}
+impl AtomicBoolGuard {
+    fn set(value: &'static std::sync::atomic::AtomicBool, enabled: bool) -> Self {
+        let previous = value.swap(enabled, Ordering::SeqCst);
+        Self { value, previous }
+    }
+}
+impl Drop for AtomicBoolGuard {
+    fn drop(&mut self) {
+        self.value.store(self.previous, Ordering::SeqCst);
+    }
+}
+
+struct UnavailableHostsGuard {
+    host_keys: Vec<String>,
+}
+impl UnavailableHostsGuard {
+    fn new(host_keys: Vec<String>) -> Self {
+        let mut unavailable = UNAVAILABLE_HTTP_HOSTS.lock().unwrap();
+        for host_key in &host_keys {
+            unavailable.remove(host_key);
+        }
+        drop(unavailable);
+        Self { host_keys }
+    }
+}
+impl Drop for UnavailableHostsGuard {
+    fn drop(&mut self) {
+        let mut unavailable = UNAVAILABLE_HTTP_HOSTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for host_key in &self.host_keys {
+            unavailable.remove(host_key);
+        }
+    }
+}
+
+struct GithubOauthSettingsGuard {
+    _settings_lock: std::sync::MutexGuard<'static, ()>,
+    _github_env_lock: std::sync::MutexGuard<'static, ()>,
+    vars: Vec<(&'static str, Option<String>)>,
+}
+
+impl Drop for GithubOauthSettingsGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.vars {
+            if let Some(value) = value {
+                crate::env::set_var(key, value);
+            } else {
+                crate::env::remove_var(key);
+            }
+        }
+        crate::github::oauth::test_support::clear_cache_path();
+        crate::testing::reset_settings(None);
+    }
+}
+
+fn set_test_github_oauth(server_url: &str, cache_path: PathBuf) -> GithubOauthSettingsGuard {
+    let settings_lock = crate::testing::lock_ignoring_poison(&crate::testing::SETTINGS_LOCK);
+    let github_env_lock = crate::testing::lock_ignoring_poison(&crate::github::TEST_ENV_LOCK);
+    let vars = vec![
+        ("MISE_EXPERIMENTAL", std::env::var("MISE_EXPERIMENTAL").ok()),
+        (
+            "MISE_GITHUB_OAUTH_CLIENT_ID",
+            std::env::var("MISE_GITHUB_OAUTH_CLIENT_ID").ok(),
+        ),
+        (
+            "MISE_GITHUB_OAUTH_AUTH_URL",
+            std::env::var("MISE_GITHUB_OAUTH_AUTH_URL").ok(),
+        ),
+        (
+            "MISE_GITHUB_OAUTH_API_URL",
+            std::env::var("MISE_GITHUB_OAUTH_API_URL").ok(),
+        ),
+        (
+            "MISE_GITHUB_OAUTH_SCOPES",
+            std::env::var("MISE_GITHUB_OAUTH_SCOPES").ok(),
+        ),
+        ("MISE_GITHUB_TOKEN", std::env::var("MISE_GITHUB_TOKEN").ok()),
+        ("GITHUB_API_TOKEN", std::env::var("GITHUB_API_TOKEN").ok()),
+        ("GITHUB_TOKEN", std::env::var("GITHUB_TOKEN").ok()),
+    ];
+
+    crate::env::set_var("MISE_EXPERIMENTAL", "1");
+    crate::env::set_var("MISE_GITHUB_OAUTH_CLIENT_ID", "Iv1.mock");
+    crate::env::set_var("MISE_GITHUB_OAUTH_AUTH_URL", format!("{server_url}/login"));
+    crate::env::set_var("MISE_GITHUB_OAUTH_API_URL", format!("{server_url}/api/v3"));
+    crate::env::remove_var("MISE_GITHUB_OAUTH_SCOPES");
+    crate::env::remove_var("MISE_GITHUB_TOKEN");
+    crate::env::remove_var("GITHUB_API_TOKEN");
+    crate::env::remove_var("GITHUB_TOKEN");
+    crate::github::oauth::test_support::set_cache_path(cache_path);
+    crate::testing::reset_settings(None);
+
+    GithubOauthSettingsGuard {
+        _settings_lock: settings_lock,
+        _github_env_lock: github_env_lock,
+        vars,
+    }
+}
+
+// A tiny in-process HTTP/1.1 responder. Each accepted connection consumes
+// the next response from `responses` and writes it back. Returns the bound
+// port and an Arc counter of connections actually served.
+async fn spawn_canned_server(
+    responses: Vec<&'static str>,
+) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let (port, count, _) = spawn_recording_server(responses).await;
+    (port, count)
+}
+
+async fn spawn_recording_server(
+    responses: Vec<&'static str>,
+) -> (
+    u16,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let count = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let count_inner = count.clone();
+    let requests_inner = requests.clone();
+    tokio::spawn(async move {
+        for resp in responses {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            count_inner.fetch_add(1, Ordering::SeqCst);
+            // Drain request headers (read until \r\n\r\n or EOF).
+            let mut buf = [0u8; 4096];
+            let mut total = Vec::new();
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total.extend_from_slice(&buf[..n]);
+                        if total.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            requests_inner
+                .lock()
+                .unwrap()
+                .push(String::from_utf8_lossy(&total).to_string());
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    (port, count, requests)
+}
+
+async fn spawn_trickling_server() -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        if socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n")
+            .await
+            .is_err()
+        {
+            return;
+        }
+        loop {
+            if socket.write_all(b"x").await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    port
+}
+
+fn ok_response() -> &'static str {
+    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK"
+}
+fn truncated_download_response() -> &'static str {
+    concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Length: 10\r\n",
+        "ETag: \"artifact-v1\"\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "hello"
+    )
+}
+fn redirect_to_tar_gz_response() -> &'static str {
+    "HTTP/1.1 302 Found\r\nLocation: /tool.tar.gz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+}
+fn redirect_to_zip_response() -> &'static str {
+    "HTTP/1.1 302 Found\r\nLocation: /tool.zip\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+}
+fn resumed_download_response() -> &'static str {
+    concat!(
+        "HTTP/1.1 206 Partial Content\r\n",
+        "Content-Length: 5\r\n",
+        "Content-Range: bytes 5-9/10\r\n",
+        "ETag: \"artifact-v1\"\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "world"
+    )
+}
+fn truncated_last_modified_download_response() -> &'static str {
+    concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Length: 10\r\n",
+        "Last-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+        "Date: Wed, 21 Oct 2015 07:29:00 GMT\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "hello"
+    )
+}
+fn resumed_last_modified_download_response() -> &'static str {
+    concat!(
+        "HTTP/1.1 206 Partial Content\r\n",
+        "Content-Length: 5\r\n",
+        "Content-Range: bytes 5-9/10\r\n",
+        "Last-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+        "Date: Wed, 21 Oct 2015 07:30:00 GMT\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "world"
+    )
+}
+fn invalid_resumed_download_response() -> &'static str {
+    concat!(
+        "HTTP/1.1 206 Partial Content\r\n",
+        "Content-Length: 6\r\n",
+        "Content-Range: bytes 4-9/10\r\n",
+        "ETag: \"artifact-v1\"\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "oworld"
+    )
+}
+fn changed_validator_download_response() -> &'static str {
+    concat!(
+        "HTTP/1.1 206 Partial Content\r\n",
+        "Content-Length: 5\r\n",
+        "Content-Range: bytes 5-9/10\r\n",
+        "ETag: \"artifact-v2\"\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "world"
+    )
+}
+fn full_download_response() -> &'static str {
+    concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Length: 10\r\n",
+        "ETag: \"artifact-v1\"\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "helloworld"
+    )
+}
+fn truncated_download_without_validator_response() -> &'static str {
+    concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Length: 10\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "hello"
+    )
+}
+fn range_not_satisfiable_response() -> &'static str {
+    concat!(
+        "HTTP/1.1 416 Range Not Satisfiable\r\n",
+        "Content-Range: bytes */4\r\n",
+        "Content-Length: 0\r\n",
+        "Connection: close\r\n",
+        "\r\n"
+    )
+}
+fn bad_gateway_response() -> &'static str {
+    "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+}
+fn too_many_requests_response(retry_after: u64) -> &'static str {
+    // Leaked so a test can pick the wait; the canned server wants 'static.
+    Box::leak(
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: {retry_after}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .into_boxed_str(),
+    )
+}
+fn not_found_response() -> &'static str {
+    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+}
+fn server_error_response() -> &'static str {
+    "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+}
+fn unauthorized_response() -> &'static str {
+    "HTTP/1.1 401 Unauthorized\r\nContent-Length: 15\r\nConnection: close\r\n\r\nBad credentials"
+}
+fn github_forbidden_response() -> &'static str {
+    concat!(
+        "HTTP/1.1 403 Forbidden\r\n",
+        "Content-Type: application/json\r\n",
+        "X-RateLimit-Limit: 5000\r\n",
+        "X-RateLimit-Remaining: 42\r\n",
+        "X-RateLimit-Resource: core\r\n",
+        "X-RateLimit-Reset: 1781337353\r\n",
+        "Content-Length: 47\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        r#"{"message":"secondary rate limit","docs":"url"}"#
+    )
+}
+/// The shape GitHub actually returns once the primary limit is spent —
+/// taken from the response that failed the v2026.9.9 docs deploy. Note the
+/// 403: GitHub does not use 429 here.
+fn github_rate_limited_response() -> &'static str {
+    concat!(
+        "HTTP/1.1 403 Forbidden\r\n",
+        "Content-Type: application/json\r\n",
+        "X-RateLimit-Limit: 5000\r\n",
+        "X-RateLimit-Remaining: 0\r\n",
+        "X-RateLimit-Resource: core\r\n",
+        "X-RateLimit-Reset: 1789456621\r\n",
+        "Content-Length: 55\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        r#"{"message":"API rate limit exceeded for installation."}"#
+    )
+}
+/// A secondary rate limit: quota still on the clock, `retry-after` set.
+fn github_secondary_rate_limited_response() -> &'static str {
+    concat!(
+        "HTTP/1.1 403 Forbidden\r\n",
+        "Content-Type: application/json\r\n",
+        "X-RateLimit-Limit: 5000\r\n",
+        "X-RateLimit-Remaining: 117\r\n",
+        "X-RateLimit-Resource: core\r\n",
+        "Retry-After: 60\r\n",
+        "Content-Length: 55\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        r#"{"message":"You have exceeded a secondary rate limit."}"#
+    )
+}
+fn github_oauth_token_response() -> &'static str {
+    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 51\r\nConnection: close\r\n\r\n{\"access_token\":\"ghu-refreshed\",\"expires_in\":28800}"
+}
+fn seed_github_oauth_cache(cache_path: &Path) {
+    let settings = mise_settings::Settings::get();
+    let cache_key = crate::github::oauth::test_support::cache_key(
+        "127.0.0.1",
+        "Iv1.mock",
+        settings.github.oauth_scopes.trim(),
+    );
+    std::fs::write(
+        cache_path,
+        format!(
+            r#"[tokens.{cache_key}]
+access_token = "ghu-stale"
+expires_at = "2099-01-01T00:00:00Z"
+refresh_token = "ghr-refresh"
+refresh_expires_at = "2099-01-01T00:00:00Z"
+"#
+        ),
+    )
+    .unwrap();
+}
+fn json_empty_array_response() -> &'static str {
+    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]"
+}
+
+fn cacheable_download_response() -> &'static str {
+    concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Length: 5\r\n",
+        "ETag: \"artifact-v1\"\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "hello"
+    )
+}
+fn not_modified_response() -> &'static str {
+    "HTTP/1.1 304 Not Modified\r\nETag: \"artifact-v1\"\r\nConnection: close\r\n\r\n"
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_download_reuses_stored_file_on_not_modified() {
+    let _settings = set_test_http_retries(0);
+    let cache = tempfile::tempdir().unwrap();
+    *cas::TEST_ROOT.lock().unwrap() = Some(cache.path().to_path_buf());
+    let (port, count, requests) = spawn_recording_server(vec![
+        cacheable_download_response(),
+        not_modified_response(),
+        not_modified_response(),
+        cacheable_download_response(),
+    ])
+    .await;
+    let url = format!("http://127.0.0.1:{port}/artifact");
+    let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("artifact");
+
+    client.download_file(&url, &dest, None).await.unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+
+    // The second request is conditional, and a 304 serves the stored file.
+    std::fs::remove_file(&dest).unwrap();
+    client.download_file(&url, &dest, None).await.unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    assert!(
+        requests.lock().unwrap()[1]
+            .to_lowercase()
+            .contains("if-none-match: \"artifact-v1\"")
+    );
+
+    // A stored file that no longer hashes to what was recorded is not used,
+    // even though the server says it is current.
+    let stored = stored_blob(cache.path());
+    std::fs::write(&stored, b"tampered").unwrap();
+    std::fs::remove_file(&dest).unwrap();
+    client.download_file(&url, &dest, None).await.unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 4);
+
+    *cas::TEST_ROOT.lock().unwrap() = None;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_limited_download_refuses_a_stored_copy_over_its_limit() {
+    let _settings = set_test_http_retries(0);
+    let cache = tempfile::tempdir().unwrap();
+    *cas::TEST_ROOT.lock().unwrap() = Some(cache.path().to_path_buf());
+    let (port, _count, requests) =
+        spawn_recording_server(vec![cacheable_download_response(), not_modified_response()]).await;
+    let url = format!("http://127.0.0.1:{port}/artifact");
+    let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("artifact");
+
+    // An uncapped download of the URL leaves a 5-byte copy in the store.
+    client.download_file(&url, &dest, None).await.unwrap();
+    std::fs::remove_file(&dest).unwrap();
+
+    // A capped one is answered with 304 and must not be handed that copy.
+    let err = client
+        .download_file_limited(&url, &dest, 4, None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("is larger than 4 B"), "{err}");
+    assert!(!dest.exists());
+    assert!(
+        requests.lock().unwrap()[1]
+            .to_lowercase()
+            .contains("if-none-match: \"artifact-v1\"")
+    );
+
+    *cas::TEST_ROOT.lock().unwrap() = None;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_download_reuses_pinned_file_without_a_request() {
+    let _settings = set_test_http_retries(0);
+    let cache = tempfile::tempdir().unwrap();
+    *cas::TEST_ROOT.lock().unwrap() = Some(cache.path().to_path_buf());
+    let (port, count) = spawn_canned_server(vec![cacheable_download_response()]).await;
+    let url = format!("http://127.0.0.1:{port}/artifact");
+    let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("artifact");
+    let sha = crate::hash::file_hash_prog::<sha2::Sha256>;
+    let hello = dir.path().join("hello");
+    std::fs::write(&hello, b"hello").unwrap();
+    let pin = format!("sha256:{}", sha(&hello, None).unwrap());
+
+    client
+        .download_file_pinned(&url, &dest, Some(&pin), None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+
+    // The same URL with the same pin is served without any request.
+    std::fs::remove_file(&dest).unwrap();
+    client
+        .download_file_pinned(&url, &dest, Some(&pin), None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Another URL with the same pin is not: a checksum (from a lockfile, say)
+    // must not hand back a file another URL served. It is requested, and
+    // nothing answers there.
+    std::fs::remove_file(&dest).unwrap();
+    let other = "http://127.0.0.1:1/elsewhere";
+    assert!(
+        client
+            .download_file_pinned(other, &dest, Some(&pin), None)
+            .await
+            .is_err()
+    );
+
+    // A blob that no longer matches the pin is not used.
+    let blob = stored_blob(cache.path());
+    std::fs::write(&blob, b"tampered").unwrap();
+    let _ = std::fs::remove_file(&dest);
+    assert!(
+        client
+            .download_file_pinned(&url, &dest, Some(&pin), None)
+            .await
+            .is_err()
+    );
+
+    *cas::TEST_ROOT.lock().unwrap() = None;
+}
+
+/// Downloads of the same file from different URLs, kept at the same time,
+/// each add their URL to the pin entry; none is lost to another's write.
+#[test]
+fn test_concurrent_pinned_keeps_record_every_url() {
+    let _settings = set_test_http_retries(0);
+    let cache = tempfile::tempdir().unwrap();
+    *cas::TEST_ROOT.lock().unwrap() = Some(cache.path().to_path_buf());
+    let dir = tempfile::tempdir().unwrap();
+    let hello = dir.path().join("hello");
+    std::fs::write(&hello, b"hello").unwrap();
+    let pin = format!(
+        "sha256:{}",
+        crate::hash::file_hash_prog::<sha2::Sha256>(&hello, None).unwrap()
+    );
+    let urls: Vec<String> = (0..24)
+        .map(|i| format!("https://mirror-{i}.example.com/artifact"))
+        .collect();
+    let barrier = std::sync::Barrier::new(urls.len());
+    std::thread::scope(|scope| {
+        for (i, url) in urls.iter().enumerate() {
+            let (dir, pin, barrier) = (dir.path(), &pin, &barrier);
+            scope.spawn(move || {
+                let path = dir.join(format!("copy-{i}")).join("artifact");
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, b"hello").unwrap();
+                barrier.wait();
+                cas::store(
+                    &path,
+                    cas::Keep {
+                        request_hash: &format!("request-{i}"),
+                        url,
+                        pin: Some(pin),
+                        validator: None,
+                        effective_filename: None,
+                    },
+                )
+                .unwrap();
+            });
+        }
+    });
+    for url in &urls {
+        assert!(cas::lookup_pin(&pin, url).is_some(), "{url} was lost");
+    }
+
+    *cas::TEST_ROOT.lock().unwrap() = None;
+}
+
+/// A pin index lock that stays held (a stuck process, say) costs the URL
+/// record, not the download: the blob is still kept and handed back.
+#[test]
+fn test_a_stuck_pin_lock_keeps_the_download() {
+    let _settings = set_test_http_retries(0);
+    let cache = tempfile::tempdir().unwrap();
+    *cas::TEST_ROOT.lock().unwrap() = Some(cache.path().to_path_buf());
+    *cas::TEST_PIN_LOCK_WAIT.lock().unwrap() = Some(Duration::from_millis(100));
+    let held = crate::lock_file::LockFile::at(&cache.path().join("pins.lock"))
+        .lock()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("artifact");
+    std::fs::write(&path, b"hello").unwrap();
+    let pin = format!(
+        "sha256:{}",
+        crate::hash::file_hash_prog::<sha2::Sha256>(&path, None).unwrap()
+    );
+    let url = "https://example.com/artifact";
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (path, thread_pin) = (path.clone(), pin.clone());
+    std::thread::spawn(move || {
+        let kept = cas::store(
+            &path,
+            cas::Keep {
+                request_hash: "stuck-lock",
+                url,
+                pin: Some(&thread_pin),
+                validator: None,
+                effective_filename: None,
+            },
+        );
+        let _ = tx.send(kept.map(|blob| blob.is_some()));
+    });
+    let kept = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("keeping the download waited on the pin lock")
+        .unwrap();
+    assert!(kept, "the download was not kept");
+    assert!(cas::lookup_pin(&pin, url).is_none());
+    drop(held);
+
+    *cas::TEST_PIN_LOCK_WAIT.lock().unwrap() = None;
+    *cas::TEST_ROOT.lock().unwrap() = None;
+}
+
+fn stored_blob(cache: &std::path::Path) -> PathBuf {
+    let dir = std::fs::read_dir(cache.join("blobs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::read_dir(dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_download_linked_shares_one_stored_file() {
+    let _settings = set_test_http_retries(0);
+    let cache = tempfile::tempdir().unwrap();
+    *cas::TEST_ROOT.lock().unwrap() = Some(cache.path().to_path_buf());
+    let (port, count) = spawn_canned_server(vec![cacheable_download_response()]).await;
+    let url = format!("http://127.0.0.1:{port}/artifact.bin");
+    let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("artifact.bin");
+    let hello = dir.path().join("hello");
+    std::fs::write(&hello, b"hello").unwrap();
+    let pin = format!(
+        "sha256:{}",
+        crate::hash::file_hash_prog::<sha2::Sha256>(&hello, None).unwrap()
+    );
+
+    client
+        .download_file_linked(&url, &dest, &HeaderMap::new(), Some(&pin), None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    // The stored file keeps the name it was downloaded as.
+    assert_eq!(
+        stored_blob(cache.path()).file_name().unwrap(),
+        "artifact.bin"
+    );
+
+    // A second install is served from the store with no request, and the
+    // destination holds the same bytes.
+    std::fs::remove_file(&dest).unwrap();
+    client
+        .download_file_linked(&url, &dest, &HeaderMap::new(), Some(&pin), None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    *cas::TEST_ROOT.lock().unwrap() = None;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_download_replaces_a_damaged_stored_file() {
+    let _settings = set_test_http_retries(0);
+    let cache = tempfile::tempdir().unwrap();
+    *cas::TEST_ROOT.lock().unwrap() = Some(cache.path().to_path_buf());
+    let (port, count) = spawn_canned_server(vec![
+        cacheable_download_response(),
+        cacheable_download_response(),
+    ])
+    .await;
+    let url = format!("http://127.0.0.1:{port}/artifact.bin");
+    let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("artifact.bin");
+    let hello = dir.path().join("hello");
+    std::fs::write(&hello, b"hello").unwrap();
+    let pin = format!(
+        "sha256:{}",
+        crate::hash::file_hash_prog::<sha2::Sha256>(&hello, None).unwrap()
+    );
+
+    client
+        .download_file_linked(&url, &dest, &HeaderMap::new(), Some(&pin), None)
+        .await
+        .unwrap();
+
+    // Damage the stored file in place. The next download must not install it,
+    // and must leave a good copy behind rather than the damaged one.
+    let blob = stored_blob(cache.path());
+    std::fs::write(&blob, b"tampered").unwrap();
+    std::fs::remove_file(&dest).unwrap();
+    client
+        .download_file_linked(&url, &dest, &HeaderMap::new(), Some(&pin), None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(std::fs::read(stored_blob(cache.path())).unwrap(), b"hello");
+
+    // Replacing a destination that already exists works too.
+    // Replace it with a new file: writing through the link would change the
+    // stored file itself.
+    std::fs::remove_file(&dest).unwrap();
+    std::fs::write(&dest, b"stale").unwrap();
+    client
+        .download_file_linked(&url, &dest, &HeaderMap::new(), Some(&pin), None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    *cas::TEST_ROOT.lock().unwrap() = None;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_download_that_fails_its_pin_is_not_kept() {
+    let _settings = set_test_http_retries(0);
+    let cache = tempfile::tempdir().unwrap();
+    *cas::TEST_ROOT.lock().unwrap() = Some(cache.path().to_path_buf());
+    // The wrong bytes, sent with the validator the right file has.
+    let wrong = concat!(
+        "HTTP/1.1 200 OK\r\n",
+        "Content-Length: 5\r\n",
+        "ETag: \"artifact-v1\"\r\n",
+        "Connection: close\r\n",
+        "\r\n",
+        "wrong"
+    );
+    let (port, count, requests) = spawn_recording_server(vec![
+        wrong,
+        wrong,
+        wrong,
+        not_modified_response(),
+        cacheable_download_response(),
+    ])
+    .await;
+    let url = format!("http://127.0.0.1:{port}/artifact.bin");
+    let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("artifact.bin");
+    let hello = dir.path().join("hello");
+    std::fs::write(&hello, b"hello").unwrap();
+    let pin = format!(
+        "sha256:{}",
+        crate::hash::file_hash_prog::<sha2::Sha256>(&hello, None).unwrap()
+    );
+
+    // The caller gets the file to reject, and nothing of it is kept: the next
+    // download is not conditional, so the server is not asked to confirm it.
+    client
+        .download_file_linked(&url, &dest, &HeaderMap::new(), Some(&pin), None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"wrong");
+    assert!(!cache.path().join("blobs").exists());
+    assert!(!cache.path().join("urls").exists());
+    client
+        .download_file_pinned(&url, &dest, Some(&pin), None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"wrong");
+    assert!(!cache.path().join("blobs").exists());
+    assert!(
+        !requests.lock().unwrap()[1]
+            .to_lowercase()
+            .contains("if-none-match")
+    );
+
+    // A file kept by an unpinned download of the same URL is not what a 304
+    // answers a pinned one with when it doesn't match the pin.
+    client.download_file(&url, &dest, None).await.unwrap();
+    assert!(cache.path().join("urls").exists());
+    std::fs::remove_file(&dest).unwrap();
+    client
+        .download_file_linked(&url, &dest, &HeaderMap::new(), Some(&pin), None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 5);
+
+    *cas::TEST_ROOT.lock().unwrap() = None;
+}
+
+fn set_test_cache_settings(
+    configure: impl FnOnce(&mut mise_settings::SettingsPartial),
+) -> SettingsGuard {
+    let lock = crate::testing::lock_ignoring_poison(&crate::testing::SETTINGS_LOCK);
+    let mut settings = mise_settings::SettingsPartial::empty();
+    settings.http_retries = Some(0);
+    configure(&mut settings);
+    crate::testing::reset_settings(Some(settings));
+    SettingsGuard { _lock: lock }
+}
+
+#[test]
+fn test_download_cache_max_size_is_configurable() {
+    let size = |value: &str| {
+        let _guard = set_test_cache_settings(|s| s.download_cache_max_size = Some(value.into()));
+        cas::max_cache_bytes()
+    };
+    assert_eq!(size("10KiB"), 10 * 1024);
+    assert_eq!(size("1GB"), 1_000_000_000);
+    assert_eq!(size("0"), u64::MAX);
+    // An unreadable value falls back to the default instead of failing installs.
+    assert_eq!(size("lots"), 2 * 1024 * 1024 * 1024);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_locked_mode_keeps_only_pinned_downloads() {
+    let _settings = set_test_cache_settings(|s| s.locked = Some(true));
+    let cache = tempfile::tempdir().unwrap();
+    *cas::TEST_ROOT.lock().unwrap() = Some(cache.path().to_path_buf());
+    let (port, count) = spawn_canned_server(vec![
+        cacheable_download_response(),
+        cacheable_download_response(),
+        cacheable_download_response(),
+    ])
+    .await;
+    let url = format!("http://127.0.0.1:{port}/artifact.bin");
+    let client = Client::new(Duration::from_secs(2), ClientKind::Http).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("artifact.bin");
+
+    // No pin: nothing is kept, and the second request is a full download.
+    client.download_file(&url, &dest, None).await.unwrap();
+    client.download_file(&url, &dest, None).await.unwrap();
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert!(!cache.path().join("blobs").exists());
+
+    // A pinned download is kept, because the pin is checked afterwards.
+    let hello = dir.path().join("hello");
+    std::fs::write(&hello, b"hello").unwrap();
+    let pin = format!(
+        "sha256:{}",
+        crate::hash::file_hash_prog::<sha2::Sha256>(&hello, None).unwrap()
+    );
+    client
+        .download_file_pinned(&url, &dest, Some(&pin), None)
+        .await
+        .unwrap();
+    assert!(cache.path().join("blobs").exists());
+    std::fs::remove_file(&dest).unwrap();
+    client
+        .download_file_pinned(&url, &dest, Some(&pin), None)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"hello");
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+    *cas::TEST_ROOT.lock().unwrap() = None;
+}

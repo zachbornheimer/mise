@@ -1,0 +1,787 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use eyre::Result;
+
+use crate::backend::backend_type::BackendType;
+use crate::config::env_directive::{EnvResolveOptions, EnvResults, ToolsFilter};
+use crate::config::{Config, Settings, SettingsExt};
+use crate::env::{PATH_KEY, WARN_ON_MISSING_REQUIRED_ENV};
+use crate::env_diff::EnvMap;
+use crate::install_context::InstallDependencyContext;
+use crate::path_env::PathEnv;
+use crate::toolset::Toolset;
+use crate::toolset::env_cache::{CachedEnv, compute_settings_hash, get_file_mtime};
+use crate::toolset::tool_request::ToolRequest;
+use crate::{env, file, github, parallel, uv};
+
+/// PATH with mise-managed install dirs filtered out. mise re-adds the current
+/// toolset's bin dirs below, so a stale `installs/<tool>/<ver>/bin` left on PATH
+/// (e.g. carried in from a frozen env snapshot) does not outrank the version that
+/// `mise x`/`run`/`env` selects for the whole process tree. Mirrors the hook-env
+/// reactivation filter from #10162. (#10345)
+fn pristine_path_without_install_dirs() -> Vec<PathBuf> {
+    let install_dirs = crate::path_env::mise_install_dirs();
+    env::PATH
+        .iter()
+        .filter(|p| !crate::path_env::is_mise_install_path(p.as_path(), &install_dirs))
+        .cloned()
+        .collect()
+}
+
+impl Toolset {
+    /// PATH for an environment mise hands to a child process or prints (`mise x`,
+    /// `mise run`, `mise env`): the pristine PATH with the given mise-managed paths
+    /// ahead of it.
+    ///
+    /// The pristine PATH never contains a shim farm that PATH activation added on its
+    /// own, and a shell without activation may not have one at all. A `lazy = true`
+    /// tool relies on its bootstrap shim being found, so when the toolset declares one
+    /// the farms follow the tool paths, mirroring the fallback boundary hook-env retains
+    /// in the interactive shell. Installed tools still resolve to their real bin
+    /// directories first. A farm already on the pristine PATH keeps its place: `PathEnv`
+    /// already puts tool paths ahead of it, and a shared directory such as
+    /// `~/.local/bin` must not be reordered.
+    fn child_path_env(&self, paths: impl IntoIterator<Item = PathBuf>) -> PathEnv {
+        let mut pristine = pristine_path_without_install_dirs();
+        let mut shim_farms = Vec::new();
+        let mut shim_boundary = None;
+        let mut inserted_farms = Vec::new();
+        if self.has_lazy_declarations() {
+            shim_farms = crate::shims::shim_farm_dirs();
+            for (index, path) in pristine.iter().enumerate() {
+                if shim_farms.iter().any(|farm| {
+                    file::paths_eq(
+                        &file::canonicalize_or_self(path),
+                        &file::canonicalize_or_self(farm),
+                    )
+                }) {
+                    shim_boundary.get_or_insert(index);
+                }
+            }
+            if let Some(boundary) = shim_boundary {
+                // A farm the inherited PATH lacks is placed there by mise, so it is
+                // managed even though it keeps the inherited entries' position.
+                inserted_farms = shim_farms
+                    .iter()
+                    .filter(|farm| {
+                        !pristine.iter().any(|path| {
+                            file::paths_eq(
+                                &file::canonicalize_or_self(path),
+                                &file::canonicalize_or_self(farm),
+                            )
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                pristine.retain(|path| {
+                    !shim_farms.iter().any(|farm| {
+                        file::paths_eq(
+                            &file::canonicalize_or_self(path),
+                            &file::canonicalize_or_self(farm),
+                        )
+                    })
+                });
+                pristine.splice(boundary..boundary, shim_farms.iter().cloned());
+            }
+        }
+        let mut path_env = PathEnv::from_iter(pristine.iter().cloned());
+        for farm in inserted_farms {
+            path_env.mark_managed(farm);
+        }
+        for p in paths {
+            path_env.add(p);
+        }
+        if shim_boundary.is_none() {
+            for dir in shim_farms {
+                path_env.add(dir);
+            }
+        }
+        path_env
+    }
+
+    fn child_path(&self, paths: impl IntoIterator<Item = PathBuf>) -> String {
+        self.child_path_env(paths).to_string()
+    }
+
+    /// The entries mise puts on PATH ahead of the inherited ones, in the order
+    /// they take in the PATH `env_with_path` returns. A directory the inherited
+    /// PATH already had, such as `~/.cargo/bin`, is included when mise moves it
+    /// forward.
+    pub async fn managed_path_entries(&self, config: &Arc<Config>) -> Result<Vec<PathBuf>> {
+        // The cache-aware lookup `mise env` uses, so the two cannot disagree.
+        let (_, _, user_paths, tool_paths, _) = self.env_with_path_and_split(config).await?;
+        Ok(self
+            .child_path_env(user_paths.into_iter().chain(tool_paths))
+            .managed_entries())
+    }
+
+    pub async fn full_env(&self, config: &Arc<Config>) -> Result<EnvMap> {
+        Ok(self.full_env_with_removals(config).await?.0)
+    }
+
+    pub(crate) async fn full_env_with_removals(
+        &self,
+        config: &Arc<Config>,
+    ) -> Result<(EnvMap, BTreeSet<String>)> {
+        let (env, env_remove, _) = self.full_env_with_removals_and_keys(config).await?;
+        Ok((env, env_remove))
+    }
+
+    /// Like `full_env_with_removals`, also returning every key mise itself sets, whatever
+    /// its value (the keys of the mise-only env, before it is merged over the process env).
+    pub(crate) async fn full_env_with_removals_and_keys(
+        &self,
+        config: &Arc<Config>,
+    ) -> Result<(EnvMap, BTreeSet<String>, BTreeSet<String>)> {
+        let (mise_env, env_remove) = self.env_with_path_and_removals(config).await?;
+        let mise_keys = mise_env.keys().cloned().collect();
+        let mut env = env::PRISTINE_ENV.clone().into_iter().collect::<EnvMap>();
+        for key in &env_remove {
+            env.remove(key);
+        }
+        env.extend(mise_env);
+        Ok((env, env_remove, mise_keys))
+    }
+
+    /// Like full_env but skips `tools=true` env directives (load_post_env).
+    /// Used for preinstall hooks where tool-dependent env vars aren't available yet,
+    /// and for dependency_env where resolving tools=true modules on a partial toolset
+    /// would trigger spurious errors from modules expecting the full PATH.
+    pub(crate) async fn full_env_without_tools(&self, config: &Arc<Config>) -> Result<EnvMap> {
+        let mut env = env::PRISTINE_ENV.clone().into_iter().collect::<EnvMap>();
+        for key in &config.env_results().await?.env_remove {
+            env.remove(key);
+        }
+        env.extend(self.env_with_path_without_tools(config).await?);
+        Ok(env)
+    }
+}
+
+impl InstallDependencyContext {
+    /// Build an install-hook base environment from this context's resolved
+    /// dependency toolset and its already-validated paths. `tools = true`
+    /// directives remain excluded because a partial install context cannot
+    /// evaluate arbitrary modules.
+    pub(crate) async fn base_env_for_install(&self, config: &Arc<Config>) -> Result<EnvMap> {
+        let mut full_env = env::PRISTINE_ENV.clone().into_iter().collect::<EnvMap>();
+        for key in &config.env_results().await?.env_remove {
+            full_env.remove(key);
+        }
+        let (mut env, add_paths) = self.toolset.env(config).await?;
+        let mut path_env = PathEnv::new();
+        for path in &self.paths {
+            path_env.add(path.clone());
+        }
+        for path in config.path_dirs().await?.clone() {
+            path_env.add(path);
+        }
+        for path in add_paths {
+            path_env.add(path);
+        }
+        for path in config.path_dirs_append().await?.clone() {
+            path_env.add(path);
+        }
+        for path in pristine_path_without_install_dirs() {
+            path_env.add(path);
+        }
+        env.insert(PATH_KEY.to_string(), path_env.to_string());
+        full_env.extend(env);
+        Ok(full_env)
+    }
+}
+
+impl Toolset {
+    /// Like env_with_path but skips `tools=true` env directives.
+    /// Used during tool installation where tool-dependent env vars
+    /// may reference tools that aren't installed yet, and in
+    /// dependency_env to avoid triggering module hooks on a partial PATH.
+    ///
+    /// The command-wrapper directory is left out: a wrapper reroutes the commands a project
+    /// runs, not the ones mise runs to install its tools. `[wrappers.cargo]` pointing at `mbx`
+    /// would otherwise take over `cargo install` for a `cargo:` tool. (jdx/mr-boxington#919)
+    pub(crate) async fn env_with_path_without_tools(&self, config: &Arc<Config>) -> Result<EnvMap> {
+        let (mut env, add_paths) = self.env(config).await?;
+        // The inherited PATH goes through `from_iter`, which keeps it behind the directories added
+        // below; only the command-wrapper directory is dropped from every source.
+        let mut path_env = PathEnv::from_iter(
+            pristine_path_without_install_dirs()
+                .into_iter()
+                .filter(|p| !file::is_command_wrapper_dir(p)),
+        );
+        let mut added = config.path_dirs().await?.clone();
+        added.extend(add_paths);
+        added.extend(self.list_paths(config).await);
+        added.extend(config.path_dirs_append().await?.clone());
+        // An entry may hold several PATH components, which `add` splits.
+        for part in added.iter().flat_map(std::env::split_paths) {
+            if !file::is_command_wrapper_dir(&part) {
+                path_env.add(part);
+            }
+        }
+        env.insert(PATH_KEY.to_string(), path_env.to_string());
+        Ok(env)
+    }
+
+    /// the full mise environment including all tool paths
+    pub async fn env_with_path(&self, config: &Arc<Config>) -> Result<EnvMap> {
+        Ok(self.env_with_path_and_removals(config).await?.0)
+    }
+
+    pub async fn env_with_path_and_removals(
+        &self,
+        config: &Arc<Config>,
+    ) -> Result<(EnvMap, BTreeSet<String>)> {
+        let (env, env_remove, _) = self.env_with_path_removals_and_paths(config).await?;
+        Ok((env, env_remove))
+    }
+
+    /// Like `env_with_path_and_removals`, and also returns every directory mise put ahead of
+    /// the inherited PATH (`_.path` entries, the uv venv, tool-added paths, tool bins), from the
+    /// same environment build, so a caller can tell them from inherited ones without building
+    /// the environment again.
+    pub async fn env_with_path_removals_and_paths(
+        &self,
+        config: &Arc<Config>,
+    ) -> Result<(EnvMap, BTreeSet<String>, Vec<PathBuf>)> {
+        // Try to load from cache if enabled
+        if CachedEnv::is_enabled()
+            && let Some(cached) = self.try_load_env_cache_full(config).await?
+        {
+            trace!("env_cache: using cached environment");
+            let mut env = cached.env;
+            let added = cached
+                .user_paths
+                .into_iter()
+                .chain(cached.tool_paths)
+                .collect::<Vec<_>>();
+            env.insert(PATH_KEY.to_string(), self.child_path(added.iter().cloned()));
+            github::oauth::inject_token_env(&mut env);
+            return Ok((env, cached.env_remove, added));
+        }
+
+        let (mut env, env_results) = self.final_env(config).await?;
+        // Use split paths so we save a cache compatible with env_with_path_and_split
+        let (user_paths, tool_paths) = self
+            .list_final_paths_split(config, env_results.clone())
+            .await?;
+        env.insert(
+            PATH_KEY.to_string(),
+            self.child_path(user_paths.iter().chain(tool_paths.iter()).cloned()),
+        );
+
+        // Save to cache if enabled and no uncacheable directives
+        // Use save_env_cache_split to ensure cache is compatible with env_with_path_and_split
+        if CachedEnv::is_enabled() {
+            if env_results.has_uncacheable {
+                debug!(
+                    "env_cache: not caching the environment: it has decrypted or redacted values \
+                     (see env_cache_redacted) or a directive that is not cacheable"
+                );
+            } else if let Err(e) =
+                self.save_env_cache_split(config, &env, &user_paths, &tool_paths, &env_results)
+            {
+                debug!("env_cache: failed to save: {}", e);
+            }
+        }
+
+        // Inject GitHub OAuth token (if configured) after cache save so the
+        // ephemeral token is never persisted to disk.
+        github::oauth::inject_token_env(&mut env);
+
+        Ok((
+            env,
+            env_results.env_remove,
+            user_paths.into_iter().chain(tool_paths).collect(),
+        ))
+    }
+
+    /// Get environment with split paths (user_paths and tool_paths separate)
+    /// This method uses the env cache when available and returns paths separately
+    /// for proper handling in hook_env.
+    pub async fn env_with_path_and_split(
+        &self,
+        config: &Arc<Config>,
+    ) -> Result<(
+        EnvMap,
+        BTreeSet<String>,
+        Vec<PathBuf>,
+        Vec<PathBuf>,
+        Vec<PathBuf>,
+    )> {
+        // Try to load from cache if enabled
+        if CachedEnv::is_enabled()
+            && let Some(cached) = self.try_load_env_cache_full(config).await?
+        {
+            trace!("env_cache: using cached environment with split paths");
+            let mut env = cached.env;
+            // Reconstruct PATH from cached paths
+            let mut path_env = PathEnv::from_iter(pristine_path_without_install_dirs());
+            for p in cached.user_paths.iter().chain(cached.tool_paths.iter()) {
+                path_env.add(p.clone());
+            }
+            env.insert(PATH_KEY.to_string(), path_env.to_string());
+            github::oauth::inject_token_env(&mut env);
+            return Ok((
+                env,
+                cached.env_remove,
+                cached.user_paths,
+                cached.tool_paths,
+                cached.watch_files,
+            ));
+        }
+
+        // Compute fresh
+        let (mut env, env_results) = self.final_env(config).await?;
+        let (user_paths, tool_paths) = self
+            .list_final_paths_split(config, env_results.clone())
+            .await?;
+
+        // Build PATH
+        let mut path_env = PathEnv::from_iter(pristine_path_without_install_dirs());
+        for p in user_paths.iter().chain(tool_paths.iter()) {
+            path_env.add(p.clone());
+        }
+        env.insert(PATH_KEY.to_string(), path_env.to_string());
+
+        // Save to cache if enabled and no uncacheable directives
+        if CachedEnv::is_enabled() {
+            if env_results.has_uncacheable {
+                debug!(
+                    "env_cache: not caching the environment: it has decrypted or redacted values \
+                     (see env_cache_redacted) or a directive that is not cacheable"
+                );
+            } else if let Err(e) =
+                self.save_env_cache_split(config, &env, &user_paths, &tool_paths, &env_results)
+            {
+                debug!("env_cache: failed to save: {}", e);
+            }
+        }
+
+        // Inject GitHub OAuth token (if configured) after cache save so the
+        // ephemeral token is never persisted to disk.
+        github::oauth::inject_token_env(&mut env);
+
+        Ok((
+            env,
+            env_results.env_remove,
+            user_paths,
+            tool_paths,
+            env_results.watch_files,
+        ))
+    }
+
+    /// Try to load environment from cache (returns full CachedEnv)
+    pub async fn try_load_env_cache_full(&self, config: &Arc<Config>) -> Result<Option<CachedEnv>> {
+        config.env_results().await?;
+        let cache_key = self.compute_env_cache_key(config)?;
+        let cached = CachedEnv::load(&cache_key)?;
+        if let Some(cached) = &cached {
+            // A hit skips the directives that registered these, so mask them again.
+            config.add_redactions_excluding(
+                cached.redactions.iter().cloned(),
+                &cached.env,
+                &cached.redaction_exclusions,
+            );
+        }
+        Ok(cached)
+    }
+
+    /// Save environment to cache with split paths
+    fn save_env_cache_split(
+        &self,
+        config: &Arc<Config>,
+        env: &EnvMap,
+        user_paths: &[PathBuf],
+        tool_paths: &[PathBuf],
+        env_results: &EnvResults,
+    ) -> Result<()> {
+        let cache_key = self.compute_env_cache_key(config)?;
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        // Collect all files to watch (config files + module watch_files + env_files)
+        let mut watch_files: Vec<PathBuf> = config.config_files.keys().cloned().collect();
+        watch_files.extend(env_results.watch_files.clone());
+        watch_files.extend(env_results.env_files.clone());
+        watch_files.extend(env_results.env_scripts.clone());
+
+        // Add mise.lock files to watch_files
+        for p in config.config_files.keys() {
+            if let Some(parent) = p.parent() {
+                let lockfile = parent.join("mise.lock");
+                if lockfile.exists() {
+                    watch_files.push(lockfile);
+                }
+            }
+        }
+
+        // Get mtimes for watch files
+        let watch_file_mtimes: Vec<u64> = watch_files
+            .iter()
+            .map(|p| get_file_mtime(p).unwrap_or(0))
+            .collect();
+
+        // Remove PATH from env before caching (we store paths separately)
+        let env_without_path: BTreeMap<String, String> = env
+            .iter()
+            .filter(|(k, _)| k.as_str() != PATH_KEY.as_str())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let cached = CachedEnv {
+            env: env_without_path,
+            env_remove: env_results.env_remove.clone(),
+            user_paths: user_paths.to_vec(),
+            tool_paths: tool_paths.to_vec(),
+            redactions: env_results.redactions.clone(),
+            redaction_exclusions: env_results.redaction_exclusions.clone(),
+            created_at: now,
+            watch_files,
+            watch_file_mtimes,
+            mise_version: env!("CARGO_PKG_VERSION").to_string(),
+            cache_key_debug: cache_key.clone(),
+        };
+
+        cached.save(&cache_key)
+    }
+
+    /// Compute the cache key for the current configuration
+    fn compute_env_cache_key(&self, config: &Arc<Config>) -> Result<String> {
+        // Collect config files with their mtimes
+        // Included fragments are inputs too: editing one changes the env without
+        // touching the file that includes it.
+        let config_files: Vec<(PathBuf, u64)> = config
+            .config_files
+            .iter()
+            .flat_map(|(p, cf)| std::iter::once(p.clone()).chain(cf.included_paths()))
+            .map(|p| {
+                let mtime = get_file_mtime(&p).unwrap_or(0);
+                (p, mtime)
+            })
+            .collect();
+
+        // Treat sibling mise.lock files as config inputs for cache invalidation
+        // to ensure creation, deletion, and modification of lock files forces
+        // a fresh env/watch_files computation.
+        let config_lockfiles: Vec<(PathBuf, u64)> = config
+            .config_files
+            .keys()
+            .filter_map(|p| {
+                let lockfile = p.parent()?.join("mise.lock");
+                let mtime = get_file_mtime(&lockfile)?;
+                Some((lockfile, mtime))
+            })
+            .collect();
+
+        // Runtime options can change tool environments and wrapper activation without
+        // changing versions, so include them in the cache identity.
+        let tool_versions: Vec<(String, String)> = self
+            .list_current_versions()
+            .into_iter()
+            .map(|(b, tv)| {
+                Ok((
+                    b.id().to_string(),
+                    serde_json::to_string(&(tv.version.clone(), tv.request.options()))?,
+                ))
+            })
+            .collect::<Result<_>>()?;
+
+        // Get settings hash
+        let settings_hash = compute_settings_hash();
+
+        // Get base PATH using platform-appropriate separator
+        let base_path = std::env::join_paths(env::PATH.iter())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Include the auto-sourced uv venv (uv.lock + resolved venv) in the key so a venv
+        // dir and a sibling sharing the same config files don't collide on one
+        // cache entry, which would leak the venv across directories.
+        let mut uv_venv_inputs: Vec<(PathBuf, u64)> = Vec::new();
+        if Settings::get().python.uv_venv_auto.should_source()
+            && let Some(uv_root) = uv::uv_root()
+        {
+            let lock = uv_root.join("uv.lock");
+            let venv = uv::uv_venv_path(config, &uv_root);
+            let lock_mtime = get_file_mtime(&lock).unwrap_or(0);
+            let venv_mtime = get_file_mtime(&venv).unwrap_or(0);
+            uv_venv_inputs.push((lock, lock_mtime));
+            uv_venv_inputs.push((venv, venv_mtime));
+        }
+
+        Ok(CachedEnv::compute_cache_key(
+            &[config_files, config_lockfiles, uv_venv_inputs].concat(),
+            &tool_versions,
+            &settings_hash,
+            &base_path,
+            env::PRISTINE_ENV.get("MANPATH").map(String::as_str),
+        ))
+    }
+
+    pub async fn env_from_tools(&self, config: &Arc<Config>) -> Vec<(String, String, String)> {
+        let this = Arc::new(self.clone());
+        let items: Vec<_> = self
+            .list_current_installed_versions(config)
+            .into_iter()
+            .filter(|(_, tv)| !matches!(tv.request, ToolRequest::System { .. }))
+            .map(|(b, tv)| (config.clone(), this.clone(), b, tv))
+            .collect();
+
+        let envs = parallel::parallel(items, |(config, this, b, tv)| async move {
+            let backend_id = b.id().to_string();
+            match b.exec_env(&config, &this, &tv).await {
+                Ok(env) => Ok(env
+                    .into_iter()
+                    .map(|(k, v)| (k, v, backend_id.clone()))
+                    .collect::<Vec<_>>()),
+                Err(e) => {
+                    warn!("Error running exec-env: {:#}", e);
+                    Ok(Vec::new())
+                }
+            }
+        })
+        .await
+        .unwrap_or_default();
+
+        envs.into_iter()
+            .flatten()
+            .filter(|(k, _, _)| k.to_uppercase() != "PATH")
+            .collect()
+    }
+
+    /// Resolve tool and non-tool environment contributions needed before the
+    /// tools-aware environment pass.
+    pub(crate) async fn env(&self, config: &Arc<Config>) -> Result<(EnvMap, Vec<PathBuf>)> {
+        time!("env start");
+        let entries = self
+            .env_from_tools(config)
+            .await
+            .into_iter()
+            .map(|(k, v, _)| (k, v))
+            .collect::<Vec<(String, String)>>();
+
+        // Collect and process MISE_ADD_PATH values into paths
+        let paths_to_add: Vec<PathBuf> = entries
+            .iter()
+            .filter(|(k, _)| k == "MISE_ADD_PATH")
+            .flat_map(|(_, v)| env::split_paths(v))
+            .collect();
+
+        let mut env: EnvMap = entries
+            .into_iter()
+            .filter(|(k, _)| k != "MISE_ADD_PATH")
+            .filter(|(k, _)| !k.starts_with("MISE_TOOL_OPTS__"))
+            .rev()
+            .collect();
+
+        env.extend(config.env().await?.clone());
+        if let Some(venv) = uv::uv_venv(config, self).await? {
+            for (k, v) in venv.env.clone() {
+                env.insert(k, v);
+            }
+        }
+        self.prepend_packslip_manpaths(config, &mut env)?;
+        for key in &config.env_results().await?.env_remove {
+            env.remove(key);
+        }
+        time!("env end");
+        Ok((env, paths_to_add))
+    }
+
+    /// Prepend normalized man roots from the active Packslip installs.
+    fn prepend_packslip_manpaths(&self, config: &Arc<Config>, env: &mut EnvMap) -> Result<()> {
+        let mut paths: Vec<PathBuf> = self
+            .list_current_installed_versions(config)
+            .into_iter()
+            .filter(|(backend, _)| backend.get_type() == BackendType::Packslip)
+            .filter_map(|(_, tv)| crate::packslip::manpath(&tv.install_path()))
+            .collect();
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let existing = env
+            .get("MANPATH")
+            .or_else(|| crate::env::PRISTINE_ENV.get("MANPATH"));
+        if let Some(existing) = existing {
+            paths.extend(std::env::split_paths(existing));
+        } else {
+            // An empty component asks `man` to retain its platform defaults.
+            // Without it, merely activating one Packslip tool would hide the
+            // operating system's own manual pages.
+            paths.push(PathBuf::new());
+        }
+        let mut seen = BTreeSet::new();
+        paths.retain(|path| seen.insert(path.clone()));
+        env.insert(
+            "MANPATH".into(),
+            std::env::join_paths(paths)?.to_string_lossy().into_owned(),
+        );
+        Ok(())
+    }
+
+    /// Resolve the complete environment, including tools-aware directives.
+    pub async fn final_env(&self, config: &Arc<Config>) -> Result<(EnvMap, EnvResults)> {
+        let (mut env, add_paths) = self.env(config).await?;
+        let non_tool_env = config.env_results().await?;
+        let mut tera_env = env::PRISTINE_ENV.clone().into_iter().collect::<EnvMap>();
+        for key in &non_tool_env.env_remove {
+            tera_env.remove(key);
+        }
+        tera_env.extend(env.clone());
+        let mut path_env = PathEnv::from_iter(pristine_path_without_install_dirs());
+
+        for p in config.path_dirs().await?.clone() {
+            path_env.add(p);
+        }
+        for p in &add_paths {
+            path_env.add(p.clone());
+        }
+        for p in self.list_paths(config).await {
+            path_env.add(p);
+        }
+        for p in config.path_dirs_append().await?.clone() {
+            path_env.add(p);
+        }
+        tera_env.insert(PATH_KEY.to_string(), path_env.to_string());
+        let mut ctx = config.tera_ctx.clone();
+        ctx.insert("env", &tera_env);
+        ctx.insert("tools", &self.build_tools_tera_map(config));
+        let mut env_results = self
+            .load_post_env(config, ctx, &tera_env, ToolsFilter::ToolsOnly)
+            .await?;
+
+        // Include watch_files from tools=false plugins so the env cache tracks all
+        // plugin watch_files, not just tools=true ones. env_results_cached()
+        // returns Some here because self.env(config) above always initialises
+        // config.env via config.env_results().
+        if let Some(non_tool_env) = config.env_results_cached() {
+            env_results
+                .watch_files
+                .extend(non_tool_env.watch_files.clone());
+        }
+
+        // The non-tool env is merged into the final env too, so a module there
+        // that returned cacheable = false must keep the combined env uncached.
+        env_results.has_uncacheable |= non_tool_env.has_uncacheable;
+
+        // Store add_paths separately to maintain consistent PATH ordering
+        env_results.tool_add_paths = add_paths;
+
+        env.extend(
+            env_results
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.0.clone())),
+        );
+        for key in &env_results.env_remove {
+            env.remove(key);
+        }
+
+        let mut effective_removals = non_tool_env.env_remove.clone();
+        for key in env_results.env.keys() {
+            effective_removals.remove(key);
+        }
+        effective_removals.extend(env_results.env_remove.clone());
+        env_results.env_remove = effective_removals;
+
+        // A tools-aware directive may replace MANPATH after env() added the
+        // Packslip roots. Compose it once more against the final value, while
+        // continuing to honor an explicit unset from either environment pass.
+        if !env_results.env_remove.contains("MANPATH") {
+            self.prepend_packslip_manpaths(config, &mut env)?;
+        }
+
+        // Apply redactions from tools-only env vars (e.g. redact=true + tools=true)
+        if !env_results.redactions.is_empty() {
+            config.add_redactions_excluding(
+                env_results.redactions.iter().cloned(),
+                &env,
+                &env_results.redaction_exclusions,
+            );
+        }
+
+        Ok((env, env_results))
+    }
+
+    pub(super) async fn load_post_env(
+        &self,
+        config: &Arc<Config>,
+        ctx: tera::Context,
+        env: &EnvMap,
+        tools_filter: ToolsFilter,
+    ) -> Result<EnvResults> {
+        if Settings::no_env() || Settings::get().no_env.unwrap_or(false) {
+            return Ok(EnvResults::default());
+        }
+        let entries = config
+            .config_files
+            .iter()
+            .rev()
+            .map(|(source, cf)| {
+                cf.env_entries()
+                    .map(|ee| ee.into_iter().map(|e| (e, source.clone())))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        // trace!("load_env: entries: {:#?}", entries);
+        let env_results = EnvResults::resolve_with_toolset(
+            config,
+            ctx,
+            env,
+            entries,
+            EnvResolveOptions {
+                vars: false,
+                tools: tools_filter,
+                warn_on_missing_required: *WARN_ON_MISSING_REQUIRED_ENV,
+            },
+            // `_.python.venv` needs the *active* python, which is only knowable here: a
+            // `--tool python@3.12` override lives in this toolset and never reaches `Config`.
+            Some(self),
+        )
+        .await?;
+        if log::log_enabled!(log::Level::Trace) {
+            trace!("{env_results:#?}");
+        } else if !env_results.is_empty() {
+            debug!("{env_results:?}");
+        }
+        Ok(env_results)
+    }
+
+    /// Resolve only `tools = true` `[env]` *value* directives (plain
+    /// `KEY = value` templates such as `{{ tools.python.path }}`) against this
+    /// toolset's currently-installed tools, layered on top of `base_env`, and
+    /// return just those vars. Env *modules* are skipped (see
+    /// [`ToolsFilter::ToolsOnlyVals`]).
+    ///
+    /// Deliberately lean: it builds only the `tools.*` tera map (cheap; no
+    /// `exec_env`) rather than recomputing the full env, so `dependency_env` can
+    /// call it per-install without the cost/recursion of `final_env`. Used so a
+    /// dependent tool's install picks up vars like `CLOUDSDK_PYTHON` during a
+    /// combined `mise install`, mirroring what a re-activated shell exports
+    /// between separate installs. (#10282)
+    pub(crate) async fn tool_val_env(
+        &self,
+        config: &Arc<Config>,
+        base_env: &EnvMap,
+    ) -> Result<EnvMap> {
+        let mut ctx = config.tera_ctx.clone();
+        ctx.insert("env", base_env);
+        ctx.insert("tools", &self.build_tools_tera_map(config));
+        let env_results = self
+            .load_post_env(config, ctx, base_env, ToolsFilter::ToolsOnlyVals)
+            .await?;
+        Ok(env_results
+            .env
+            .into_iter()
+            .map(|(k, (v, _))| (k, v))
+            .collect())
+    }
+}

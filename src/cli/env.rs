@@ -1,0 +1,361 @@
+use eyre::Result;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
+
+use crate::args::ToolArg;
+use crate::config::Config;
+use crate::env_diff::EnvMap;
+use crate::shell::{ShellType, get_shell};
+use crate::toolset::{InstallOptions, Toolset, ToolsetBuilder};
+use crate::wildcard::wildcard_match;
+use indexmap::IndexSet;
+
+/// Print the environment for the current configuration
+///
+/// Evaluate the shell output to load tools and variables once, without installing
+/// prompt hooks. Changing directories afterward does not recompute this environment.
+/// Use `mise exec -- command` to apply it to one child process instead.
+///
+/// JSON, dotenv, and shell output contain actual variable values, including secrets.
+/// `--redacted` selects variables marked for redaction; it does not mask their values.
+/// Tools you pass as TOOL@VERSION arguments are installed first if they are missing;
+/// missing tools from the config are reported, not installed.
+#[derive(Debug, usage_rs::Args)]
+#[usage(
+    visible_alias = "e",
+    verbatim_doc_comment,
+    example(
+        r#"eval "$(mise env -s bash)""#,
+        help = "Load the environment once into the current bash session"
+    ),
+    example(r#"eval "$(mise env -s zsh)""#, help = "Same, for zsh"),
+    example("mise env -s fish | source", help = "Same, for fish"),
+    example("execx($(mise env -s xonsh))", help = "Same, for xonsh"),
+    example("mise env --json", help = "Print the variables as JSON"),
+    example(
+        "mise env --paths",
+        help = "List the PATH entries mise manages, such as tool bin directories"
+    ),
+    example(
+        "mise env --dotenv > .env",
+        help = "Write a dotenv file; it contains secret values"
+    )
+)]
+pub(crate) struct Env {
+    /// Tools to include in addition to those in the config, such as `node@24`
+    #[usage(value_name = "TOOL@VERSION")]
+    tool: Vec<ToolArg>,
+
+    /// Output in dotenv format
+    ///
+    /// Values are quoted and escaped where needed so mise reads them back unchanged. Tools that
+    /// do not interpret quotes, such as Docker `--env-file`, receive them literally.
+    #[usage(long, short = 'D', overrides = "shell")]
+    dotenv: bool,
+
+    /// Output in JSON format
+    #[usage(long, short = 'J', overrides = "shell")]
+    json: bool,
+
+    /// Shell type to generate environment variables for
+    #[usage(long, short, overrides = "json", value_enum)]
+    shell: Option<ShellType>,
+
+    /// Output in JSON format with additional information (source, tool)
+    #[usage(long, overrides = "shell")]
+    json_extended: bool,
+
+    /// Only include variables marked for redaction; their values are printed unmasked
+    #[usage(long)]
+    redacted: bool,
+
+    /// Only show values of environment variables
+    #[usage(long)]
+    values: bool,
+
+    /// Print the PATH entries mise manages, in PATH order, one per line
+    #[usage(long)]
+    paths: bool,
+}
+
+impl Env {
+    pub(crate) async fn run(self) -> Result<()> {
+        let mut config = Config::get().await?;
+        let mut ts = ToolsetBuilder::new()
+            .with_args(&self.tool)
+            .with_deferred_lazy_resolution()
+            .build(&config)
+            .await?;
+        let (_, missing) = ts
+            .install_missing_versions(&mut config, &InstallOptions::default())
+            .await?;
+        // The printed environment places the shim farms on PATH for lazy
+        // declarations, so evaluating it must leave working bootstrap shims
+        // behind: an eval'd shell has no command-not-found handler to fall
+        // back on (discussion #12678).
+        if ts.has_lazy_declarations()
+            && let Err(err) = crate::shims::ensure_lazy_shims(&missing).await
+        {
+            warn!("failed to create shims for lazy tools: {err:#}");
+        }
+        ts.notify_missing_versions(missing);
+
+        if self.paths {
+            for path in ts.managed_path_entries(&config).await? {
+                miseprintln!("{}", path.display());
+            }
+            return Ok(());
+        }
+
+        // Pre-compute final_env when needed by --redacted or --dotenv to
+        // avoid calling it twice. final_env includes the tools-only pass
+        // whose redactions are not in config.env_results().
+        let final_env = if self.redacted || self.dotenv {
+            Some(ts.final_env(&config).await?)
+        } else {
+            None
+        };
+
+        let redacted_keys = if self.redacted {
+            let env_results = config.env_results().await?;
+            let mut patterns = IndexSet::new();
+            patterns.extend(env_results.redactions.clone());
+            // `redact = false` exempts a key from `redactions` patterns everywhere else
+            // (task output, CI masking), so it must not be selected here either.
+            let mut exclusions = env_results.redaction_exclusions.clone();
+            if let Some((_, ref tools_env_results)) = final_env {
+                patterns.extend(tools_env_results.redactions.clone());
+                // A tools-aware assignment overrides a config-level exclusion, as a task
+                // assignment does in the task context builder.
+                for key in tools_env_results.env.keys() {
+                    exclusions.remove(key);
+                }
+                exclusions.extend(tools_env_results.redaction_exclusions.iter().cloned());
+            }
+            patterns.extend(config.redaction_keys());
+            Some(RedactedKeys {
+                patterns,
+                exclusions,
+            })
+        } else {
+            None
+        };
+
+        if self.json {
+            self.output_json(&config, ts, &redacted_keys).await
+        } else if self.json_extended {
+            self.output_extended_json(&config, ts, &redacted_keys).await
+        } else if self.dotenv {
+            self.output_dotenv(final_env.unwrap().0, &redacted_keys)
+        } else if self.values {
+            self.output_values(&config, ts, &redacted_keys).await
+        } else {
+            self.output_shell(&config, ts, &redacted_keys).await
+        }
+    }
+
+    async fn output_json(
+        &self,
+        config: &Arc<Config>,
+        ts: Toolset,
+        redacted_keys: &Option<RedactedKeys>,
+    ) -> Result<()> {
+        let mut env = ts.env_with_path(config).await?;
+
+        if let Some(keys) = redacted_keys {
+            env.retain(|k, _| keys.matches(k));
+        }
+
+        miseprintln!("{}", serde_json::to_string_pretty(&env)?);
+        Ok(())
+    }
+
+    async fn output_extended_json(
+        &self,
+        config: &Arc<Config>,
+        ts: Toolset,
+        redacted_keys: &Option<RedactedKeys>,
+    ) -> Result<()> {
+        let mut res = BTreeMap::new();
+
+        ts.env_with_path(config).await?.iter().for_each(|(k, v)| {
+            res.insert(k.to_string(), BTreeMap::from([("value", v.to_string())]));
+        });
+
+        config.env_with_sources().await?.iter().for_each(|(k, v)| {
+            res.insert(
+                k.to_string(),
+                BTreeMap::from([
+                    ("value", v.0.to_string()),
+                    ("source", v.1.to_string_lossy().into_owned()),
+                ]),
+            );
+        });
+
+        let tool_map: BTreeMap<String, String> = ts
+            .list_all_versions(config)
+            .await?
+            .into_iter()
+            .map(|(b, tv)| {
+                (
+                    b.id().into(),
+                    tv.request
+                        .source()
+                        .path()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "".to_string()),
+                )
+            })
+            .collect();
+
+        ts.env_from_tools(config)
+            .await
+            .iter()
+            .for_each(|(name, value, tool_id)| {
+                res.insert(
+                    name.to_string(),
+                    BTreeMap::from([
+                        ("value", value.to_string()),
+                        ("tool", tool_id.to_string()),
+                        (
+                            "source",
+                            tool_map
+                                .get(tool_id)
+                                .cloned()
+                                .unwrap_or_else(|| "unknown_source".to_string()),
+                        ),
+                    ]),
+                );
+            });
+
+        if let Some(keys) = redacted_keys {
+            res.retain(|k, _| keys.matches(k));
+        }
+
+        miseprintln!("{}", serde_json::to_string_pretty(&res)?);
+        Ok(())
+    }
+
+    async fn output_shell(
+        &self,
+        config: &Arc<Config>,
+        ts: Toolset,
+        redacted_keys: &Option<RedactedKeys>,
+    ) -> Result<()> {
+        let default_shell = get_shell(Some(fallback_shell())).unwrap();
+        let shell = get_shell(self.shell).unwrap_or(default_shell);
+        let (mut env, mut env_remove) = ts.env_with_path_and_removals(config).await?;
+
+        if let Some(keys) = redacted_keys {
+            env.retain(|k, _| keys.matches(k));
+            env_remove.retain(|k| keys.matches(k));
+        }
+
+        for k in env_remove {
+            miseprint!("{}", shell.unset_env(&k))?;
+        }
+        for (k, v) in env {
+            let k = k.to_string();
+            let v = v.to_string();
+            miseprint!("{}", shell.set_env(&k, &v))?;
+        }
+        Ok(())
+    }
+
+    fn output_dotenv(&self, mut env: EnvMap, redacted_keys: &Option<RedactedKeys>) -> Result<()> {
+        if let Some(keys) = redacted_keys {
+            env.retain(|k, _| keys.matches(k));
+        }
+
+        // Render everything first so one unrepresentable name does not leave a partial file.
+        let lines = env
+            .iter()
+            .map(|(k, v)| {
+                mise_dotenv::render_var_for_substitution(k, v)
+                    .map_err(|e| eyre::eyre!("cannot write {k} as dotenv: {e}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for line in lines {
+            miseprint!("{line}\n")?;
+        }
+        Ok(())
+    }
+
+    async fn output_values(
+        &self,
+        config: &Arc<Config>,
+        ts: Toolset,
+        redacted_keys: &Option<RedactedKeys>,
+    ) -> Result<()> {
+        let mut env = ts.env_with_path(config).await?;
+
+        if let Some(keys) = redacted_keys {
+            env.retain(|k, _| keys.matches(k));
+        }
+
+        for (_, v) in env {
+            miseprintln!("{}", v);
+        }
+        Ok(())
+    }
+}
+
+/// The keys `--redacted` selects: those matching a redaction pattern, minus the ones a
+/// `redact = false` directive exempts.
+struct RedactedKeys {
+    patterns: IndexSet<String>,
+    exclusions: BTreeSet<String>,
+}
+
+impl RedactedKeys {
+    fn matches(&self, key: &str) -> bool {
+        !self.exclusions.contains(key)
+            && self
+                .patterns
+                .iter()
+                .any(|pattern| wildcard_match(key, pattern))
+    }
+}
+
+/// The shell to emit for when there is nothing to detect from.
+///
+/// Detection is `MISE_SHELL`, then `SHELL`. On unix that always resolves — an unset `SHELL` falls
+/// back to `sh` — so this is reached only on Windows, where PowerShell and cmd set neither and the
+/// value mise would otherwise read, `COMSPEC`, names cmd.exe. mise has no cmd implementation, so
+/// bash was being printed into a PowerShell session:
+///
+/// ```console
+/// PS> mise env
+/// export MY_PATH='C:\Users\me'
+/// ```
+///
+/// pwsh is the only shell mise can emit for that a Windows user is likely to be in. It is not
+/// right for a cmd user, but neither was bash, and there is no third answer available.
+fn fallback_shell() -> ShellType {
+    match cfg!(windows) {
+        true => ShellType::Pwsh,
+        false => ShellType::Bash,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Asserted on the output rather than on the enum, which would only restate the `cfg!` above.
+    /// What matters is that the syntax is one the platform's shell can run.
+    #[test]
+    fn the_fallback_emits_syntax_this_platform_can_run() {
+        let line = fallback_shell().as_shell().set_env("K", "V");
+
+        if cfg!(windows) {
+            // `export K=V` is what a PowerShell session used to be handed.
+            assert!(!line.starts_with("export "), "{line}");
+            assert!(line.contains("${Env:K}"), "{line}");
+        } else {
+            assert!(line.starts_with("export "), "{line}");
+        }
+    }
+}

@@ -1,0 +1,3 @@
+backends = ["vfox:jdx/vfox-oci"]
+description = "Oracle Cloud Infrastructure CLI"
+version_order = "semver"

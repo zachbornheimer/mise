@@ -1,0 +1,1366 @@
+use std::path::PathBuf;
+
+use crate::file::replace_path;
+
+#[cfg(target_os = "linux")]
+mod landlock;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "linux")]
+mod seccomp;
+
+/// Configuration for process sandboxing.
+///
+/// Any `deny_*` or `allow_*` field being set implicitly enables sandboxing.
+/// `allow_*` fields imply their corresponding `deny_*` (e.g., `allow_write` implies `deny_write`
+/// for everything not in the allow list).
+#[derive(Debug, Clone, Default)]
+pub struct SandboxConfig {
+    pub deny_read: bool,
+    pub deny_write: bool,
+    pub deny_net: bool,
+    /// Block connections to Unix sockets outside the sandbox (Linux 7.1 or later).
+    pub deny_unix: bool,
+    pub deny_env: bool,
+    /// Block child-process creation. Internal-only: task/CLI sandboxes leave this disabled.
+    pub deny_process: bool,
+    /// Do not apply the normal writable-temp-directory exception.
+    pub deny_temp_write: bool,
+    pub allow_read: Vec<PathBuf>,
+    pub allow_write: Vec<PathBuf>,
+    pub allow_net: Vec<String>,
+    /// Unix sockets that stay reachable under `deny_unix`; implies it.
+    pub allow_unix: Vec<PathBuf>,
+    pub allow_env: Vec<String>,
+    /// Environment patterns that survive an active env sandbox without enabling it themselves.
+    pub pass_through_env: Vec<String>,
+    /// Exact hashed environment names that survive an active env sandbox.
+    pub cache_env: Vec<String>,
+    /// Allow-list spellings [`SandboxConfig::resolve_paths`] replaced with a
+    /// canonical target, for the entries that had one.
+    ///
+    /// Seatbelt matches a rule against the canonical path, so a caller reaching
+    /// an allowed directory through the symlink it was named by still has to
+    /// `lstat` the link and the directories above it. Only the macOS profile
+    /// needs this — Landlock resolves paths itself and restricts neither the
+    /// walk nor `stat`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub symlinked_allow_paths: Vec<PathBuf>,
+}
+
+/// Minimal env vars inherited when deny_env is active.
+const DEFAULT_ENV_KEYS: &[&str] = &["PATH", "HOME", "USER", "SHELL", "TERM", "COLORTERM", "LANG"];
+
+/// What a Windows process needs to start and run normally, kept under deny_env alongside
+/// [`DEFAULT_ENV_KEYS`]:
+///
+/// - `SystemRoot`: system DLLs (Winsock, CryptoAPI, side-by-side assemblies) find their files
+///   through it, so networking, TLS and many programs fail to start without it.
+/// - `SystemDrive` and `windir`: the same directories under the names older programs and
+///   scripts read.
+/// - `ComSpec`: cmd.exe, which runs `.bat`/`.cmd` files and `cmd /c` commands.
+/// - `PATHEXT`: the extensions cmd and other shells try when a command is named without one.
+/// - `TEMP` and `TMP`: without them `GetTempPath` returns the Windows directory, which a normal
+///   user cannot write.
+/// - `USERPROFILE` and `USERNAME`: the Windows spellings of `HOME` and `USER`.
+#[cfg(windows)]
+const WINDOWS_ENV_KEYS: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "ComSpec",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "USERNAME",
+];
+
+/// Every variable deny_env keeps from the parent environment.
+fn essential_env_keys() -> impl Iterator<Item = &'static str> {
+    let keys = DEFAULT_ENV_KEYS.iter();
+    #[cfg(windows)]
+    let keys = keys.chain(WINDOWS_ENV_KEYS);
+    keys.copied()
+}
+
+/// Whether two variable names name the same variable: on Windows names are case-insensitive,
+/// so `Path` is `PATH`.
+fn same_env_key(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// The closest ancestor that exists, and so the only one a Landlock rule can
+/// name.
+///
+/// `parent()` is not enough: for `a/b/c` where `a/b` is missing too, allowing
+/// `a/b` would be dropped for exactly the same reason.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn nearest_existing_ancestor(path: &std::path::Path) -> Option<&std::path::Path> {
+    // Confirmed to exist, not merely "no error saying otherwise": pointing the
+    // user at a directory we could not stat would be the same unchecked claim.
+    path.ancestors()
+        .skip(1)
+        .find(|ancestor| matches!(ancestor.try_exists(), Ok(true)))
+}
+
+/// Fold `.` and `..` so two spellings of one missing path are reported once.
+///
+/// Only ever a deduplication key, never displayed. A path that does not exist
+/// cannot be canonicalized, so this is lexical: if a `..` crosses a symlink the
+/// fold is not what the kernel would resolve. The cost of being wrong is one
+/// merged warning, so lexical is the right trade here.
+fn dedup_key(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// The directories [`check_symlinks_stay_in_roots`] guards: the cwd and the
+/// given project roots, canonical so a comparison is not fooled by a symlink
+/// above them.
+///
+/// The home directory and its ancestors are left out. They are not a checkout
+/// whose contents the confined code chose, and links there, such as `~/.npm`
+/// on another disk, are the user's own.
+#[cfg(unix)]
+fn symlink_check_roots(cwd: &std::path::Path, project_roots: &[&std::path::Path]) -> Vec<PathBuf> {
+    let home: &std::path::Path = &crate::dirs::HOME;
+    let mut roots: Vec<PathBuf> = std::iter::once(cwd)
+        .chain(project_roots.iter().copied())
+        .filter_map(|root| root.canonicalize().ok())
+        .filter(|root| {
+            !file_identity(root).is_some_and(|root| is_within(home, &root, file_identity))
+        })
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Which file a path names, independent of how it is spelled: a
+/// case-insensitive volume (the macOS default) accepts `PROJECT` for
+/// `project`, so comparing spellings would miss that both are one directory.
+#[cfg(unix)]
+fn file_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// Whether `path` or one of its ancestors is the directory identified by `dir`.
+#[cfg(unix)]
+fn is_within<I: PartialEq>(
+    path: &std::path::Path,
+    dir: &I,
+    identity: impl Fn(&std::path::Path) -> Option<I>,
+) -> bool {
+    path.ancestors()
+        .any(|ancestor| identity(ancestor).as_ref() == Some(dir))
+}
+
+/// Refuse an allow-list path when a symlink inside one of `roots` leads out of
+/// that root on the way to it.
+///
+/// The roots hold the code being confined, so its author decides what the
+/// names in them are. Symlinks outside the roots are followed as before
+/// (`/var` -> `/private/var` on macOS), and so is a link that stays in its
+/// root. This walks the path the way the kernel will, so the check does not
+/// depend on how the path was spelled: relative, absolute, through `..`, or
+/// from a template. Containment is decided by file identity, not by comparing
+/// spellings, which a case-insensitive volume would defeat.
+#[cfg(unix)]
+fn check_symlinks_stay_in_roots(path: &std::path::Path, roots: &[PathBuf]) -> eyre::Result<()> {
+    check_symlinks_stay_in_roots_by(path, roots, file_identity)
+}
+
+/// [`check_symlinks_stay_in_roots`] with the notion of "same directory"
+/// passed in, so tests can model a case-insensitive volume.
+#[cfg(unix)]
+fn check_symlinks_stay_in_roots_by<I: PartialEq>(
+    path: &std::path::Path,
+    roots: &[PathBuf],
+    identity: impl Fn(&std::path::Path) -> Option<I> + Copy,
+) -> eyre::Result<()> {
+    use std::path::Component;
+    let roots: Vec<(&PathBuf, I)> = roots
+        .iter()
+        .filter_map(|root| identity(root).map(|id| (root, id)))
+        .collect();
+    let mut resolved = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => resolved.push(component),
+            Component::CurDir => {}
+            // `resolved` holds no symlinks, so `..` is its parent.
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => {
+                let candidate = resolved.join(name);
+                match std::fs::symlink_metadata(&candidate) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        // A dangling link grants nothing: like a missing path,
+                        // its Landlock rule is dropped.
+                        let Ok(target) = candidate.canonicalize() else {
+                            return Ok(());
+                        };
+                        // The link sits in a root when its directory is the
+                        // root or below it; it stays there when its target does.
+                        let link_dir = candidate.parent().unwrap_or(&candidate);
+                        if let Some((root, _)) = roots.iter().find(|(_, root)| {
+                            is_within(link_dir, root, identity)
+                                && !is_within(&target, root, identity)
+                        }) {
+                            eyre::bail!(
+                                "sandbox: {} leads out of {} through the symlink {} -> {}.\n\
+                                 A project can ship such a link to widen what the sandbox allows. \
+                                 To allow the target anyway, name it directly: {}",
+                                crate::file::display_path(path),
+                                crate::file::display_path(root),
+                                crate::file::display_path(&candidate),
+                                crate::file::display_path(&target),
+                                crate::file::display_path(&target),
+                            );
+                        }
+                        resolved = target;
+                    }
+                    Ok(_) => resolved = candidate,
+                    // Nothing below a missing entry to follow.
+                    Err(_) => return Ok(()),
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check if an env var name matches an allow_env pattern.
+/// Patterns can contain `*` as a wildcard (e.g., `MYAPP_*` matches `MYAPP_FOO`).
+/// Patterns without `*` require an exact match. On Windows, where names are case-insensitive,
+/// so is the match: `appdata*` matches `APPDATA`.
+fn env_pattern_matches(pattern: &str, key: &str) -> bool {
+    if cfg!(windows) {
+        env_pattern_matches_exactly(&pattern.to_ascii_uppercase(), &key.to_ascii_uppercase())
+    } else {
+        env_pattern_matches_exactly(pattern, key)
+    }
+}
+
+/// [`env_pattern_matches`], comparing names exactly as written.
+fn env_pattern_matches_exactly(pattern: &str, key: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == key;
+    }
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 2 {
+        // Common case: single wildcard (prefix*, *suffix, or prefix*suffix)
+        let (prefix, suffix) = (parts[0], parts[1]);
+        return prefix.len() + suffix.len() <= key.len()
+            && key.starts_with(prefix)
+            && key.ends_with(suffix);
+    }
+    // Multiple wildcards: use globset
+    globset::Glob::new(pattern)
+        .map(|g| g.compile_matcher().is_match(key))
+        .unwrap_or(false)
+}
+
+impl SandboxConfig {
+    /// Build sandbox configuration by combining persistent deny settings with CLI options.
+    pub fn from_settings_and_cli(
+        settings: &mise_settings::SettingsSandbox,
+        cli_deny_all: bool,
+        mut cli: Self,
+    ) -> Self {
+        cli.deny_read |= settings.deny_all || settings.deny_read || cli_deny_all;
+        cli.deny_write |= settings.deny_all || settings.deny_write || cli_deny_all;
+        cli.deny_net |= settings.deny_all || settings.deny_net || cli_deny_all;
+        cli.deny_env |= settings.deny_all || settings.deny_env || cli_deny_all;
+        cli
+    }
+
+    /// Returns true if any sandbox restriction is configured.
+    pub fn is_active(&self) -> bool {
+        self.effective_deny_env() || self.restricts_more_than_env()
+    }
+
+    /// Returns true if a file, network or process restriction is configured. Windows applies
+    /// only the environment filter, and warns when anything else was asked for.
+    pub fn restricts_more_than_env(&self) -> bool {
+        self.deny_read
+            || self.deny_write
+            || self.deny_net
+            || self.effective_deny_unix()
+            || self.deny_process
+            || self.deny_temp_write
+            || !self.allow_read.is_empty()
+            || !self.allow_write.is_empty()
+            || !self.allow_net.is_empty()
+    }
+
+    /// Resolve allow_* paths to absolute paths relative to cwd.
+    ///
+    /// `project_roots` are directories whose contents the code being confined
+    /// may have written, such as the project and task directories; the cwd is
+    /// always one. An allowed path that a symlink inside one of them leads out
+    /// of it is refused: a checkout that ships `dist -> /` would otherwise turn
+    /// `--allow-write=./dist` into write access to everything.
+    pub fn resolve_paths(&mut self, project_roots: &[&std::path::Path]) -> eyre::Result<()> {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        #[cfg(unix)]
+        let roots = symlink_check_roots(&cwd, project_roots);
+        #[cfg(not(unix))]
+        let _ = project_roots;
+        // An allow list implies its deny. Record that before empty entries are
+        // dropped, or a list holding nothing else (`--allow-write="$UNSET"`)
+        // would lift the restriction instead of allowing nothing.
+        self.deny_read |= !self.allow_read.is_empty();
+        self.deny_write |= !self.allow_write.is_empty();
+        self.deny_unix |= !self.allow_unix.is_empty();
+        // Keep the spelling a canonicalization replaces. It is the one a caller
+        // inside the sandbox will use, and macOS has to let a walk take that
+        // route — see `symlinked_allow_paths`.
+        let mut symlinked = Vec::new();
+        let mut resolve = |paths: &mut Vec<PathBuf>| -> eyre::Result<()> {
+            paths.retain(|p| !p.as_os_str().is_empty());
+            for p in paths.iter_mut() {
+                *p = replace_path(&*p);
+                if p.is_relative() {
+                    *p = cwd.join(&*p);
+                }
+                // `Path` equality ignores `.` components, so `./dist` would
+                // reach the profile as `<cwd>/./dist`, which Seatbelt never
+                // matches against the canonical path it checks. Drop them.
+                // A trailing `/` still demands a directory, so keep it when
+                // the path exists and is not one (`./config/` naming a file stays
+                // refused). A missing path loses it, so it matches once created.
+                let bytes = p.as_os_str().as_encoded_bytes();
+                let wants_dir = bytes.ends_with(b"/") || bytes.ends_with(b"/.");
+                *p = p.components().collect();
+                if wants_dir && p.exists() && !p.is_dir() {
+                    p.push("");
+                }
+                #[cfg(unix)]
+                check_symlinks_stay_in_roots(p, &roots)?;
+                // Canonicalize to resolve symlinks (e.g., /var -> /private/var on macOS)
+                if let Ok(canonical) = p.canonicalize()
+                    && canonical != *p
+                {
+                    debug!(
+                        "sandbox: {} resolves to {}",
+                        crate::file::display_path(&*p),
+                        crate::file::display_path(&canonical)
+                    );
+                    symlinked.push(std::mem::replace(p, canonical));
+                }
+            }
+            Ok(())
+        };
+        resolve(&mut self.allow_read)?;
+        resolve(&mut self.allow_write)?;
+        resolve(&mut self.allow_unix)?;
+        self.symlinked_allow_paths = symlinked;
+        Ok(())
+    }
+
+    /// Compute effective deny flags, accounting for allow_* implying deny_*.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn effective_deny_read(&self) -> bool {
+        self.deny_read || !self.allow_read.is_empty()
+    }
+
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn effective_deny_write(&self) -> bool {
+        self.deny_write || !self.allow_write.is_empty()
+    }
+
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn effective_deny_net(&self) -> bool {
+        self.deny_net || !self.allow_net.is_empty()
+    }
+
+    pub fn effective_deny_unix(&self) -> bool {
+        self.deny_unix || !self.allow_unix.is_empty()
+    }
+
+    pub fn effective_deny_env(&self) -> bool {
+        self.deny_env || !self.allow_env.is_empty()
+    }
+
+    /// Refuse per-host network exceptions, which no supported sandbox can enforce.
+    ///
+    /// seccomp sees sockets, not destinations, and Seatbelt's `remote ip` filter
+    /// accepts only `*` or `localhost` as the host: `sandbox-exec` rejects a
+    /// profile naming any other address with `host must be * or localhost in
+    /// network address`. Fail before building anything rather than run a
+    /// command whose sandbox cannot start.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    pub fn reject_allow_net(&self) -> eyre::Result<()> {
+        if !self.allow_net.is_empty() {
+            let platform = if cfg!(target_os = "macos") {
+                "macOS"
+            } else {
+                "Linux"
+            };
+            eyre::bail!(
+                "per-host network filtering (--allow-net=<host>) is not supported on {platform}. \
+                 Use --deny-net to block all network, or remove --allow-net."
+            );
+        }
+        Ok(())
+    }
+
+    /// Refuse Unix socket restrictions where the platform cannot enforce them.
+    ///
+    /// Only Landlock on Linux 7.1 or later can tell one socket from another;
+    /// running without the restriction would hand the command the very access
+    /// it was asked to lose.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn reject_unix_sockets(&self) -> eyre::Result<()> {
+        if self.effective_deny_unix() {
+            eyre::bail!(
+                "Unix socket restrictions (--deny-unix, --allow-unix) are only supported on Linux 7.1 or later"
+            );
+        }
+        Ok(())
+    }
+
+    /// Allow-list paths that do not exist, in declaration order and listed once
+    /// even when named by both `allow_read` and `allow_write`.
+    ///
+    /// Landlock binds a rule to an open descriptor, so it cannot name a path
+    /// that is not there yet and the rule is dropped — see
+    /// <https://github.com/jdx/mise/discussions/10556>. Not gated on Linux:
+    /// this is only a set of existence checks, and keeping it portable keeps it
+    /// testable on any host.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn missing_allow_paths(&self) -> Vec<&std::path::Path> {
+        let mut seen = std::collections::HashSet::new();
+        self.allow_read
+            .iter()
+            .chain(self.allow_write.iter())
+            .chain(self.allow_unix.iter())
+            // Only paths confirmed absent. `exists()` would fold a metadata
+            // error — no listing permission on a parent, say — into "missing"
+            // and report a cause nothing checked, which is the habit this whole
+            // change is removing. Those land in `add_path_rule` instead.
+            .filter(|path| matches!(path.try_exists(), Ok(false)))
+            .filter(|path| seen.insert(dedup_key(path)))
+            .map(|path| path.as_path())
+            .collect()
+    }
+
+    /// Report dropped rules before the sandbox starts denying things.
+    ///
+    /// Reported from the parent rather than from `add_path_rule`, which runs
+    /// inside `pre_exec` — after fork, where the logger is not available and
+    /// the same path warns once per allow-list it appears in.
+    #[cfg(target_os = "linux")]
+    pub fn warn_missing_allow_paths(&self) {
+        for path in self.missing_allow_paths() {
+            let workaround = match nearest_existing_ancestor(path) {
+                Some(dir) => format!(
+                    "To let the task create it, allow a directory that does exist — the closest is {}.",
+                    crate::file::display_path(dir)
+                ),
+                None => {
+                    "To let the task create it, allow a directory that does exist and contains it."
+                        .to_string()
+                }
+            };
+            warn!(
+                "sandbox: {} does not exist, so its rule was dropped.\n\
+                 Landlock can only bind rules to paths that already exist. {workaround}",
+                crate::file::display_path(path)
+            );
+        }
+    }
+
+    /// Whether `filter_env` lets the variable `key` through: always without `deny_env`,
+    /// otherwise only the essential keys, `cache_env` and `allow_env`/`pass_through_env`
+    /// patterns.
+    pub fn keeps_env_key(&self, key: &str) -> bool {
+        if !self.effective_deny_env() {
+            return true;
+        }
+        essential_env_keys().any(|essential| same_env_key(essential, key))
+            || self.cache_env.iter().any(|name| same_env_key(name, key))
+            || self
+                .allow_env
+                .iter()
+                .chain(&self.pass_through_env)
+                .any(|pattern| env_pattern_matches(pattern, key))
+    }
+
+    /// Filter environment variables based on sandbox config.
+    ///
+    /// When deny_env is active, starts with the mise-computed env (tool paths etc.),
+    /// keeps only essential vars + allow_env entries, and also pulls in allow_env
+    /// vars from the parent process environment if not already present.
+    pub fn filter_env(
+        &self,
+        env: &std::collections::BTreeMap<String, String>,
+    ) -> std::collections::BTreeMap<String, String> {
+        if !self.effective_deny_env() {
+            return env.clone();
+        }
+        let mut filtered: std::collections::BTreeMap<String, String> = env
+            .iter()
+            .filter(|(k, _)| self.keeps_env_key(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        // A name already kept under another spelling (Windows `Path` for `PATH`) is the same
+        // variable, and must not be added again.
+        let has_key = |filtered: &std::collections::BTreeMap<String, String>, key: &str| {
+            filtered.keys().any(|k| same_env_key(k, key))
+        };
+        // Pull in allowed vars from parent env that might not be in mise's env map.
+        // For wildcard patterns, check all parent env vars; for exact names, check directly.
+        for pattern in self.allow_env.iter().chain(&self.pass_through_env) {
+            if pattern.contains('*') {
+                for (key, val) in crate::env::vars_safe() {
+                    if !has_key(&filtered, &key) && env_pattern_matches(pattern, &key) {
+                        filtered.insert(key, val);
+                    }
+                }
+            } else if !has_key(&filtered, pattern)
+                && let Ok(val) = std::env::var(pattern)
+            {
+                filtered.insert(pattern.clone(), val);
+            }
+        }
+        for key in &self.cache_env {
+            if !has_key(&filtered, key)
+                && let Ok(val) = std::env::var(key)
+            {
+                filtered.insert(key.clone(), val);
+            }
+        }
+        // Also ensure essential vars from parent env are present
+        for key in essential_env_keys() {
+            if !has_key(&filtered, key)
+                && let Ok(val) = std::env::var(key)
+            {
+                filtered.insert(key.to_string(), val);
+            }
+        }
+        filtered
+    }
+
+    /// Apply filesystem and network sandboxing before exec (for `mise x`).
+    ///
+    /// On Linux: applies Landlock rules and seccomp filters in-process (inherited across exec).
+    /// On macOS: returns a modified command that wraps through sandbox-exec.
+    #[allow(unused_variables)]
+    pub async fn apply(
+        &self,
+        program: &str,
+        args: &[String],
+    ) -> eyre::Result<Option<SandboxedCommand>> {
+        if !self.is_active() {
+            return Ok(None);
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            self.warn_missing_allow_paths();
+            self.apply_linux(program)?;
+            Ok(None)
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            self.apply_macos(program, args)
+        }
+
+        // The caller filters the environment itself (`filter_env`), so an
+        // env-only sandbox is fully applied here.
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            if self.restricts_more_than_env() {
+                warn!(
+                    "sandbox file, network and process restrictions are not supported on this platform, running without them"
+                );
+            }
+            Ok(None)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn apply_linux(&self, program: &str) -> eyre::Result<()> {
+        if self.effective_deny_read()
+            || self.effective_deny_write()
+            || self.effective_deny_unix()
+            || self.deny_process
+        {
+            landlock::apply_landlock(self, Some(std::path::Path::new(program)))?;
+        }
+        if self.effective_deny_net() || self.deny_process {
+            self.reject_allow_net()?;
+            seccomp::apply_seccomp_filter(self.effective_deny_net(), self.deny_process)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn apply_macos(
+        &self,
+        program: &str,
+        args: &[String],
+    ) -> eyre::Result<Option<SandboxedCommand>> {
+        self.reject_allow_net()?;
+        self.reject_unix_sockets()?;
+        let profile = macos::generate_seatbelt_profile(self, Some(std::path::Path::new(program)));
+        let mut sandbox_args = vec![
+            "-p".to_string(),
+            profile,
+            "--".to_string(),
+            program.to_string(),
+        ];
+        sandbox_args.extend(args.iter().cloned());
+        Ok(Some(SandboxedCommand {
+            program: SANDBOX_EXEC.to_string(),
+            args: sandbox_args,
+        }))
+    }
+}
+
+/// A command rewritten to run through a sandbox wrapper (macOS sandbox-exec).
+#[derive(Debug)]
+pub struct SandboxedCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// The system Seatbelt wrapper (macOS).
+///
+/// Absolute because the wrapper is started with the `PATH` built for the
+/// command being sandboxed, where tool bin directories and `_.path` entries
+/// come before `/usr/bin`: a bare name would let that command ship its own
+/// `sandbox-exec` and run unconfined.
+pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
+
+// Public functions for use by cmd.rs (which can't access private submodules)
+
+/// Keep the variables an env sandbox withholds out of reach through mise's own
+/// process (Linux only).
+///
+/// The filter only shapes the child's environment. mise itself still holds the
+/// full one, and a child running as the same user can read it from
+/// `/proc/<mise pid>/environ` or attach to mise with ptrace. A non-dumpable
+/// process's `/proc` entries belong to root and it cannot be attached to
+/// without `CAP_SYS_PTRACE`, which closes both routes for an unprivileged
+/// child. The flag stays for the rest of this mise process; `execve` resets
+/// it, so the commands mise starts are unaffected.
+#[cfg(target_os = "linux")]
+pub fn hide_environment_from_children() -> eyre::Result<()> {
+    let ret = unsafe { nix::libc::prctl(nix::libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+    if ret != 0 {
+        eyre::bail!(
+            "sandbox: failed to hide mise's environment from the sandboxed command: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
+
+/// Check that the running kernel's Landlock can enforce `config` (Linux only).
+#[cfg(target_os = "linux")]
+pub fn landlock_check(config: &SandboxConfig) -> eyre::Result<()> {
+    landlock::check_kernel_support(config)
+}
+
+/// Apply Landlock filesystem restrictions (Linux only).
+#[cfg(target_os = "linux")]
+pub fn landlock_apply(
+    config: &SandboxConfig,
+    initial_program: &std::path::Path,
+) -> eyre::Result<()> {
+    landlock::apply_landlock(config, Some(initial_program))
+}
+
+/// Apply seccomp network/process filter (Linux only).
+#[cfg(target_os = "linux")]
+pub fn seccomp_apply(deny_net: bool, deny_process: bool) -> eyre::Result<()> {
+    seccomp::apply_seccomp_filter(deny_net, deny_process)
+}
+
+/// Generate a macOS Seatbelt profile string (macOS only).
+#[cfg(target_os = "macos")]
+pub fn macos_generate_profile(config: &SandboxConfig, program: &std::path::Path) -> String {
+    macos::generate_seatbelt_profile(config, Some(program))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SandboxConfig;
+
+    #[test]
+    fn keeps_env_key_matches_filter_env() {
+        let open = SandboxConfig::default();
+        assert!(open.keeps_env_key("ANYTHING"));
+        let deny = SandboxConfig {
+            deny_env: true,
+            ..Default::default()
+        };
+        assert!(deny.keeps_env_key("PATH"));
+        assert!(!deny.keeps_env_key("DEPLOY_KEY"));
+        let allow = SandboxConfig {
+            allow_env: vec!["DEPLOY_*".into()],
+            pass_through_env: vec!["TOKEN".into()],
+            cache_env: vec!["CACHED".into()],
+            ..Default::default()
+        };
+        assert!(allow.keeps_env_key("DEPLOY_KEY"));
+        assert!(allow.keeps_env_key("TOKEN"));
+        assert!(allow.keeps_env_key("CACHED"));
+        assert!(!allow.keeps_env_key("OTHER"));
+        let env = std::collections::BTreeMap::from([
+            ("DEPLOY_KEY".to_string(), "1".to_string()),
+            ("OTHER".to_string(), "2".to_string()),
+            ("PATH".to_string(), "3".to_string()),
+        ]);
+        let filtered = allow.filter_env(&env);
+        for key in env.keys() {
+            assert_eq!(
+                filtered.contains_key(key),
+                allow.keeps_env_key(key),
+                "{key}"
+            );
+        }
+    }
+
+    use super::*;
+    use mise_settings::SettingsSandbox;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn test_restricts_more_than_env_ignores_the_env_filter() {
+        let env_only = SandboxConfig {
+            deny_env: true,
+            allow_env: vec!["TOKEN".into()],
+            ..Default::default()
+        };
+        assert!(env_only.is_active());
+        assert!(!env_only.restricts_more_than_env());
+        let read = SandboxConfig {
+            allow_read: vec![PathBuf::from("/data")],
+            ..Default::default()
+        };
+        assert!(read.is_active());
+        assert!(read.restricts_more_than_env());
+    }
+
+    /// Windows names are case-insensitive: mise's own `Path` is the PATH deny_env keeps, and the
+    /// variables a Windows process needs to start survive whatever their spelling.
+    #[cfg(windows)]
+    #[test]
+    fn test_filter_env_keeps_windows_essentials() {
+        let deny = SandboxConfig {
+            deny_env: true,
+            ..Default::default()
+        };
+        for key in [
+            "Path",
+            "SystemRoot",
+            "SYSTEMROOT",
+            "windir",
+            "ComSpec",
+            "PATHEXT",
+            "TEMP",
+            "USERPROFILE",
+        ] {
+            assert!(deny.keeps_env_key(key), "{key}");
+        }
+        assert!(!deny.keeps_env_key("DEPLOY_KEY"));
+        let env = BTreeMap::from([
+            ("Path".to_string(), r"C:\mise\tools".to_string()),
+            ("DEPLOY_KEY".to_string(), "secret".to_string()),
+        ]);
+        let filtered = deny.filter_env(&env);
+        assert_eq!(
+            filtered.get("Path").map(String::as_str),
+            Some(r"C:\mise\tools")
+        );
+        assert!(
+            !filtered
+                .keys()
+                .any(|k| k != "Path" && k.eq_ignore_ascii_case("PATH")),
+            "PATH must not be added again under another spelling: {filtered:?}"
+        );
+        assert!(!filtered.contains_key("DEPLOY_KEY"));
+        let system_root = std::env::var("SystemRoot").expect("SystemRoot is set on Windows");
+        assert_eq!(filtered.get("SystemRoot"), Some(&system_root));
+    }
+
+    /// Windows names are case-insensitive, so `allow_env` patterns and `cache_env` names match
+    /// whatever spelling the environment uses, and a kept name is not added a second time.
+    #[cfg(windows)]
+    #[test]
+    fn test_filter_env_matches_names_case_insensitively_on_windows() {
+        let deny = SandboxConfig {
+            deny_env: true,
+            allow_env: vec!["myapp_*".into(), "token".into()],
+            cache_env: vec!["cache_key".into()],
+            ..Default::default()
+        };
+        for key in ["MYAPP_FOO", "Token", "CACHE_KEY"] {
+            assert!(deny.keeps_env_key(key), "{key}");
+        }
+        assert!(!deny.keeps_env_key("OTHER"));
+        let env = BTreeMap::from([
+            ("MYAPP_FOO".to_string(), "foo".to_string()),
+            ("TOKEN".to_string(), "secret".to_string()),
+            ("CACHE_KEY".to_string(), "cache".to_string()),
+            ("OTHER".to_string(), "other".to_string()),
+        ]);
+        let filtered = deny.filter_env(&env);
+        assert_eq!(filtered.get("MYAPP_FOO").map(String::as_str), Some("foo"));
+        assert_eq!(filtered.get("TOKEN").map(String::as_str), Some("secret"));
+        assert_eq!(filtered.get("CACHE_KEY").map(String::as_str), Some("cache"));
+        assert!(!filtered.contains_key("OTHER"));
+        for name in ["token", "cache_key"] {
+            assert_eq!(
+                filtered
+                    .keys()
+                    .filter(|k| k.eq_ignore_ascii_case(name))
+                    .count(),
+                1,
+                "{name} is kept once: {filtered:?}"
+            );
+        }
+    }
+
+    /// Fixture paths that cannot collide with a previous run or a concurrent one.
+    fn missing_fixture(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("mise-10556-{}-{name}", std::process::id()))
+    }
+
+    #[test]
+    fn test_missing_allow_paths_lists_each_absent_path_once() {
+        // Landlock drops a rule naming a path that is not there yet, and the
+        // same path commonly appears in both allow-lists — the report in
+        // discussion #10556 shows the warning printed twice for one path.
+        let existing = std::env::temp_dir();
+        let missing_a = missing_fixture("a");
+        let missing_b = missing_fixture("b");
+        assert!(existing.exists(), "temp_dir should exist");
+        assert!(!missing_a.exists(), "fixture path should not exist");
+        assert!(!missing_b.exists(), "fixture path should not exist");
+
+        let config = SandboxConfig {
+            allow_read: vec![existing.clone(), missing_a.clone(), missing_b.clone()],
+            allow_write: vec![missing_a.clone(), existing],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.missing_allow_paths(),
+            vec![missing_a.as_path(), missing_b.as_path()]
+        );
+    }
+
+    #[test]
+    fn test_missing_allow_paths_folds_equivalent_spellings() {
+        // A missing path cannot be canonicalized, so `a/../b` and `b` stay
+        // distinct to `Path` and would each warn.
+        let missing = missing_fixture("dotdot");
+        let detoured = std::env::temp_dir()
+            .join("nested")
+            .join("..")
+            .join(missing.file_name().unwrap());
+        assert_ne!(missing.as_path(), detoured.as_path());
+
+        let config = SandboxConfig {
+            allow_read: vec![missing.clone()],
+            allow_write: vec![detoured],
+            ..Default::default()
+        };
+
+        assert_eq!(config.missing_allow_paths(), vec![missing.as_path()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_paths_keeps_the_spelling_a_canonicalization_replaced() {
+        // The replaced spelling is the one a caller inside the sandbox uses, and
+        // macOS has to keep that route walkable. A path that was already
+        // canonical contributes nothing.
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let target = root.join("target");
+        let plain = root.join("plain");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+        let through_link = root.join("link");
+
+        let mut config = SandboxConfig {
+            allow_read: vec![through_link.clone()],
+            allow_write: vec![plain.clone()],
+            ..Default::default()
+        };
+        config.resolve_paths(&[]).unwrap();
+
+        assert_eq!(config.allow_read, vec![target]);
+        assert_eq!(config.allow_write, vec![plain]);
+        assert_eq!(config.symlinked_allow_paths, vec![through_link]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_paths_drops_current_dir_components() {
+        // `Path` equality ignores `.`, so a `./` spelling survives
+        // canonicalization and reaches the macOS profile, where it never matches.
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let mut config = SandboxConfig {
+            allow_read: vec![root.join("./sub"), root.join("./")],
+            ..Default::default()
+        };
+        config.resolve_paths(&[]).unwrap();
+
+        let rendered: Vec<_> = config
+            .allow_read
+            .iter()
+            .map(|p| p.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![sub.to_str().unwrap(), root.to_str().unwrap()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_paths_keeps_a_trailing_slash_on_a_file() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let file = root.join("config");
+        std::fs::write(&file, "").unwrap();
+        for spelling in ["./config/", "config/."] {
+            let mut config = SandboxConfig {
+                allow_read: vec![root.join(spelling)],
+                ..Default::default()
+            };
+            config.resolve_paths(&[]).unwrap();
+
+            assert_eq!(
+                config.allow_read[0].as_os_str().as_encoded_bytes().last(),
+                Some(&b'/'),
+                "{spelling}"
+            );
+        }
+
+        // A directory that does not exist yet must match once it is created.
+        let mut config = SandboxConfig {
+            allow_write: vec![root.join("./new/")],
+            ..Default::default()
+        };
+        config.resolve_paths(&[]).unwrap();
+        assert_eq!(
+            config.allow_write[0].as_os_str(),
+            root.join("new").as_os_str()
+        );
+    }
+
+    /// The project holds the code being confined, so whoever wrote that code
+    /// also chose what `dist` is. A link in it must not carry an allowed path
+    /// out of it, however the path reaches the link.
+    #[cfg(unix)]
+    #[test]
+    fn test_check_symlinks_stay_in_roots() {
+        use std::os::unix::fs::symlink;
+        let root_dir = tempfile::tempdir().unwrap();
+        let tmp = root_dir.path().canonicalize().unwrap();
+        let project = tmp.join("project");
+        let outside = tmp.join("outside");
+        std::fs::create_dir_all(project.join("real").join("deep")).unwrap();
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink("/", project.join("dist")).unwrap();
+        symlink("real", project.join("inside")).unwrap();
+        symlink(project.join("dist"), project.join("chain")).unwrap();
+        symlink(&outside, tmp.join("out")).unwrap();
+        symlink(project.join("real"), tmp.join("into")).unwrap();
+        let roots = vec![project.clone()];
+
+        for escaping in [
+            project.join("dist"),
+            project.join("dist").join("etc"),
+            project.join("real").join("..").join("dist"),
+            project.join("sub").join("..").join("dist"),
+            project.join("chain"),
+        ] {
+            let err = check_symlinks_stay_in_roots(&escaping, &roots).unwrap_err();
+            assert!(err.to_string().contains("leads out of"), "{err}");
+        }
+        for staying in [
+            project.clone(),
+            project.join("real"),
+            project.join("inside").join("deep"),
+            project.join("missing").join("file"),
+            // Links outside the roots are the caller's own and stay followed,
+            // also when they lead into a root.
+            tmp.join("out"),
+            tmp.join("into").join("deep"),
+            // The target named outright.
+            PathBuf::from("/"),
+        ] {
+            check_symlinks_stay_in_roots(&staying, &roots).unwrap();
+        }
+        // Without the project as a root, the same link is followed.
+        check_symlinks_stay_in_roots(&project.join("dist"), &[]).unwrap();
+    }
+
+    /// On a case-insensitive volume `PROJECT/dist` is the project's `dist`, so
+    /// the guard must recognize the root by identity, not by spelling. Linux
+    /// has no such volume here: model one with an identity that ignores case,
+    /// and a second directory standing in for the other spelling.
+    #[cfg(unix)]
+    #[test]
+    fn test_check_symlinks_stay_in_roots_ignores_spelling() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let tmp = root_dir.path().canonicalize().unwrap();
+        let project = tmp.join("project");
+        let other_spelling = tmp.join("PROJECT");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&other_spelling).unwrap();
+        std::os::unix::fs::symlink("/", other_spelling.join("dist")).unwrap();
+        let case_insensitive =
+            |path: &std::path::Path| path.exists().then(|| path.to_string_lossy().to_lowercase());
+
+        let err = check_symlinks_stay_in_roots_by(
+            &other_spelling.join("dist"),
+            std::slice::from_ref(&project),
+            case_insensitive,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("leads out of"), "{err}");
+    }
+
+    /// `resolve_paths` refuses the escaping path itself rather than dropping
+    /// it, which would lift the restriction the list implies.
+    #[cfg(unix)]
+    #[test]
+    fn test_resolve_paths_refuses_a_symlink_out_of_a_project_root() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let project = root_dir.path().canonicalize().unwrap().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::os::unix::fs::symlink("/", project.join("dist")).unwrap();
+
+        let mut config = SandboxConfig {
+            allow_write: vec![project.join("dist")],
+            ..Default::default()
+        };
+        let err = config.resolve_paths(&[&project]).unwrap_err();
+        assert!(err.to_string().contains("leads out of"), "{err}");
+    }
+
+    #[test]
+    fn test_nearest_existing_ancestor_skips_missing_parents() {
+        let existing = std::env::temp_dir();
+        // The immediate parent is missing too, so naming it in the warning
+        // would send the user to a rule that is dropped for the same reason.
+        let nested = missing_fixture("outer").join("inner").join("file");
+        assert_eq!(nearest_existing_ancestor(&nested), Some(existing.as_path()));
+    }
+
+    #[test]
+    fn test_missing_allow_paths_is_empty_when_everything_exists() {
+        let config = SandboxConfig {
+            allow_write: vec![std::env::temp_dir()],
+            ..Default::default()
+        };
+        assert!(config.missing_allow_paths().is_empty());
+    }
+
+    #[test]
+    fn test_env_pattern_matches_exact() {
+        assert!(env_pattern_matches("FOO", "FOO"));
+        assert!(!env_pattern_matches("FOO", "FOOBAR"));
+        assert!(!env_pattern_matches("FOO", "BAR"));
+    }
+
+    #[test]
+    fn test_env_pattern_matches_prefix_wildcard() {
+        assert!(env_pattern_matches("MYAPP_*", "MYAPP_FOO"));
+        assert!(env_pattern_matches("MYAPP_*", "MYAPP_"));
+        assert!(!env_pattern_matches("MYAPP_*", "MYAPP"));
+        assert!(!env_pattern_matches("MYAPP_*", "OTHER_FOO"));
+    }
+
+    #[test]
+    fn test_env_pattern_matches_suffix_wildcard() {
+        assert!(env_pattern_matches("*_SECRET", "MY_SECRET"));
+        assert!(env_pattern_matches("*_SECRET", "_SECRET"));
+        assert!(!env_pattern_matches("*_SECRET", "SECRET"));
+    }
+
+    #[test]
+    fn test_env_pattern_matches_infix_wildcard() {
+        assert!(env_pattern_matches("MY_*_SECRET", "MY_APP_SECRET"));
+        assert!(env_pattern_matches("MY_*_SECRET", "MY__SECRET"));
+        // key too short for both prefix and suffix without overlap
+        assert!(!env_pattern_matches("MY_*_SECRET", "MY_SECRET"));
+        assert!(!env_pattern_matches("AB*B", "AB"));
+    }
+
+    #[test]
+    fn test_env_pattern_matches_star_only() {
+        assert!(env_pattern_matches("*", "ANYTHING"));
+        assert!(env_pattern_matches("*", ""));
+    }
+
+    #[test]
+    fn test_filter_env_with_wildcard() {
+        let config = SandboxConfig {
+            allow_env: vec!["MYAPP_*".to_string()],
+            ..Default::default()
+        };
+        let mut env = BTreeMap::new();
+        env.insert("MYAPP_FOO".to_string(), "val1".to_string());
+        env.insert("MYAPP_BAR".to_string(), "val2".to_string());
+        env.insert("OTHER_VAR".to_string(), "val3".to_string());
+        env.insert("PATH".to_string(), "/usr/bin".to_string());
+
+        let filtered = config.filter_env(&env);
+        assert!(filtered.contains_key("MYAPP_FOO"));
+        assert!(filtered.contains_key("MYAPP_BAR"));
+        assert!(!filtered.contains_key("OTHER_VAR"));
+        assert!(filtered.contains_key("PATH")); // default key
+    }
+
+    #[test]
+    fn test_pass_through_env_only_filters_when_env_is_denied() {
+        let mut env = BTreeMap::new();
+        env.insert("PASSED_SECRET".to_string(), "secret".to_string());
+        env.insert("OTHER_VAR".to_string(), "other".to_string());
+        let loose = SandboxConfig {
+            pass_through_env: vec!["PASSED_*".to_string()],
+            ..Default::default()
+        };
+
+        assert!(!loose.effective_deny_env());
+        assert_eq!(loose.filter_env(&env), env);
+
+        let strict = SandboxConfig {
+            deny_env: true,
+            ..loose
+        };
+        let filtered = strict.filter_env(&env);
+        assert_eq!(
+            filtered.get("PASSED_SECRET").map(String::as_str),
+            Some("secret")
+        );
+        assert!(!filtered.contains_key("OTHER_VAR"));
+    }
+
+    #[test]
+    fn test_cache_env_uses_exact_names() {
+        let config = SandboxConfig {
+            deny_env: true,
+            cache_env: vec!["HASHED_*".to_string(), "EXACT".to_string()],
+            ..Default::default()
+        };
+        let env = BTreeMap::from([
+            ("HASHED_VALUE".to_string(), "not-selected".to_string()),
+            ("EXACT".to_string(), "selected".to_string()),
+        ]);
+
+        let filtered = config.filter_env(&env);
+        assert!(!filtered.contains_key("HASHED_VALUE"));
+        assert_eq!(filtered.get("EXACT").map(String::as_str), Some("selected"));
+    }
+
+    /// filter_env() walks the parent environment for wildcard allow_env
+    /// patterns; a non-UTF-8 parent var must be skipped, not panic (#5370).
+    #[cfg(unix)]
+    #[test]
+    fn test_filter_env_wildcard_skips_invalid_utf8_parent_var() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let key = "MISE_TEST_SANDBOX_INVALID";
+        let config = SandboxConfig {
+            allow_env: vec!["MISE_TEST_SANDBOX_*".to_string()],
+            ..Default::default()
+        };
+        // restores the environment on drop, even if the assertion below fails
+        let mut guard = crate::testing::EnvVarGuard::new();
+        guard.set(key, OsString::from_vec(vec![0xff]));
+
+        let filtered = config.filter_env(&BTreeMap::new());
+
+        assert!(!filtered.contains_key(key));
+    }
+
+    #[test]
+    fn test_resolve_paths_drops_empty_paths() {
+        let mut config = SandboxConfig {
+            allow_read: vec![PathBuf::new()],
+            allow_write: vec![PathBuf::from("")],
+            ..Default::default()
+        };
+
+        config.resolve_paths(&[]).unwrap();
+
+        assert!(config.allow_read.is_empty());
+        assert!(config.allow_write.is_empty());
+        // `--allow-write="$UNSET"` allows nothing; dropping the only entry must
+        // not drop the restriction it implied.
+        assert!(config.effective_deny_read());
+        assert!(config.effective_deny_write());
+        assert!(config.is_active());
+    }
+
+    #[test]
+    fn test_resolve_paths_without_allow_paths_denies_nothing() {
+        let mut config = SandboxConfig::default();
+
+        config.resolve_paths(&[]).unwrap();
+
+        assert!(!config.effective_deny_read());
+        assert!(!config.effective_deny_write());
+        assert!(!config.is_active());
+    }
+
+    #[test]
+    fn test_from_settings_and_cli_combines_denies() {
+        let settings = SettingsSandbox {
+            deny_read: true,
+            deny_net: true,
+            ..Default::default()
+        };
+        let config = SandboxConfig::from_settings_and_cli(
+            &settings,
+            false,
+            SandboxConfig {
+                deny_write: true,
+                allow_env: vec!["ALLOWED".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert!(config.deny_read);
+        assert!(config.deny_write);
+        assert!(config.deny_net);
+        assert!(!config.deny_env);
+        assert_eq!(config.allow_env, ["ALLOWED"]);
+    }
+
+    #[test]
+    fn test_from_settings_and_cli_expands_deny_all() {
+        let settings = SettingsSandbox {
+            deny_all: true,
+            ..Default::default()
+        };
+        let config =
+            SandboxConfig::from_settings_and_cli(&settings, false, SandboxConfig::default());
+
+        assert!(config.deny_read);
+        assert!(config.deny_write);
+        assert!(config.deny_net);
+        assert!(config.deny_env);
+    }
+
+    #[test]
+    fn test_allow_unix_implies_deny_unix() {
+        let mut config = SandboxConfig {
+            allow_unix: vec![PathBuf::from("/run/agent.sock")],
+            ..Default::default()
+        };
+        assert!(!config.deny_unix);
+        assert!(config.effective_deny_unix());
+        assert!(config.restricts_more_than_env());
+        config.resolve_paths(&[]).unwrap();
+        assert!(config.deny_unix);
+
+        assert!(!SandboxConfig::default().effective_deny_unix());
+        assert!(SandboxConfig::default().reject_unix_sockets().is_ok());
+        let denied = SandboxConfig {
+            deny_unix: true,
+            ..Default::default()
+        };
+        assert!(denied.reject_unix_sockets().is_err());
+        assert!(denied.is_active());
+    }
+
+    #[test]
+    fn test_reject_allow_net() {
+        assert!(SandboxConfig::default().reject_allow_net().is_ok());
+        assert!(
+            SandboxConfig {
+                deny_net: true,
+                ..Default::default()
+            }
+            .reject_allow_net()
+            .is_ok()
+        );
+
+        // Neither Linux nor macOS can enforce a per-host exception, so the
+        // request fails instead of producing a sandbox that cannot start.
+        let err = SandboxConfig {
+            allow_net: vec!["registry.npmjs.org".to_string()],
+            ..Default::default()
+        }
+        .reject_allow_net()
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("per-host network filtering (--allow-net=<host>) is not supported"),
+            "{err}"
+        );
+    }
+
+    /// `mise x` goes through `apply`, which must reject the host before it
+    /// builds the `sandbox-exec` command. macOS only: on Linux `apply`
+    /// sandboxes the calling process, so a regression would sandbox the test.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_apply_rejects_allow_net() {
+        let config = SandboxConfig {
+            allow_net: vec!["registry.npmjs.org".to_string()],
+            ..Default::default()
+        };
+        let err = match config.apply("true", &[]).await {
+            Ok(_) => panic!("apply accepted --allow-net"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("--allow-net=<host>"), "{err}");
+    }
+
+    /// `mise x` execs the wrapper after setting the command's `PATH` on the
+    /// mise process, so a bare name would resolve to a `sandbox-exec` in a
+    /// tool's bin directory.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn test_apply_uses_system_sandbox_exec() {
+        let config = SandboxConfig {
+            deny_net: true,
+            ..Default::default()
+        };
+        let sandboxed = config.apply("true", &[]).await.unwrap().unwrap();
+        assert_eq!(sandboxed.program, "/usr/bin/sandbox-exec");
+    }
+}

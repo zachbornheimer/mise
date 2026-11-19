@@ -1,0 +1,2495 @@
+use std::fmt::{Display, Formatter};
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::path::{Component, Path, PathBuf};
+use std::{cmp::Ordering, sync::LazyLock};
+use std::{collections::BTreeMap, sync::Arc};
+
+use crate::args::BackendArg;
+use crate::backend::platform_target::PlatformTarget;
+use crate::backend::{self, ABackend, VersionInfo};
+use crate::config::env_directive::EnvValue;
+use crate::config::{Config, Settings, SettingsExt};
+#[cfg(windows)]
+use crate::file;
+use crate::hash::hash_to_str;
+use crate::install_before::{
+    BeforeDateSource, format_hidden_release_details, minimum_release_age_label,
+    resolve_before_date_for_tool_with_source,
+};
+use crate::lockfile::{AubeLock, CondaPackageInfo, LockfileTool, PlatformInfo};
+use crate::runtime_symlinks::is_runtime_symlink;
+use crate::toolset::{ToolRequest, ToolSource, ToolVersionOptions, install_state, tool_request};
+use crate::versions_index::IndexPick;
+use crate::{dirs, env};
+use console::style;
+use dashmap::DashMap;
+use eyre::Result;
+use indexmap::IndexMap;
+use jiff::Timestamp;
+#[cfg(windows)]
+use path_absolutize::Absolutize;
+
+static INSTALL_PATH_CACHE: LazyLock<DashMap<ToolVersion, PathBuf>> = LazyLock::new(DashMap::new);
+
+/// Clear the install_path cache. Called when install state is reset
+/// to avoid stale paths (e.g. shared dir paths after a new install).
+pub(super) fn reset_install_path_cache() {
+    INSTALL_PATH_CACHE.clear();
+    crate::install_layout::resolver::reset_cache();
+}
+
+/// represents a single version of a tool for a particular plugin
+#[derive(Debug, Clone)]
+pub struct ToolVersion {
+    pub request: ToolRequest,
+    pub version: String,
+    /// Effective install-before cutoff used to resolve this version.
+    pub before_date: Option<Timestamp>,
+    locked: bool,
+    resolved_from_lockfile: bool,
+    /// A lazy request left unresolved because nothing is installed: `version` is
+    /// the request itself, not a release, so nothing may record or compare it as one.
+    deferred: bool,
+    pub lock_platforms: BTreeMap<String, PlatformInfo>,
+    pub install_path: Option<PathBuf>,
+    /// The HTTP backend should treat `install_path` as the final destination
+    /// rather than a `<tool>/<version>` path. Used by install-into.
+    pub install_path_is_exact: bool,
+    /// The HTTP backend should place files directly in `install_path` instead
+    /// of linking to its shared extraction cache. Set for system, shared, and
+    /// install-into destinations.
+    pub install_path_is_explicit: bool,
+    /// Conda packages resolved during installation: (platform, basename) -> CondaPackageInfo
+    pub conda_packages: BTreeMap<(String, String), CondaPackageInfo>,
+    /// Portable dependency graph used by embedded aube installs.
+    pub aube_lock: Option<crate::lockfile::GraphRef<AubeLock>>,
+    pub uv_lock: Option<crate::lockfile::GraphRef<crate::lockfile::UvLock>>,
+    /// The source repository the lockfile pins this `npm:` tool's package to.
+    pub npm_provenance: Option<crate::lockfile::PackageProvenance>,
+    pub uv_python: Option<(PathBuf, String)>,
+    /// Install satisfaction computed during dry-run installs.
+    pub install_satisfied: Option<bool>,
+}
+
+impl ToolVersion {
+    /// A lazy request with no version of the tool installed: it is waiting for
+    /// its first run, so a bare `mise upgrade` leaves it alone. A backend that
+    /// fails to resolve is not waiting for anything, so it reports `false`.
+    pub fn is_unrun_lazy(&self) -> bool {
+        self.request.options().lazy == Some(true)
+            && self
+                .backend()
+                .is_ok_and(|backend| backend.list_installed_versions().is_empty())
+    }
+
+    /// The error raised when resolution found no usable version.
+    ///
+    /// `minimum_release_age` applies by default, so "no versions found" is
+    /// routinely the cutoff hiding a brand-new release rather than anything
+    /// being wrong. Naming the setting, the versions it hid and the exact-pin
+    /// escape hatch keeps users from hunting for a filter they never set
+    /// (https://github.com/jdx/mise/discussions/13303).
+    async fn no_versions_found(
+        config: &Arc<Config>,
+        backend: &ABackend,
+        query: &str,
+        before_date: Option<Timestamp>,
+        minimum_release_age: Option<&str>,
+        suggest_exact_pin: bool,
+        selection_opts: Option<&ToolVersionOptions>,
+    ) -> eyre::Report {
+        let id = backend.id();
+        // The version list is also empty when fetching it failed, in which case
+        // no filter was ever applied — blaming the date filter sends users
+        // looking for a cutoff that isn't the problem.
+        if let Some(cause) = crate::backend::version_listing_failure(backend.ba()) {
+            return eyre::eyre!("unable to fetch versions for {id}: {cause}");
+        }
+        let Some(before) = before_date else {
+            return eyre::eyre!("no versions found for {id}");
+        };
+        let hidden = backend
+            .versions_hidden_by_before_date(config, query, before, selection_opts)
+            .await
+            .unwrap_or_default();
+        // The cutoff is only to blame when it actually removed a candidate.
+        let Some(newest) = hidden.last() else {
+            return eyre::eyre!("no versions found for {id}");
+        };
+        let tz = jiff::tz::TimeZone::system();
+        let age = minimum_release_age_label(backend.ba(), minimum_release_age, before);
+        let (released, age_fragment) = format_hidden_release_details(
+            newest.created_at_timestamp(),
+            age.as_deref(),
+            tz.clone(),
+        );
+        // Without a configured age to name, the cutoff itself is the only thing
+        // that tells the user how far back the filter reaches.
+        let cutoff = if age.is_some() {
+            String::new()
+        } else {
+            format!(
+                " newer than the {} cutoff",
+                before.to_zoned(tz).strftime("%Y-%m-%d %H:%M %Z")
+            )
+        };
+        let count = hidden.len();
+        let plural = if count == 1 { "" } else { "s" };
+        // Pinning the newest hidden version reproduces what was asked for only
+        // when the request selects a version directly. A `sub-N:` request
+        // subtracts from the base, so pinning the base would install something
+        // other than what was requested — `sub-1:1.8.2` resolves to `0`, not to
+        // the release below 1.8.2.
+        let remedy = if suggest_exact_pin {
+            format!(
+                " Install that one now with `{id}@{}`, or lower minimum_release_age.",
+                newest.version
+            )
+        } else {
+            format!(
+                " Lower minimum_release_age to make {} eligible.",
+                if count == 1 { "it" } else { "them" }
+            )
+        };
+        // Typed, so `mise lock --bump` can tell a cutoff hold from an empty list.
+        eyre::Report::new(crate::errors::Error::ReleaseAgeHidAllVersions(format!(
+            "no versions found for {id} matching minimum_release_age{age_fragment}: \
+             it hid {count} release{plural}{cutoff}, the newest being {}{released}.{remedy}",
+            newest.version,
+        )))
+    }
+
+    pub fn new(request: ToolRequest, version: String) -> Self {
+        let request = request.with_registry_version(&version);
+        ToolVersion {
+            request,
+            version,
+            before_date: None,
+            locked: false,
+            resolved_from_lockfile: false,
+            deferred: false,
+            lock_platforms: Default::default(),
+            install_path: None,
+            install_path_is_exact: false,
+            install_path_is_explicit: false,
+            conda_packages: Default::default(),
+            aube_lock: None,
+            npm_provenance: None,
+            uv_lock: None,
+            uv_python: None,
+            install_satisfied: None,
+        }
+    }
+
+    pub async fn resolve(
+        config: &Arc<Config>,
+        request: ToolRequest,
+        opts: &ResolveOptions,
+    ) -> Result<Self> {
+        let install_env = request.options().core.install_env;
+        let ba = request.ba().clone();
+        let resolve =
+            crate::toolset::with_safe_mode_tool_scope(&ba, Self::resolve_(config, request, opts));
+        let mut tv = crate::env::with_install_env(install_env, resolve).await?;
+        // Only the request has been validated so far. The version it resolved to came from a
+        // version list, a release tag or the lockfile, and for these requests it is what
+        // `logical_pathname` names the install, download and cache directories by.
+        if tv.request.uses_resolved_version_as_pathname() {
+            tool_request::validate_resolved_version(&tv.version)?;
+        }
+        if tv.uv_lock.is_some() || crate::backend::pipx::has_selected_python(&tv).unwrap_or(false) {
+            Box::pin(
+                crate::backend::pipx::PIPXBackend::from_arg(tv.ba().clone())
+                    .restore_uv_python(config, &mut tv),
+            )
+            .await;
+        }
+        Ok(tv)
+    }
+
+    async fn resolve_(
+        config: &Arc<Config>,
+        request: ToolRequest,
+        opts: &ResolveOptions,
+    ) -> Result<Self> {
+        let minimum_release_age = request.options().minimum_release_age().map(str::to_string);
+        let mut opts = opts.clone();
+        opts.apply_before_date_for_tool(request.ba(), minimum_release_age.as_deref())?;
+
+        trace!("resolving {} {}", &request, opts);
+        // A link is chosen by what the request means, so expand aliases (`lts` -> `24`) first.
+        let linked_query = match request.backend() {
+            Ok(backend) => config
+                .resolve_alias(&backend, &request.version())
+                .await
+                .unwrap_or_else(|_| request.version()),
+            Err(_) => request.version(),
+        };
+        if opts.use_locked_version
+            && !has_linked_version(request.ba(), &linked_query)
+            && let Some(lt) = request.lockfile_resolve(config)?
+        {
+            return Ok(Self::from_lockfile(request.clone(), lt).with_before_date(opts.before_date));
+        }
+        let backend = request.ba().backend()?;
+        if let Some(plugin) = backend.plugin()
+            && !plugin.is_installed()
+        {
+            // Without the plugin only the config's aliases expand. The
+            // lockfile may still pin what one of them means, as it would be
+            // found once the plugin is installed.
+            let (lock_query, lock_prefix_boundary) = lock_query(&linked_query);
+            if opts.use_locked_version
+                && matches!(request, ToolRequest::Version { .. })
+                && linked_query != request.version()
+                && !has_linked_version(request.ba(), lock_query)
+                && let Some(lt) = request.lockfile_resolve_with_prefix(
+                    config,
+                    lock_query,
+                    lock_prefix_boundary,
+                    opts.keep_moved_alias_pins || Self::resolution_locked(config, &request, &opts),
+                )?
+            {
+                return Ok(
+                    Self::from_lockfile(request.clone(), lt).with_before_date(opts.before_date)
+                );
+            }
+            let tv = Self::new(request.clone(), request.version());
+            return Ok(tv.with_before_date(opts.before_date));
+        }
+        if Self::defers_missing_lazy(&request, &opts)
+            && backend.list_installed_versions().is_empty()
+        {
+            let version = request.version();
+            return Ok(Self::new(request, version)
+                .into_deferred()
+                .with_before_date(opts.before_date));
+        }
+        if matches!(
+            request,
+            ToolRequest::Prefix { .. } | ToolRequest::Ref { .. }
+        ) {
+            Self::ensure_unlocked_resolution_allowed(config, &request, &linked_query, &opts)?;
+        }
+        let tv = match request.clone() {
+            ToolRequest::Version { version: v, .. } => {
+                Self::resolve_version(config, request, &v, &opts).await?
+            }
+            ToolRequest::Prefix { prefix, .. } => {
+                Self::resolve_prefix(config, request, &prefix, &opts).await?
+            }
+            ToolRequest::Sub {
+                sub, orig_version, ..
+            } => Self::resolve_sub(config, request, &sub, &orig_version, &opts).await?,
+            _ => {
+                let version = request.version();
+                Self::new(request, version)
+            }
+        };
+        let tv = tv.with_before_date(opts.before_date);
+        trace!("resolved: {tv}");
+        Ok(tv)
+    }
+
+    /// `opts` without the install-time refresh, when `backend` (the one the
+    /// request resolves through, after aliases and registry `min_version`
+    /// boundaries) has a cached list that already holds every release the
+    /// cutoff admits.
+    ///
+    /// The refresh keeps a cached list from hiding a release newer than the
+    /// cache. A cutoff well older than the list (24h by default, against a list
+    /// at most an hour old) already hides every such release, so the cached
+    /// list gives the same answer a refetch would. See
+    /// `Backend::adopt_cached_remote_versions_for_cutoff` for when that holds.
+    async fn without_covered_refresh(
+        config: &Arc<Config>,
+        request: &ToolRequest,
+        backend: &ABackend,
+        opts: &ResolveOptions,
+    ) -> ResolveOptions {
+        let mut opts = opts.clone();
+        if opts.refresh_remote_versions
+            && let Some(before) = opts.before_date
+            && backend
+                .adopt_cached_remote_versions_for_cutoff(config, before)
+                .await
+        {
+            trace!(
+                "not refreshing remote versions for {request}: the release-age cutoff predates the cache"
+            );
+            opts.refresh_remote_versions = false;
+        }
+        opts
+    }
+
+    /// Whether a command that runs tools may leave this lazy request unresolved
+    /// rather than wait on remote version lists for a tool nobody has run yet.
+    /// Installing the tool resolves the request then.
+    pub(crate) fn defers_missing_lazy(request: &ToolRequest, opts: &ResolveOptions) -> bool {
+        opts.defer_missing_lazy_tools
+            && !opts.latest_versions
+            && request.options().lazy == Some(true)
+            && (opts.defer_missing_lazy_online || Settings::get().prefer_offline())
+            && !matches!(request.source(), ToolSource::Argument)
+    }
+
+    fn with_before_date(mut self, before_date: Option<Timestamp>) -> Self {
+        self.before_date = before_date;
+        self
+    }
+
+    /// Returns a copy locked to the exact resolved version, so `runtime_path()`
+    /// resolves to `install_path()` rather than a fuzzy runtime symlink (e.g.
+    /// `installs/python/3`). Used during postinstall so the hook sees the version
+    /// just installed, not a stale symlink target (#10347).
+    pub(crate) fn with_locked(mut self) -> Self {
+        self.locked = true;
+        self
+    }
+
+    /// The version a locked install on `target` would take for `request`
+    /// from the lockfile, selected by that platform's lock options. `None`
+    /// when no entry matches.
+    pub async fn resolve_locked_for_target(
+        config: &Arc<Config>,
+        request: &ToolRequest,
+        target: &PlatformTarget,
+    ) -> Result<Option<Self>> {
+        let version = request.version();
+        let (query, boundary, alias_resolved) = match request {
+            ToolRequest::Prefix { prefix, .. } => (prefix.clone(), true, false),
+            _ => {
+                let resolved = match request.backend() {
+                    Ok(backend) => config
+                        .resolve_alias(&backend, &version)
+                        .await
+                        .unwrap_or_else(|_| version.clone()),
+                    Err(_) => version.clone(),
+                };
+                let (query, boundary) = lock_query(&resolved);
+                (query.to_string(), boundary, resolved != version)
+            }
+        };
+        Ok(request
+            .lockfile_resolve_for_target(config, &query, boundary, alias_resolved, target)?
+            .map(|lt| Self::from_lockfile(request.clone(), lt)))
+    }
+
+    fn from_lockfile(mut request: ToolRequest, lt: LockfileTool) -> Self {
+        if let Some(backend_full) = &lt.backend {
+            let backend = Arc::new(BackendArg::new(
+                request.ba().short.clone(),
+                Some(backend_full.clone()),
+            ));
+            // The registry's options are for the backend it chose; the lock's
+            // backend would read them as its own settings and record them.
+            if request.registry_options_are_not_for(backend_full) {
+                request = request.without_registry_options();
+            }
+            match &mut request {
+                ToolRequest::Version { backend: b, .. }
+                | ToolRequest::Prefix { backend: b, .. }
+                | ToolRequest::Ref { backend: b, .. }
+                | ToolRequest::Sub { backend: b, .. }
+                | ToolRequest::Path { backend: b, .. }
+                | ToolRequest::System { backend: b, .. } => *b = backend,
+            }
+        }
+        // Lockfile options have already selected the matching lock entry; keep
+        // the original request options so config/core install behavior survives.
+        let mut tv = Self::new(request, lt.version);
+        tv.locked = true;
+        tv.resolved_from_lockfile = true;
+        tv.lock_platforms = lt.platforms;
+        tv.aube_lock = lt.aube;
+        tv.uv_lock = lt.uv;
+        tv.npm_provenance = lt.provenance;
+        tv
+    }
+
+    pub fn resolved_from_lockfile(&self) -> bool {
+        self.resolved_from_lockfile
+    }
+
+    /// Why each dependency graph the lockfile records for this version cannot
+    /// be read: a sidecar that is missing, unreadable, or edited since its
+    /// digest was recorded.
+    pub fn locked_graph_errors(&self) -> Vec<eyre::Report> {
+        let aube = self.aube_lock.as_ref().and_then(|g| g.load().err());
+        let uv = self.uv_lock.as_ref().and_then(|g| g.load().err());
+        aube.into_iter().chain(uv).collect()
+    }
+
+    /// Whether the request named this exact release, e.g. `hk = "2.0.1"` in
+    /// `mise.toml` or `mise install hk@2.0.1`. Release-age policy governs which
+    /// version a fuzzy request may select; naming one release is that selection,
+    /// so callers use this to avoid re-applying the cutoff to a choice the user
+    /// already made.
+    ///
+    /// Version strings are opaque: this compares the request against the
+    /// resolved version byte for byte and never parses or orders them. A fuzzy
+    /// request (`"2"`), an alias (`"lts"`), a ref, or a prefix leaves the two
+    /// strings different, so only a literal pin matches.
+    fn into_deferred(mut self) -> Self {
+        self.deferred = true;
+        self
+    }
+
+    /// Whether this is a lazy request left unresolved, so `version` only echoes it.
+    pub fn is_deferred(&self) -> bool {
+        self.deferred
+    }
+
+    pub(crate) fn request_pinned_this_version(&self) -> bool {
+        let ToolRequest::Version { version, .. } = &self.request else {
+            return false;
+        };
+        if version != &self.version {
+            return false;
+        }
+        // `latest` and rolling channels are moving pointers. A backend may list
+        // one as a literal version, which would make the strings match, but the
+        // request commits to the pointer, not to whichever release it names today.
+        if version == "latest" {
+            return false;
+        }
+        !self
+            .backend()
+            .is_ok_and(|backend| backend.is_rolling_channel(version))
+    }
+
+    pub fn ba(&self) -> &BackendArg {
+        self.request.ba()
+    }
+
+    pub fn backend(&self) -> Result<ABackend> {
+        self.ba().backend()
+    }
+
+    pub fn short(&self) -> &str {
+        &self.ba().short
+    }
+
+    /// The logical tool version, excluding an internal embedded-aube graph
+    /// identity suffix discovered while scanning install directories.
+    pub fn display_version(&self) -> &str {
+        self.aube_install_path_version()
+            .or_else(|| self.uv_install_path_version())
+            .unwrap_or(&self.version)
+    }
+
+    /// Replace a version discovered by scanning install directories
+    /// (`<version>~aube~<digest>`, `<version>~uv~<digest>`) with the logical
+    /// version it stands for. Lockfiles and dependency resolvers must only
+    /// ever see the logical version; the digest is a private path identity.
+    pub fn strip_install_path_identity(&mut self) {
+        if let Some(version) = self.install_path_identity_version().map(str::to_string) {
+            // Keep pointing at the directory that was found. In the identity
+            // layout that name is a compatibility link, and the version it
+            // carries would otherwise be hashed into an identity nothing has.
+            self.install_path = Some(
+                crate::install_layout::resolver::physical_dir(self.ba(), &self.version)
+                    .unwrap_or_else(|| self.install_path()),
+            );
+            self.version = version;
+        }
+    }
+
+    /// The logical version of a version named by an install directory with a
+    /// private dependency-graph suffix that this version's own graph does not
+    /// account for.
+    fn install_path_identity_version(&self) -> Option<&str> {
+        if self.aube_lock.is_none() {
+            self.aube_install_path_version()
+                .or_else(|| self.legacy_aube_install_path_version())
+        } else {
+            None
+        }
+        .or_else(|| {
+            self.uv_lock
+                .is_none()
+                .then(|| self.uv_install_path_version())
+                .flatten()
+        })
+    }
+
+    /// A version chosen from the installed versions of the request's tool. A
+    /// graph install made from a lockfile lists as `<version>~aube~<digest>`
+    /// (or `~uv~`), which is never the version itself. The identity layout
+    /// keeps that installation to the lockfile that made it: a request without
+    /// the graph stands for the version, and gets its own installation of it.
+    /// The legacy layout keeps using the directory that was found.
+    fn from_installed(request: ToolRequest, name: String) -> Self {
+        let mut tv = Self::new(request, name);
+        let Some(version) = tv.install_path_identity_version().map(str::to_string) else {
+            return tv;
+        };
+        if crate::install_layout::resolver::applies_to(&tv) {
+            return Self::new(tv.request, version);
+        }
+        tv.strip_install_path_identity();
+        tv
+    }
+
+    pub(crate) fn aube_install_path_version(&self) -> Option<&str> {
+        if !self.ba().full_without_opts().starts_with("npm:") {
+            return None;
+        }
+        let (version, identity) = self.version.rsplit_once("~aube~")?;
+        (identity.len() == 16 && identity.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .then_some(version)
+    }
+
+    pub(crate) fn uv_install_path_version(&self) -> Option<&str> {
+        if self.ba().backend_type() != crate::backend::backend_type::BackendType::Pipx {
+            return None;
+        }
+        let (version, identity) = self.version.rsplit_once("~uv~")?;
+        (identity.len() == 16 && identity.bytes().all(|b| b.is_ascii_hexdigit())).then_some(version)
+    }
+
+    pub(crate) fn uv_install_identity(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        let python = self
+            .uv_python
+            .as_ref()
+            .map(|(_, identity)| identity.as_str())?;
+        let mut options: BTreeMap<_, _> = self
+            .request
+            .options()
+            .opts_as_strings()
+            .into_iter()
+            .collect();
+        if self.uv_lock.is_some() {
+            // A locked graph already holds the cutoff it was resolved with, and the
+            // install replays it as it is, so a tool's own release-age options only
+            // move the installation when they change the graph.
+            options.remove("minimum_release_age");
+            options.remove("install_before");
+        }
+        Some(hex::encode(Sha256::digest(
+            format!(
+                "{}\n{}\n{}",
+                self.uv_lock
+                    .as_ref()
+                    .map(|lock| lock.install_identity())
+                    .unwrap_or_else(|| "version-only".to_string()),
+                python,
+                toml::to_string(&options).ok()?
+            )
+            .as_bytes(),
+        )))
+    }
+
+    pub(crate) fn legacy_aube_install_path_version(&self) -> Option<&str> {
+        if !self.ba().full_without_opts().starts_with("npm:") {
+            return None;
+        }
+        let (version, identity) = self.version.rsplit_once("-aube-")?;
+        if identity.len() != 16 || !identity.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        let contents =
+            crate::file::read_to_string(self.install_path().join("aube-lock.yaml")).ok()?;
+        use sha2::{Digest, Sha256};
+        let graph = crate::lockfile::AubeLock::from_yaml(&contents).ok()?;
+        let options: BTreeMap<_, _> = self
+            .request
+            .options()
+            .opts_as_strings()
+            .into_iter()
+            .collect();
+        let actual = hex::encode(Sha256::digest(
+            format!(
+                "{}\n{}",
+                graph.legacy_identity().ok()?,
+                toml::to_string(&options).ok()?
+            )
+            .as_bytes(),
+        ));
+        actual.starts_with(identity).then_some(version)
+    }
+
+    pub fn install_path(&self) -> PathBuf {
+        if let Some(p) = &self.install_path {
+            return p.clone();
+        }
+        // The identity layout names the directory by what is installed, so it is
+        // resolved before (and instead of) the legacy `<short>/<version>` path.
+        if let Some(located) = crate::install_layout::resolver::locate(self) {
+            return located.dir;
+        }
+        if let Some(p) = INSTALL_PATH_CACHE.get(self) {
+            return p.clone();
+        }
+        let pathname = match &self.request {
+            ToolRequest::Path { path: p, .. } => p.to_string_lossy().to_string(),
+            _ => self.tv_pathname(),
+        };
+        let path = self.ba().installs_path().join(&pathname);
+
+        // handle non-symlinks on windows
+        // TODO: make this a utility function in xx
+        #[cfg(windows)]
+        if path.is_file()
+            && let Ok(p) = file::read_to_string(&path).map(PathBuf::from)
+        {
+            let path = self.ba().installs_path().join(p);
+            if path.exists() {
+                return path
+                    .absolutize()
+                    .expect("failed to absolutize path")
+                    .to_path_buf();
+            }
+        }
+
+        // Check shared install directories if the primary path doesn't exist
+        let path = if matches!(&self.request, ToolRequest::Path { .. }) {
+            path
+        } else {
+            env::find_in_shared_installs(path, &self.ba().tool_dir_name(), &pathname)
+        };
+
+        // Only cache the resolved path if it actually exists on disk. Otherwise
+        // the answer may change once the tool installs into a different
+        // location (e.g. a shared install dir created mid-run by `--system` /
+        // `--shared`), and the stale cache entry would be returned to callers
+        // like core go's `exec_env`, sending wrong values for GOROOT/GOPATH.
+        if path.exists() {
+            INSTALL_PATH_CACHE.insert(self.clone(), path.clone());
+        }
+        path
+    }
+
+    pub(crate) fn install_env(&self) -> IndexMap<String, EnvValue> {
+        self.request.options().core.install_env
+    }
+
+    pub(crate) fn runtime_path(&self) -> PathBuf {
+        if self.locked {
+            return self.install_path();
+        }
+        // Identity layout: an unlocked request puts the friendly link path on
+        // PATH (`installs/node/20`, `installs/node/20.1.0`), never the hashed
+        // directory it points at, whenever that link is this installation.
+        if crate::install_layout::resolver::governs(self) {
+            return crate::install_layout::resolver::runtime_dir(self);
+        }
+        let Some(pathname) = self.runtime_pathname() else {
+            return self.install_path();
+        };
+        let path = self.ba().installs_path().join(&pathname);
+        let path = env::find_in_shared_installs(path, &self.ba().tool_dir_name(), &pathname);
+        // The link stands in for this installation only while it names it: a
+        // `latest` link skips prereleases, and any link is stale during an
+        // upgrade until runtime symlinks are rebuilt.
+        let install_path = self.install_path();
+        let names_install = |target: &Path| {
+            matches!(
+                (target.canonicalize(), install_path.canonicalize()),
+                (Ok(a), Ok(b)) if a == b
+            )
+        };
+        if path.is_dir() && is_runtime_symlink(&path) && names_install(&path) {
+            return path;
+        }
+
+        #[cfg(windows)]
+        if path.is_file()
+            && is_runtime_symlink(&path)
+            && let Ok(Some(target)) = file::resolve_symlink(&path)
+            && let Some(parent) = path.parent()
+        {
+            let target = parent.join(target);
+            if target.is_dir() && names_install(&target) {
+                return target
+                    .absolutize()
+                    .expect("failed to absolutize path")
+                    .to_path_buf();
+            }
+        }
+
+        install_path
+    }
+    pub(crate) fn cache_path(&self) -> PathBuf {
+        self.ba().cache_path().join(self.state_key())
+    }
+    pub(crate) fn download_path(&self) -> PathBuf {
+        self.request.ba().downloads_path().join(self.state_key())
+    }
+    pub(crate) async fn latest_version(&self, config: &Arc<Config>) -> Result<String> {
+        self.latest_version_with_opts(config, &ResolveOptions::default())
+            .await
+    }
+
+    pub async fn latest_version_with_opts(
+        &self,
+        config: &Arc<Config>,
+        base_opts: &ResolveOptions,
+    ) -> Result<String> {
+        // Note: We always use latest_versions=true and use_locked_version=false for latest version lookup,
+        // but we preserve before_date from base_opts to respect date-based filtering
+        let opts = ResolveOptions {
+            latest_versions: true,
+            latest_versions_for_all_requests: false,
+            latest_versions_for_arguments_only: false,
+            use_locked_version: false,
+            resolve_rolling_channels: false,
+            prefer_exact_version: false,
+            before_date: base_opts.before_date,
+            before_date_from_default: base_opts.before_date_from_default,
+            filter_installed_versions_by_release_date: base_opts
+                .filter_installed_versions_by_release_date,
+            offline: base_opts.offline,
+            refresh_remote_versions: base_opts.refresh_remote_versions,
+            inactive: base_opts.inactive,
+            outdated_release_urls: base_opts.outdated_release_urls,
+            warn_not_in_lockfile: base_opts.warn_not_in_lockfile,
+            defer_missing_lazy_tools: false,
+            defer_missing_lazy_online: false,
+            keep_moved_alias_pins: base_opts.keep_moved_alias_pins,
+            locked: false,
+        };
+        let tv = self.request.resolve(config, &opts).await?;
+        Ok(tv.version)
+    }
+    pub fn style(&self) -> String {
+        format!(
+            "{}{}",
+            style(&self.ba().short).blue().for_stderr(),
+            style(&format!("@{}", self.version)).for_stderr()
+        )
+    }
+    /// The logical name of this version as a path component: the version, a
+    /// `<ref type>-<ref>`, and so on, without any dependency-graph identity.
+    pub(crate) fn logical_pathname(&self) -> String {
+        match &self.request {
+            ToolRequest::Version { .. } => self.version.to_string(),
+            ToolRequest::Prefix { .. } => self.version.to_string(),
+            ToolRequest::Sub { .. } => self.version.to_string(),
+            ToolRequest::Ref {
+                ref_: r, ref_type, ..
+            } => format!("{ref_type}-{r}"),
+            ToolRequest::Path { path: p, .. } => format!("path-{}", hash_to_str(p)),
+            ToolRequest::System { .. } => {
+                // Compatibility version files define `system` as a native value, so only
+                // warn when the request came from a mise-owned source.
+                if !matches!(
+                    self.request.source(),
+                    crate::toolset::ToolSource::ToolVersions(_)
+                        | crate::toolset::ToolSource::IdiomaticVersionFile(_)
+                ) {
+                    deprecated!(
+                        "system_tool_version",
+                        "@system is deprecated, use MISE_DISABLE_TOOLS instead"
+                    );
+                }
+                "system".to_string()
+            }
+        }
+        .replace([':', '/'], "-")
+    }
+
+    pub fn tv_pathname(&self) -> String {
+        let pathname = self.logical_pathname();
+        if let Some(identity) = self.uv_install_identity() {
+            return format!("{pathname}~uv~{}", &identity[..16]);
+        }
+        if let Some(identity) = self.aube_install_identity() {
+            // `~` is not valid in an npm package version, so install-state
+            // discovery can distinguish this private identity from an opaque
+            // upstream version without guessing.
+            return format!("{pathname}~aube~{}", &identity[..16]);
+        }
+        pathname
+    }
+
+    /// What install state (the incomplete marker, the install lock, the cache and
+    /// download directories) is keyed by. The legacy layout keys it by the
+    /// logical version; the identity layout by the installation directory, so
+    /// two variants of one version never share it.
+    pub(crate) fn state_key(&self) -> String {
+        // Resolving the install path is not free, and with the layout off it is
+        // never an installation directory.
+        if !crate::install_layout::resolver::governs(self) {
+            return self.tv_pathname();
+        }
+        crate::install_layout::resolver::dir_name_of(&self.install_path())
+            .unwrap_or_else(|| self.tv_pathname())
+    }
+
+    /// Whether an install into `path` was interrupted: the incomplete marker for
+    /// it is still in place.
+    pub(crate) fn is_incomplete_at(&self, path: &Path) -> bool {
+        let key = crate::install_layout::resolver::dir_name_of(path)
+            .unwrap_or_else(|| self.tv_pathname());
+        install_state::is_incomplete(self.ba(), &key)
+    }
+
+    pub(crate) fn aube_install_identity(&self) -> Option<String> {
+        use sha2::{Digest, Sha256};
+
+        let lock = self.aube_lock.as_ref()?;
+        let graph_identity = lock.identity();
+        let options: BTreeMap<_, _> = self
+            .request
+            .options()
+            .opts_as_strings()
+            .into_iter()
+            .collect();
+        let options = toml::to_string(&options).ok()?;
+        Some(hex::encode(Sha256::digest(
+            format!("{graph_identity}\n{options}").as_bytes(),
+        )))
+    }
+    pub(crate) fn runtime_pathname(&self) -> Option<String> {
+        let pathname = match &self.request {
+            ToolRequest::Version { version, .. } if version != &self.version => version.clone(),
+            ToolRequest::Prefix { prefix, .. } => prefix.clone(),
+            ToolRequest::Sub { .. } if self.request.version() != self.version => {
+                self.request.version()
+            }
+            _ => return None,
+        };
+        Some(pathname.replace([':', '/'], "-"))
+    }
+    /// Whether `--locked` (or `locked`) and `tool_config.locked`, in that
+    /// order, forbid resolving this request outside the lockfile.
+    fn locked_by(config: &Config, request: &ToolRequest, opts: &ResolveOptions) -> (bool, bool) {
+        let invocation_locked =
+            opts.locked || config.invocation_locked_for(request.source(), Settings::get().locked);
+        let tool_config_locked = request.tool_config_locked(config, opts.use_locked_version);
+        (invocation_locked, tool_config_locked)
+    }
+
+    fn resolution_locked(config: &Config, request: &ToolRequest, opts: &ResolveOptions) -> bool {
+        let (invocation_locked, tool_config_locked) = Self::locked_by(config, request, opts);
+        invocation_locked || tool_config_locked
+    }
+
+    fn ensure_unlocked_resolution_allowed(
+        config: &Config,
+        request: &ToolRequest,
+        linked_query: &str,
+        opts: &ResolveOptions,
+    ) -> Result<()> {
+        let settings = Settings::get();
+        let (invocation_locked, tool_config_locked) = Self::locked_by(config, request, opts);
+        if (invocation_locked || tool_config_locked)
+            && opts.use_locked_version
+            && settings.lockfile_enabled()
+            && !has_linked_version(request.ba(), linked_query)
+            && request
+                .lockfile_source()
+                .and_then(ToolSource::path)
+                .is_some()
+        {
+            let hint = if tool_config_locked && !invocation_locked {
+                "Run `mise lock` to update the lockfile, or disable `tool_config.locked`"
+            } else {
+                "Run `mise install` without --locked to update the lockfile"
+            };
+            return Err(crate::errors::Error::NotInLockfile {
+                tool: request.ba().short.clone(),
+                version: request.version().to_string(),
+                hint: hint.to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn resolve_version(
+        config: &Arc<Config>,
+        request: ToolRequest,
+        v: &str,
+        opts: &ResolveOptions,
+    ) -> Result<ToolVersion> {
+        let backend = request.backend()?;
+        let requested = v;
+        let v = config.resolve_alias(&backend, v).await?;
+        let request = request.with_registry_version(&v);
+        let backend = request.backend()?;
+        let opts = &Self::without_covered_refresh(config, &request, &backend, opts).await;
+
+        // Re-check the lockfile after alias resolution (e.g., "lts" → "24")
+        // The initial lockfile check in resolve() uses the unresolved alias which
+        // won't match lockfile entries like "24.13.0".starts_with("lts")
+        // If the alias resolved to a `prefix:` selector, match on the bare
+        // prefix with separator-boundary matching — the lockfile stores
+        // concrete versions (#5781). Config-level `prefix:...` strings always
+        // parse into ToolRequest::Prefix, so a Version request only carries
+        // this scheme via an alias.
+        let (lock_query, lock_prefix_boundary) = lock_query(&v);
+        if opts.use_locked_version
+            && !has_linked_version(request.ba(), lock_query)
+            && let Some(lt) = request.lockfile_resolve_with_prefix(
+                config,
+                lock_query,
+                lock_prefix_boundary,
+                v != requested
+                    && (opts.keep_moved_alias_pins
+                        || Self::resolution_locked(config, &request, opts)),
+            )?
+        {
+            return Ok(Self::from_lockfile(request.clone(), lt));
+        }
+        Self::ensure_unlocked_resolution_allowed(config, &request, lock_query, opts)?;
+
+        match v.split_once(':') {
+            Some((ref_type @ ("ref" | "tag" | "branch" | "rev"), r)) => {
+                return Ok(Self::resolve_ref(
+                    r.to_string(),
+                    ref_type.to_string(),
+                    &request,
+                ));
+            }
+            Some(("path", p)) => {
+                return Self::resolve_path(PathBuf::from(p), &request);
+            }
+            Some(("prefix", p)) => {
+                return Self::resolve_prefix(config, request, p, opts).await;
+            }
+            Some((part, v)) if part.starts_with("sub-") => {
+                let sub = part.split_once('-').unwrap().1;
+                return Self::resolve_sub(config, request, sub, v, opts).await;
+            }
+            _ => (),
+        }
+
+        // An explicit release-age cutoff in the past pins a moving channel to the release it
+        // pointed at then. Offline mode skips the network lookup but still maps a channel the
+        // backend can map without it (`rust@stable` to `latest`), so an offline resolve, such as an
+        // install dependency check, finds the dated install a cutoff made. The built-in default
+        // and a cutoff in the future (how `--minimum-release-age 0s` turns the cooldown off)
+        // leave the channel alone.
+        let v = match opts.before_date {
+            Some(before) if !opts.before_date_from_default && before < Timestamp::now() => backend
+                .channel_for_cutoff(
+                    config,
+                    &v,
+                    before,
+                    opts.offline
+                        || Settings::get().offline()
+                        || (Settings::get().prefer_offline()
+                            && !matches!(request.source(), ToolSource::Argument)),
+                )
+                .await?
+                .unwrap_or(v),
+            _ => v,
+        };
+
+        let build = |v| Ok(Self::new(request.clone(), v));
+
+        if v.matches('.').count() >= 2 {
+            // Fully-qualified requests can return through several offline and
+            // backend-specific shortcuts, so validate backend-gated options
+            // before any of those paths bypass version listing.
+            backend.version_order(&request.options())?;
+        }
+
+        let settings = Settings::get();
+        let is_offline = settings.offline() || opts.offline;
+        let prefer_offline =
+            settings.prefer_offline() && !matches!(request.source(), ToolSource::Argument);
+        let should_filter_installed_versions = opts.filter_installed_versions_by_release_date
+            && opts.before_date.is_some()
+            && !opts.before_date_from_default
+            && !is_offline
+            && !prefer_offline;
+        // resolve_ defers a lazy tool with nothing installed. One whose installed
+        // versions don't match this request is deferred below, after the installed
+        // shortcuts.
+        let defer_missing_lazy = Self::defers_missing_lazy(&request, opts);
+        // Rolling release channels (e.g. zig's "master") are moving pointers that
+        // mise must resolve before the plugin-installed shortcut can preserve their
+        // symbolic name as an install identity.
+        if backend.is_rolling_channel(&v) {
+            if !opts.latest_versions
+                && !opts.resolve_rolling_channels
+                && !should_filter_installed_versions
+                && let Some(installed) = backend.latest_installed_channel_version(&v)
+            {
+                return build(installed);
+            }
+            if !is_offline {
+                match backend.resolve_channel_version(config, &v).await {
+                    Ok(Some(concrete)) => return build(concrete),
+                    Ok(None) => {}
+                    Err(source) if backend.requires_concrete_channel_version(&v) => {
+                        return Err(source.wrap_err(
+                            crate::errors::Error::RequiredChannelResolution {
+                                backend: Box::new(backend.ba().as_ref().clone()),
+                                version: v.clone(),
+                            },
+                        ));
+                    }
+                    Err(source) => {
+                        debug!(
+                            "{backend}: failed to resolve optional rolling channel {v}: {source:#}"
+                        );
+                    }
+                }
+            }
+            if opts.offline {
+                return build(v);
+            }
+            if is_offline && backend.requires_concrete_channel_version(&v) {
+                let err = crate::errors::Error::RequiredChannelResolution {
+                    backend: Box::new(backend.ba().as_ref().clone()),
+                    version: v.clone(),
+                };
+                return Err(eyre::Report::new(err).wrap_err(format!(
+                    "cannot resolve rolling channel {backend}@{v} while offline; create a lockfile or install a concrete channel version first"
+                )));
+            }
+            // Backends whose channel resolver is best-effort can still fall through
+            // to their legacy symbolic-channel resolution.
+        }
+
+        if let Some(plugin) = backend.plugin()
+            && !plugin.is_installed()
+        {
+            return build(v);
+        }
+
+        if v == "latest" {
+            if !opts.latest_versions
+                && !should_filter_installed_versions
+                && let Some(v) = backend.latest_installed_version(None)?
+            {
+                return Ok(Self::from_installed(request, v));
+            }
+            if defer_missing_lazy {
+                return build(v).map(Self::into_deferred);
+            }
+            if !is_offline
+                && let Some(v) = backend
+                    .latest_version_with_selection_options(
+                        config,
+                        None,
+                        &request.options(),
+                        opts.before_date,
+                        opts.refresh_remote_versions,
+                    )
+                    .await?
+            {
+                return build(v);
+            }
+            if !is_offline {
+                let versions = backend
+                    .list_remote_versions_with_refresh(config, opts.refresh_remote_versions)
+                    .await?;
+                if versions.is_empty()
+                    && let Some(v) = backend.unresolved_latest_version()
+                {
+                    return build(v);
+                }
+            }
+            // A backend with no release list to resolve `latest` from (a
+            // github git source with no releases) installs under the literal
+            // `latest` directory, which the installed-version lookup skips.
+            // Offline, that install is the answer.
+            if is_offline
+                && let Some(unresolved) = backend.unresolved_latest_version()
+                && backend.list_installed_versions().contains(&unresolved)
+            {
+                return Ok(Self::from_installed(request, unresolved));
+            }
+            // Prune-style offline (opts.offline) wants a non-erroring no-op
+            // when nothing is installed — the literal "latest" can't match
+            // any installed pathname so it's safe. Global MISE_OFFLINE keeps
+            // the original error to avoid surprising upgrade/outdated callers.
+            if opts.offline {
+                return build(v);
+            }
+            return Err(Self::no_versions_found(
+                config,
+                &backend,
+                &v,
+                opts.before_date,
+                request.options().minimum_release_age(),
+                true,
+                Some(&request.options()),
+            )
+            .await);
+        }
+        let installed_matches =
+            (!opts.latest_versions).then(|| backend.list_installed_versions_matching(&v));
+        if installed_matches
+            .as_ref()
+            .is_some_and(|matches| matches.contains(&v))
+        {
+            return build(v);
+        }
+
+        let mut pin_remote_matches = None;
+        if opts.prefer_exact_version && !is_offline && !crate::semver::is_npm_semver_range_query(&v)
+        {
+            // Pinning must prove that the exact release exists before it
+            // bypasses an installed fuzzy match. Some backend exact resolvers
+            // only validate syntax and defer existence checks to installation.
+            let matches = backend
+                .list_versions_matching_with_selection_options(
+                    config,
+                    &v,
+                    &request.options(),
+                    None,
+                    opts.refresh_remote_versions,
+                )
+                .await?;
+            if matches.contains(&v) {
+                return build(v);
+            }
+            if opts.before_date.is_none() {
+                pin_remote_matches = Some(matches);
+            }
+        }
+        if !should_filter_installed_versions
+            && let Some(v) = installed_matches
+                .as_ref()
+                .and_then(|matches| matches.last())
+        {
+            return Ok(Self::from_installed(request, v.clone()));
+        }
+        if defer_missing_lazy {
+            return build(v).map(Self::into_deferred);
+        }
+        if matches!(
+            request.source(),
+            ToolSource::IdiomaticVersionFile(path)
+                if crate::config::config_file::idiomatic_version::package_json::is_package_json(path)
+        ) && crate::semver::is_npm_semver_range_query(&v)
+        {
+            if !opts.latest_versions && !should_filter_installed_versions {
+                let installed_versions = backend.list_installed_versions();
+                if let Some(matches) =
+                    crate::semver::npm_semver_range_filter(&installed_versions, &v)
+                    && let Some(v) = matches.last()
+                {
+                    return Ok(Self::from_installed(request, v.clone()));
+                }
+            }
+            if !is_offline {
+                let versions = match opts.before_date {
+                    Some(before) => {
+                        let versions_with_info = backend
+                            .list_remote_versions_with_info_with_refresh(
+                                config,
+                                opts.refresh_remote_versions,
+                            )
+                            .await?;
+                        VersionInfo::filter_by_date(versions_with_info, before)
+                            .into_iter()
+                            .map(|v| v.version)
+                            .collect()
+                    }
+                    None => {
+                        backend
+                            .list_remote_versions_with_refresh(config, opts.refresh_remote_versions)
+                            .await?
+                    }
+                };
+                if let Some(matches) = crate::semver::npm_semver_range_filter(&versions, &v)
+                    && let Some(v) = matches.last()
+                {
+                    return build(v.clone());
+                }
+            }
+        }
+        // When OFFLINE, skip ALL remote version fetching regardless of version format
+        if is_offline {
+            return build(v);
+        }
+        // In prefer-offline mode (hook-env, activate, exec), skip remote version
+        // fetching for fully-qualified versions (e.g. "2.3.2") that aren't installed.
+        // Prefix versions like "2" still need remote resolution to find e.g. "2.1.0".
+        // "latest" also needs remote resolution but is handled in the block above.
+        if prefer_offline && !opts.latest_versions && v.matches('.').count() >= 2 {
+            return build(v);
+        }
+        // A fully-qualified version usually names itself, so prefer-offline
+        // commands install it as written when the remote lookup cannot reach
+        // its server (e.g. `mise x tool@1.2.3` hitting the short prefer-offline
+        // timeout) rather than leaving it unresolved. The installer reports a
+        // missing release. Other errors, such as invalid settings, still fail.
+        let fall_back_to_literal = settings.prefer_offline()
+            && !opts.latest_versions
+            && (v.matches('.').count() >= 2 || backend.is_exact_version(&v));
+        let selection_opts = request.options();
+        match Self::resolve_remote_version(
+            config,
+            &backend,
+            &v,
+            &selection_opts,
+            opts,
+            pin_remote_matches,
+        )
+        .await
+        {
+            Ok(v) => build(v),
+            Err(err) if fall_back_to_literal && crate::http::is_unreachable(&err) => {
+                // Keyed without the error: a command can resolve more than once,
+                // and a retry fails with different text for the same cause.
+                let key = format!("version list fallback {backend}@{v}");
+                if crate::output::WARNED_ONCE.lock().unwrap().insert(key) {
+                    warn!(
+                        "failed to fetch versions for {backend}, installing {v} as written: {err:#}"
+                    );
+                }
+                build(v)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The remote half of [`Self::resolve_version`]: resolves `v` against the
+    /// backend's upstream versions.
+    async fn resolve_remote_version(
+        config: &Arc<Config>,
+        backend: &ABackend,
+        v: &str,
+        selection_opts: &ToolVersionOptions,
+        opts: &ResolveOptions,
+        pin_remote_matches: Option<Vec<String>>,
+    ) -> Result<String> {
+        // Exact pinned versions do not need the full versions list when the
+        // backend can validate them directly or defer validation to its
+        // installer. This also keeps explicit pins outside release-age
+        // filtering. If the backend returns None, fall through to normal
+        // prefix resolution so requests like "1.2.3" can still resolve to
+        // "1.2.3.4" when that is the latest matching version.
+        if (v.matches('.').count() >= 2 || backend.is_exact_version(v))
+            && let Some(v) = backend.resolve_exact_version(config, v).await?
+        {
+            return Ok(v);
+        }
+        // First try with date filter (common case)
+        let matches = match pin_remote_matches {
+            Some(matches) => matches,
+            None => {
+                // The answer the matches below would give, when the versions
+                // index can prove it without the full list.
+                if let Some(version) = Box::pin(backend::resolve_from_versions_index(
+                    backend.as_ref(),
+                    config,
+                    v,
+                    IndexPick::Request,
+                    selection_opts,
+                    opts.before_date,
+                    opts.refresh_remote_versions,
+                ))
+                .await
+                {
+                    return Ok(version);
+                }
+                backend
+                    .list_versions_matching_with_selection_options(
+                        config,
+                        v,
+                        selection_opts,
+                        opts.before_date,
+                        opts.refresh_remote_versions,
+                    )
+                    .await?
+            }
+        };
+        if matches.iter().any(|m| m == v) {
+            return Ok(v.to_string());
+        }
+        if let Some(v) = matches.last() {
+            return Ok(v.clone());
+        }
+        // If date filter is active and exact version not found, check without filter.
+        // Explicit pinned versions like "22.5.0" should not be filtered by date.
+        if let Some(before) = opts.before_date {
+            let all_versions = backend
+                .list_versions_matching_with_selection_options(
+                    config,
+                    v,
+                    selection_opts,
+                    None,
+                    false,
+                )
+                .await?;
+            if all_versions.iter().any(|m| m == v) {
+                // Exact match exists but was filtered by date - use it anyway
+                return Ok(v.to_string());
+            }
+            // Nothing matched because the cutoff hid every candidate. Returning
+            // the request text would hand a prefix like `1` to the installer as
+            // if it were a version.
+            let hidden = backend
+                .versions_hidden_by_before_date(config, v, before, Some(selection_opts))
+                .await
+                .unwrap_or_default();
+            if !hidden.is_empty() {
+                return Err(Self::no_versions_found(
+                    config,
+                    backend,
+                    v,
+                    opts.before_date,
+                    selection_opts.minimum_release_age(),
+                    true,
+                    Some(selection_opts),
+                )
+                .await);
+            }
+        }
+        Ok(v.to_string())
+    }
+
+    /// resolve a version like `sub-1:12.0.0` which becomes `11.0.0`, `sub-0.1:12.1.0` becomes `12.0.0`
+    async fn resolve_sub(
+        config: &Arc<Config>,
+        request: ToolRequest,
+        sub: &str,
+        v: &str,
+        opts: &ResolveOptions,
+    ) -> Result<Self> {
+        let request = request.with_registry_version(v);
+        let backend = request.backend()?;
+        let opts = &Self::without_covered_refresh(config, &request, &backend, opts).await;
+        if v == "latest" && opts.offline {
+            let pathname = request.version().replace([':', '/'], "-");
+            let path = backend.ba().installs_path().join(&pathname);
+            let path = env::find_in_shared_installs(path, &backend.ba().tool_dir_name(), &pathname);
+            if let Ok(Some(target)) = crate::file::resolve_symlink(&path)
+                && target.starts_with("./")
+                && let Some(version) = target.file_name().map(|v| v.to_string_lossy().to_string())
+            {
+                return Box::pin(Self::resolve_version(config, request, &version, opts)).await;
+            }
+            // Can't resolve sub-N:latest offline (no remote latest, and
+            // applying version_sub to latest_installed_version would shift
+            // one step too low). Return the raw spec; callers that care
+            // (`get_versions_needed_by_tracked_configs`) over-protect by
+            // keeping all installed versions of this backend.
+            let version = request.version();
+            return Ok(Self::new(request, version));
+        }
+        let v = resolve_sub_base(
+            config,
+            &backend,
+            sub,
+            v,
+            opts.before_date,
+            opts.refresh_remote_versions,
+        )
+        .await?;
+        Box::pin(Self::resolve_version(config, request, &v, opts)).await
+    }
+
+    async fn resolve_prefix(
+        config: &Arc<Config>,
+        request: ToolRequest,
+        prefix: &str,
+        opts: &ResolveOptions,
+    ) -> Result<Self> {
+        let request = request.with_registry_version(prefix);
+        let backend = request.backend()?;
+        let opts = &Self::without_covered_refresh(config, &request, &backend, opts).await;
+        let settings = Settings::get();
+        let is_offline = settings.offline() || opts.offline;
+        let prefer_offline =
+            settings.prefer_offline() && !matches!(request.source(), ToolSource::Argument);
+        let should_filter_installed_versions = opts.filter_installed_versions_by_release_date
+            && opts.before_date.is_some()
+            && !opts.before_date_from_default
+            && !is_offline
+            && !prefer_offline;
+        if !opts.latest_versions
+            && !should_filter_installed_versions
+            && let Some(v) = backend.list_installed_versions_matching(prefix).last()
+        {
+            return Ok(Self::from_installed(request, v.to_string()));
+        }
+        if opts.offline {
+            return Ok(Self::new(request, prefix.to_string()));
+        }
+        let selection_opts = request.options();
+        if let Some(v) = Box::pin(backend::resolve_from_versions_index(
+            backend.as_ref(),
+            config,
+            prefix,
+            IndexPick::Last,
+            &selection_opts,
+            opts.before_date,
+            opts.refresh_remote_versions,
+        ))
+        .await
+        {
+            return Ok(Self::new(request, v));
+        }
+        let matches = backend
+            .list_versions_matching_with_selection_options(
+                config,
+                prefix,
+                &selection_opts,
+                opts.before_date,
+                opts.refresh_remote_versions,
+            )
+            .await?;
+        let Some(v) = matches.last() else {
+            return Err(Self::no_versions_found(
+                config,
+                &backend,
+                prefix,
+                opts.before_date,
+                request.options().minimum_release_age(),
+                true,
+                Some(&request.options()),
+            )
+            .await);
+        };
+        Ok(Self::new(request, v.to_string()))
+    }
+
+    fn resolve_ref(ref_: String, ref_type: String, tr: &ToolRequest) -> Self {
+        let request = tr.to_ref(ref_, ref_type);
+        let version = request.version();
+        Self::new(request, version)
+    }
+
+    fn resolve_path(path: PathBuf, tr: &ToolRequest) -> Result<ToolVersion> {
+        let path = fs::canonicalize(path)?;
+        let request = tr.to_path(path);
+        let version = request.version();
+        Ok(Self::new(request, version))
+    }
+}
+
+/// Resolve the base of a `sub-N:<base>` request and subtract from it.
+///
+/// `base` may be `latest` or an alias such as `lts`, neither of which
+/// `tool_request::version_sub` can subtract from — it needs a concrete version. Every
+/// command that accepts `sub-N:` must go through here; skipping this step is what made
+/// `mise ls-remote <tool>@sub-2:lts` panic.
+pub async fn resolve_sub_base(
+    config: &Arc<Config>,
+    backend: &ABackend,
+    sub: &str,
+    base: &str,
+    before_date: Option<Timestamp>,
+    refresh_remote_versions: bool,
+) -> Result<String> {
+    // An alias can point at `latest`, so the alias is resolved first and the result is
+    // then treated exactly like a literal `latest` — otherwise the string `latest`
+    // reaches the subtraction, which cannot do anything with it.
+    let base = if base == "latest" {
+        base.to_string()
+    } else {
+        config.resolve_alias(backend, base).await?
+    };
+    let v = if base == "latest" {
+        match backend
+            .latest_version_with_refresh(config, None, before_date, refresh_remote_versions)
+            .await?
+        {
+            Some(v) => v,
+            None => {
+                // No per-tool option to pass here: `minimum_release_age_label`
+                // only names a value that resolves to the actual cutoff, so a
+                // tool that overrides it simply goes unnamed instead of being
+                // labelled with the global one.
+                return Err(ToolVersion::no_versions_found(
+                    config,
+                    backend,
+                    "latest",
+                    before_date,
+                    None,
+                    false,
+                    None,
+                )
+                .await);
+            }
+        }
+    } else {
+        base
+    };
+    tool_request::version_sub(&v, sub)
+}
+
+impl Display for ToolVersion {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}@{}", self.ba().full(), self.display_version())
+    }
+}
+
+impl PartialEq for ToolVersion {
+    fn eq(&self, other: &Self) -> bool {
+        self.ba() == other.ba()
+            && self.version == other.version
+            && self.aube_install_identity() == other.aube_install_identity()
+            && self.uv_install_identity() == other.uv_install_identity()
+    }
+}
+
+impl Eq for ToolVersion {}
+
+impl PartialOrd for ToolVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ToolVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match self.request.ba().as_ref().cmp(other.ba()) {
+            Ordering::Equal => self
+                .version
+                .cmp(&other.version)
+                .then_with(|| self.tv_pathname().cmp(&other.tv_pathname())),
+            o => o,
+        }
+    }
+}
+
+impl Hash for ToolVersion {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.ba().hash(state);
+        self.version.hash(state);
+        self.uv_install_identity().hash(state);
+        if let Some(identity) = self.aube_install_identity() {
+            identity.hash(state);
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolveOptions {
+    pub latest_versions: bool,
+    /// Apply `latest_versions` to every request in a toolset, not only
+    /// `latest` and rolling channels, so a selector such as `6` resolves to
+    /// the newest remote match instead of the newest installed one.
+    /// `mise lock --bump` needs this; `mise x node@20 npm@latest` must not
+    /// look up newer Node releases.
+    pub latest_versions_for_all_requests: bool,
+    /// Apply `latest_versions` and `use_locked_version = false` only to tools
+    /// named as command-line arguments. Configured tools keep resolving
+    /// against installed versions and the lockfile, so `mise x tool@latest`
+    /// does not bump every `latest` tool in mise.toml past what is installed.
+    pub latest_versions_for_arguments_only: bool,
+    pub use_locked_version: bool,
+    /// Resolve rolling channels to their current concrete version even when
+    /// ordinary version requests may reuse installed versions.
+    pub resolve_rolling_channels: bool,
+    /// Prefer an exact remote release over a fuzzy installed match.
+    pub prefer_exact_version: bool,
+    /// Only consider versions released before this timestamp
+    pub before_date: Option<Timestamp>,
+    /// `before_date` came from the built-in default release age rather than
+    /// explicit configuration (CLI flag, per-tool option, or the
+    /// `minimum_release_age` setting). This provenance is included in trace
+    /// output to distinguish the implicit policy from a user-selected cutoff.
+    pub before_date_from_default: bool,
+    /// Resolve fuzzy installed matches against release metadata when a cutoff
+    /// is active. This is reserved for discovery flows such as lockfile
+    /// generation; ordinary resolution treats installed versions as eligible.
+    pub filter_installed_versions_by_release_date: bool,
+    /// Additive to `Settings::offline()` — either being true skips remote version listing.
+    pub offline: bool,
+    /// Ignore cached remote version lists while resolving this request.
+    pub refresh_remote_versions: bool,
+    /// Include installed-but-inactive versions that do not have a known config source
+    /// (for example `ToolSource::Unknown`) when resolving tools for flows like
+    /// outdated/upgrade checks.
+    pub inactive: bool,
+    /// Look up where to read about each outdated version
+    /// (`OutdatedInfo::release_url`). Only `mise outdated --json` reports it,
+    /// and the lookup can read a version list that resolution did not need.
+    pub outdated_release_urls: bool,
+    /// If false, missing lockfile entries log at debug instead of warn.
+    pub warn_not_in_lockfile: bool,
+    /// Under `prefer_offline`, leave a lazy tool that has no installed match at its
+    /// requested version instead of listing remote versions. Installing it through its
+    /// shim resolves the request then.
+    pub defer_missing_lazy_tools: bool,
+    /// Defer those lazy tools even when not under `prefer_offline`. For a command that
+    /// manages one tool's versions and so resolves the others only to look them up.
+    pub defer_missing_lazy_online: bool,
+    /// Keep a version 0 lockfile's only entry for a tool whose alias has
+    /// moved (`lts` -> `26` with `24.13.0` locked). `mise lock --upgrade`
+    /// sets it so the upgrade binds the alias to that pin instead of
+    /// re-resolving it.
+    pub keep_moved_alias_pins: bool,
+    /// Resolve as `--locked` does, whatever the settings say: a request the
+    /// lockfile does not hold fails with `Error::NotInLockfile`.
+    /// `mise lock --check` sets it.
+    pub locked: bool,
+}
+
+impl Default for ResolveOptions {
+    fn default() -> Self {
+        Self {
+            latest_versions: false,
+            latest_versions_for_all_requests: false,
+            latest_versions_for_arguments_only: false,
+            use_locked_version: true,
+            resolve_rolling_channels: false,
+            prefer_exact_version: false,
+            before_date: None,
+            before_date_from_default: false,
+            filter_installed_versions_by_release_date: false,
+            offline: false,
+            refresh_remote_versions: false,
+            inactive: false,
+            outdated_release_urls: false,
+            warn_not_in_lockfile: true,
+            defer_missing_lazy_tools: false,
+            defer_missing_lazy_online: false,
+            keep_moved_alias_pins: false,
+            locked: false,
+        }
+    }
+}
+
+impl ResolveOptions {
+    /// Full-toolset resolve used as a side effect of another operation.
+    pub fn without_lockfile_warnings() -> Self {
+        Self {
+            warn_not_in_lockfile: false,
+            ..Default::default()
+        }
+    }
+
+    /// Merge the effective release-age cutoff for a tool into these options.
+    /// A cutoff pre-resolved by the caller keeps its provenance flag; cutoffs
+    /// resolved here are flagged by source so installed-version fast paths
+    /// can ignore the built-in default.
+    pub fn apply_before_date_for_tool(
+        &mut self,
+        backend_arg: &BackendArg,
+        minimum_release_age: Option<&str>,
+    ) -> Result<()> {
+        match resolve_before_date_for_tool_with_source(
+            backend_arg,
+            self.before_date,
+            minimum_release_age,
+        )? {
+            Some((ts, source)) => {
+                self.before_date = Some(ts);
+                match source {
+                    BeforeDateSource::Provided => {}
+                    BeforeDateSource::Explicit => self.before_date_from_default = false,
+                    BeforeDateSource::Default => self.before_date_from_default = true,
+                }
+            }
+            None => {
+                self.before_date = None;
+                self.before_date_from_default = false;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Check if a tool has a user-linked version (created by `mise link`) that could
+/// satisfy `version`. A linked version is an installed version whose path is a symlink
+/// to an external absolute path, as opposed to runtime symlinks or mise-managed
+/// install/cache links. A link that `version` cannot select (`node@22` linked while the
+/// config asks for `24.21.0`) is not a candidate, so it must not displace the lockfile.
+/// The lockfile query for what an alias expanded to: a `prefix:` selector
+/// matches the bare prefix on a separator boundary, since the lockfile
+/// stores concrete versions (#5781).
+fn lock_query(version: &str) -> (&str, bool) {
+    match version.strip_prefix("prefix:") {
+        Some(prefix) => (prefix, true),
+        None => (version, false),
+    }
+}
+
+fn has_linked_version(ba: &BackendArg, version: &str) -> bool {
+    if install_state::get_tool_full(&ba.short)
+        .is_some_and(|installed| installed != ba.full_without_opts())
+    {
+        return false;
+    }
+    let installs_dir = &ba.installs_path();
+    let Ok(entries) = std::fs::read_dir(installs_dir) else {
+        return false;
+    };
+    let backend = ba.backend().ok();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(Some(target)) = crate::file::resolve_symlink(&path) {
+            // Runtime symlinks start with "./" (e.g., latest -> ./1.35.0)
+            // User-linked symlinks point to absolute paths (e.g., brew -> /opt/homebrew/opt/hk)
+            if target.is_absolute()
+                && !is_mise_managed_symlink_target(&target)
+                && !is_rustup_install(ba, &path, &target)
+                && path.file_name().is_some_and(|name| {
+                    linked_name_satisfies(&name.to_string_lossy(), version, backend.as_deref())
+                })
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether a link named `name` is the very version `version` spells, including the
+/// directory name a `ref:`/`tag:` request is stored under.
+fn linked_name_is_exact(name: &str, version: &str) -> bool {
+    let version = version.strip_prefix("prefix:").unwrap_or(version);
+    name == version || name == version.replace([':', '/'], "-")
+}
+
+/// Whether a link named `name` is something a request for `version` selects. Any link
+/// satisfies `latest`, and an exact name always does; otherwise the backend's own
+/// installed-version matching decides (separators, `v` prefixes, pre-release hiding).
+fn linked_name_satisfies(
+    name: &str,
+    version: &str,
+    backend: Option<&dyn backend::Backend>,
+) -> bool {
+    let version = version.strip_prefix("prefix:").unwrap_or(version);
+    if version == "latest" || linked_name_is_exact(name, version) {
+        return true;
+    }
+    match backend {
+        Some(backend) => {
+            let filter = !backend.include_prereleases(&backend.ba().opts());
+            !backend
+                .fuzzy_match_filter(vec![name.to_string()], version, filter)
+                .is_empty()
+        }
+        None => crate::backend::fuzzy_version_matches(version, name),
+    }
+}
+
+/// core:rust installs are symlinks to rustup's `$CARGO_HOME/bin`, which sits
+/// outside mise's directories. They are named after the rustup toolchain they
+/// stand for (`1.99.0`, `stable`, `nightly-2026-10-01`), so a link to that
+/// directory under any other name is a user's `mise link`.
+fn is_rustup_install(ba: &BackendArg, link: &Path, target: &Path) -> bool {
+    let rustup = if cfg!(windows) {
+        "rustup.exe"
+    } else {
+        "rustup"
+    };
+    ba.full_without_opts() == "core:rust"
+        && target.join(rustup).exists()
+        && link
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_rustup_toolchain_spec)
+}
+
+fn is_rustup_toolchain_spec(name: &str) -> bool {
+    let channel = name.split('-').next().unwrap_or(name);
+    matches!(channel, "stable" | "beta" | "nightly")
+        || (channel.split('.').count() >= 2
+            && channel
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())))
+}
+
+fn is_mise_managed_symlink_target(target: &Path) -> bool {
+    debug_assert!(target.is_absolute(), "caller filters relative targets");
+    let target = normalize_path_components(target);
+
+    [
+        *dirs::DATA,
+        *dirs::CACHE,
+        *dirs::DOWNLOADS,
+        *dirs::INSTALLS,
+        *dirs::INSTALL_STORE,
+    ]
+    .into_iter()
+    .any(|root| target.starts_with(normalize_path_components(root)))
+        || env::shared_install_dirs()
+            .iter()
+            .any(|root| target.starts_with(normalize_path_components(root)))
+}
+
+fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push("..");
+                }
+            }
+            Component::CurDir => {}
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+impl Display for ResolveOptions {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        let mut opts = vec![];
+        if self.latest_versions {
+            opts.push("latest_versions".to_string());
+        }
+        if self.latest_versions_for_all_requests {
+            opts.push("latest_versions_for_all_requests".to_string());
+        }
+        if self.latest_versions_for_arguments_only {
+            opts.push("latest_versions_for_arguments_only".to_string());
+        }
+        if self.use_locked_version {
+            opts.push("use_locked_version".to_string());
+        }
+        if self.resolve_rolling_channels {
+            opts.push("resolve_rolling_channels".to_string());
+        }
+        if self.prefer_exact_version {
+            opts.push("prefer_exact_version".to_string());
+        }
+        if let Some(ts) = &self.before_date {
+            if self.before_date_from_default {
+                opts.push(format!("before_date={ts} (default)"));
+            } else {
+                opts.push(format!("before_date={ts}"));
+            }
+        }
+        if self.offline {
+            opts.push("offline".to_string());
+        }
+        if self.refresh_remote_versions {
+            opts.push("refresh_remote_versions".to_string());
+        }
+        if !self.warn_not_in_lockfile {
+            opts.push("no_lockfile_warnings".to_string());
+        }
+        write!(f, "({})", opts.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::BackendResolution;
+    use crate::toolset::{CoreToolOptions, ToolOptionSource, ToolVersionOptions};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_name(prefix: &str) -> String {
+        format!(
+            "{}-{}",
+            prefix,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    fn test_backend(installs_path: PathBuf) -> BackendArg {
+        let short = unique_name("dummy-linked");
+        let mut backend = BackendArg::new_raw(
+            short.clone(),
+            None,
+            short,
+            None,
+            BackendResolution::new(false),
+        );
+        backend.set_installs_path(installs_path);
+        backend
+    }
+
+    #[test]
+    fn ref_pathname_preserves_selector_type() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let backend = Arc::new(test_backend(temp_dir.path().join("installs")));
+
+        for (version, pathname) in [
+            ("ref:main", "ref-main"),
+            ("rev:abc123", "rev-abc123"),
+            ("tag:v1.0.0", "tag-v1.0.0"),
+            ("branch:main", "branch-main"),
+        ] {
+            let request = ToolRequest::new(backend.clone(), version, ToolSource::Argument).unwrap();
+            let tv = ToolVersion::new(request, version.to_string());
+            assert_eq!(tv.tv_pathname(), pathname);
+        }
+    }
+
+    #[test]
+    fn uv_install_identity_ignores_when_the_graph_was_locked() {
+        use crate::lockfile::{GraphRef, UvLock};
+        let tv_locked_at = |cutoff: &str, age: &str| {
+            let graph_text =
+                format!("version = 1\nrevision = 3\n\n[options]\nexclude-newer = \"{cutoff}\"\n");
+            let pipx = Arc::new(BackendArg::from("pipx:ansible-lint"));
+            let mut options = ToolVersionOptions::default();
+            options.opts.insert(
+                "minimum_release_age".to_string(),
+                toml::Value::String(age.to_string()),
+            );
+            let request =
+                ToolRequest::new_with_options(pipx, "26.8.0", options, ToolSource::Argument)
+                    .unwrap();
+            let mut tv = ToolVersion::new(request, "26.8.0".into());
+            tv.uv_python = Some((PathBuf::from("/python"), "cpython-3.13".into()));
+            tv.uv_lock = Some(GraphRef::from(UvLock {
+                project: toml::Table::new(),
+                graph: graph_text.parse().unwrap(),
+                graph_text,
+            }));
+            tv
+        };
+        let monday = tv_locked_at("2026-10-26T09:00:00Z", "7d");
+        let tuesday = tv_locked_at("2026-10-27T17:30:00Z", "14d");
+        assert_eq!(monday.tv_pathname(), tuesday.tv_pathname());
+        assert_eq!(monday, tuesday);
+    }
+
+    #[test]
+    fn display_version_only_hides_aube_identity_for_npm() {
+        let version = "release~aube~0123456789abcdef";
+        let github = Arc::new(BackendArg::from("github:owner/tool"));
+        let request = ToolRequest::new(github, version, ToolSource::Argument).unwrap();
+        assert_eq!(
+            ToolVersion::new(request, version.into()).display_version(),
+            version
+        );
+
+        let npm = Arc::new(BackendArg::from("npm:tool"));
+        let request = ToolRequest::new(npm, version, ToolSource::Argument).unwrap();
+        assert_eq!(
+            ToolVersion::new(request, version.into()).display_version(),
+            "release"
+        );
+    }
+
+    #[test]
+    fn strip_install_path_identity_keeps_the_found_directory() {
+        let dir = "3.9.6~aube~de4f77e9115401ed";
+        let npm = Arc::new(BackendArg::from("npm:prettier"));
+        let request = ToolRequest::new(npm, "latest", ToolSource::Argument).unwrap();
+        let mut tv = ToolVersion::new(request, dir.into());
+        let install_path = tv.install_path();
+        tv.strip_install_path_identity();
+        assert_eq!(tv.version, "3.9.6");
+        assert_eq!(tv.install_path(), install_path);
+        assert!(install_path.ends_with(dir));
+
+        let github = Arc::new(BackendArg::from("github:owner/tool"));
+        let request = ToolRequest::new(github, "latest", ToolSource::Argument).unwrap();
+        let mut tv = ToolVersion::new(request, dir.into());
+        tv.strip_install_path_identity();
+        assert_eq!(tv.version, dir);
+    }
+
+    #[test]
+    fn request_pinned_this_version_only_matches_a_literal_pin() {
+        let backend = Arc::new(BackendArg::from("packslip:github.com/jdx/hk"));
+        let pinned = |requested: &str, resolved: &str| {
+            let request =
+                ToolRequest::new(backend.clone(), requested, ToolSource::Argument).unwrap();
+            ToolVersion::new(request, resolved.to_string()).request_pinned_this_version()
+        };
+
+        // The request names the release that was installed.
+        assert!(pinned("2.0.1", "2.0.1"));
+        // Non-semver versions are just as pinnable — the check is a string
+        // comparison, not a version parse.
+        assert!(pinned("2026.9.9", "2026.9.9"));
+        assert!(pinned("nightly-2026-09-15", "nightly-2026-09-15"));
+
+        // Fuzzy requests let release age pick the version, so it still governs.
+        assert!(!pinned("2", "2.0.1"));
+        assert!(!pinned("2.0", "2.0.1"));
+        assert!(!pinned("latest", "2.0.1"));
+        // A moving pointer stays unpinned even when it names itself.
+        assert!(!pinned("latest", "latest"));
+
+        // A ref is not a version request at all.
+        let request = ToolRequest::new(backend, "ref:main", ToolSource::Argument).unwrap();
+        assert!(
+            !ToolVersion::new(request, "ref:main".to_string()).request_pinned_this_version(),
+            "a ref names a moving target, not a release"
+        );
+    }
+
+    #[test]
+    fn from_lockfile_drops_registry_options_when_the_lock_binds_another_backend() {
+        let restore = |backend: &str| {
+            let request = ToolRequest::new_with_options(
+                Arc::new(BackendArg::new("hk".to_string(), None)),
+                "latest",
+                ToolVersionOptions::default(),
+                ToolSource::Argument,
+            )
+            .unwrap();
+            assert!(
+                request.options().opts.contains_key("workflow"),
+                "the registry pins hk's signing workflow"
+            );
+            let lt = LockfileTool {
+                version: "1.58.1".to_string(),
+                backend: Some(backend.to_string()),
+                specifiers: Default::default(),
+                options: Default::default(),
+                platforms: Default::default(),
+                aube: None,
+                uv: None,
+                provenance: None,
+            };
+            ToolVersion::from_lockfile(request, lt).request.options()
+        };
+        assert!(!restore("aqua:jdx/hk").opts.contains_key("workflow"));
+        // An entry pinned below the registry's `min_version` for Packslip still
+        // binds a request made with `latest`, which carries Packslip's options.
+        let older = {
+            let request = ToolRequest::new_with_options(
+                Arc::new(BackendArg::new("hk".to_string(), None)),
+                "latest",
+                ToolVersionOptions::default(),
+                ToolSource::Argument,
+            )
+            .unwrap();
+            let lt = LockfileTool {
+                version: "1.57.0".to_string(),
+                backend: Some("aqua:jdx/hk".to_string()),
+                specifiers: Default::default(),
+                options: Default::default(),
+                platforms: Default::default(),
+                aube: None,
+                uv: None,
+                provenance: None,
+            };
+            ToolVersion::from_lockfile(request, lt).request.options()
+        };
+        assert!(!older.opts.contains_key("workflow"));
+        // Options a non-first registry backend supplied stay with that backend:
+        // below github's `min_version` the registry picks npm for nub.
+        let nub = |backend: &str| {
+            let request = ToolRequest::new_with_options(
+                Arc::new(BackendArg::new("nub".to_string(), None)),
+                "0.9.0",
+                ToolVersionOptions::default(),
+                ToolSource::Argument,
+            )
+            .unwrap();
+            assert!(request.options().opts.contains_key("allow_builds"));
+            let lt = LockfileTool {
+                version: "0.9.0".to_string(),
+                backend: Some(backend.to_string()),
+                specifiers: Default::default(),
+                options: Default::default(),
+                platforms: Default::default(),
+                aube: None,
+                uv: None,
+                provenance: None,
+            };
+            ToolVersion::from_lockfile(request, lt).request.options()
+        };
+        assert!(nub("npm:@nubjs/nub").opts.contains_key("allow_builds"));
+        assert!(!nub("github:nubjs/nub").opts.contains_key("allow_builds"));
+        assert!(
+            restore("packslip:github.com/jdx/hk")
+                .opts
+                .contains_key("workflow")
+        );
+        // Another project of the same backend type is not the registry's choice.
+        assert!(
+            !restore("packslip:github.com/other/hk")
+                .opts
+                .contains_key("workflow")
+        );
+    }
+
+    #[test]
+    fn from_lockfile_applies_backend_and_preserves_request_options() {
+        let backend = Arc::new(BackendArg::new("npm".to_string(), None));
+        let mut options = ToolVersionOptions {
+            core: CoreToolOptions {
+                depends: Some(vec!["node".to_string()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        options.install_env.insert(
+            "NODE_OPTIONS".to_string(),
+            EnvValue::from("--enable-source-maps"),
+        );
+        options.opts.insert(
+            "registry".to_string(),
+            toml::Value::String("https://registry.example.test".to_string()),
+        );
+        let mut request =
+            ToolRequest::new_with_options(backend, "latest", options, ToolSource::Argument)
+                .unwrap();
+        let owner = ToolSource::MiseToml("/project/mise.toml".into());
+        request.set_lockfile_scope(crate::toolset::tool_request::LockfileScope::Source(
+            owner.clone(),
+        ));
+        let lt = LockfileTool {
+            version: "11.17.0".to_string(),
+            backend: Some("npm:npm".to_string()),
+            specifiers: Default::default(),
+            options: BTreeMap::from([("registry".to_string(), "lockfile-value".to_string())]),
+            platforms: Default::default(),
+            aube: None,
+            uv: None,
+            provenance: None,
+        };
+
+        let tv = ToolVersion::from_lockfile(request, lt);
+        let options = tv.request.options();
+
+        assert_eq!(tv.version, "11.17.0");
+        assert!(tv.locked);
+        assert!(tv.resolved_from_lockfile());
+        assert_eq!(tv.ba().full_without_opts(), "npm:npm");
+        assert_eq!(tv.request.source(), &ToolSource::Argument);
+        assert_eq!(tv.request.lockfile_source(), Some(&owner));
+        assert_eq!(options.depends, Some(vec!["node".to_string()]));
+        assert_eq!(
+            options.install_env.get("NODE_OPTIONS"),
+            Some(&EnvValue::String("--enable-source-maps".to_string()))
+        );
+        assert_eq!(
+            options.opts.get("registry"),
+            Some(&toml::Value::String(
+                "https://registry.example.test".to_string()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn ref_resolution_preserves_request_option_source() {
+        crate::toolset::install_state::init().await.unwrap();
+        let backend = Arc::new(BackendArg::from("solidity"));
+        let mut options = ToolVersionOptions::default();
+        options
+            .opts
+            .insert("bin".to_string(), toml::Value::String("solc".to_string()));
+        let request =
+            ToolRequest::new_with_options(backend, "latest", options.clone(), ToolSource::Argument)
+                .unwrap();
+
+        let resolved = ToolVersion::resolve_ref("main".to_string(), "ref".to_string(), &request);
+
+        assert_eq!(
+            resolved.request.option_source("bin"),
+            Some(ToolOptionSource::Request)
+        );
+        assert_eq!(resolved.request.options().get("bin"), Some("solc"));
+    }
+
+    #[test]
+    fn has_linked_version_detects_external_absolute_targets() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let backend = test_backend(temp_dir.path().join("installs").join("dummy"));
+        fs::create_dir_all(backend.installs_path())?;
+
+        let external_target = temp_dir.path().join("external").join("tool");
+        fs::create_dir_all(&external_target)?;
+        crate::file::make_symlink_or_file(&external_target, &backend.installs_path().join("brew"))?;
+
+        assert!(has_linked_version(&backend, "latest"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn has_linked_version_ignores_rustup_bin_dir_for_core_rust() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let mut backend = BackendArg::new_raw(
+            "rust".to_string(),
+            Some("core:rust".to_string()),
+            "rust".to_string(),
+            None,
+            BackendResolution::new(false),
+        );
+        backend.set_installs_path(temp_dir.path().join("installs").join("rust"));
+        fs::create_dir_all(backend.installs_path())?;
+
+        let cargo_bin = temp_dir.path().join("cargo").join("bin");
+        fs::create_dir_all(&cargo_bin)?;
+        let rustup = if cfg!(windows) {
+            "rustup.exe"
+        } else {
+            "rustup"
+        };
+        fs::write(cargo_bin.join(rustup), "")?;
+        crate::file::make_symlink_or_file(&cargo_bin, &backend.installs_path().join("1.99.0"))?;
+        assert!(!has_linked_version(&backend, "latest"));
+
+        // A user link to the same directory under a non-toolchain name stays linked.
+        let custom = backend.installs_path().join("custom");
+        crate::file::make_symlink_or_file(&cargo_bin, &custom)?;
+        assert!(has_linked_version(&backend, "latest"));
+        fs::remove_file(&custom)?;
+
+        let other = temp_dir.path().join("other");
+        fs::create_dir_all(&other)?;
+        crate::file::make_symlink_or_file(&other, &backend.installs_path().join("custom"))?;
+        assert!(has_linked_version(&backend, "latest"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn rustup_toolchain_spec_matches_mise_created_names() {
+        for name in [
+            "1.99.0",
+            "1.99",
+            "stable",
+            "beta",
+            "nightly",
+            "nightly-2026-10-01",
+            "1.99.0-x86_64-unknown-linux-gnu",
+        ] {
+            assert!(is_rustup_toolchain_spec(name), "{name}");
+        }
+        for name in ["custom", "latest", "1", "1.x", "my-stable", ""] {
+            assert!(!is_rustup_toolchain_spec(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn has_linked_version_normalizes_absolute_targets_before_managed_check() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let backend = test_backend(temp_dir.path().join("installs").join("dummy"));
+        fs::create_dir_all(backend.installs_path())?;
+
+        let escaped_target = dirs::DATA
+            .join("..")
+            .join("has-linked-version-external")
+            .join("tool");
+        if let Some(parent) = escaped_target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        crate::file::make_symlink_or_file(
+            &escaped_target,
+            &backend.installs_path().join("escaped"),
+        )?;
+
+        assert!(has_linked_version(&backend, "latest"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn has_linked_version_ignores_mise_managed_absolute_targets() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let backend = test_backend(temp_dir.path().join("installs").join("dummy"));
+        fs::create_dir_all(backend.installs_path())?;
+
+        let mut managed_targets = vec![];
+        let mut roots = vec![
+            ("data".to_string(), dirs::DATA.to_path_buf()),
+            ("cache".to_string(), dirs::CACHE.to_path_buf()),
+            ("downloads".to_string(), dirs::DOWNLOADS.to_path_buf()),
+            ("installs".to_string(), dirs::INSTALLS.to_path_buf()),
+        ];
+        roots.extend(
+            env::shared_install_dirs()
+                .into_iter()
+                .enumerate()
+                .map(|(i, root)| (format!("shared-{i}"), root)),
+        );
+
+        for (name, root) in roots {
+            fs::create_dir_all(&root)?;
+            let target = tempfile::Builder::new()
+                .prefix(&format!("has-linked-version-{name}-"))
+                .tempdir_in(&root)?;
+            crate::file::make_symlink_or_file(
+                target.path(),
+                &backend.installs_path().join(format!("{name}-target")),
+            )?;
+            managed_targets.push(target);
+        }
+
+        assert!(!has_linked_version(&backend, "latest"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn linked_name_satisfies_follows_backend_matching() {
+        assert!(linked_name_satisfies("v3.2.0", "3", None));
+        assert!(linked_name_satisfies("3.2.0-custom", "3", None));
+        assert!(linked_name_satisfies("3.2+build", "3.2", None));
+        assert!(linked_name_satisfies("brew", "latest", None));
+        assert!(!linked_name_satisfies("3.20", "3.2", None));
+        assert!(!linked_name_satisfies("22", "24.21.0", None));
+        assert!(linked_name_is_exact("ref-main", "ref:main"));
+    }
+
+    #[test]
+    fn has_linked_version_ignores_links_the_request_cannot_select() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let backend = test_backend(temp_dir.path().join("installs").join("dummy"));
+        fs::create_dir_all(backend.installs_path())?;
+
+        let external_target = temp_dir.path().join("external").join("tool");
+        fs::create_dir_all(&external_target)?;
+        crate::file::make_symlink_or_file(&external_target, &backend.installs_path().join("22"))?;
+
+        assert!(!has_linked_version(&backend, "24.21.0"));
+        assert!(!has_linked_version(&backend, "2"));
+        assert!(has_linked_version(&backend, "22"));
+        assert!(has_linked_version(&backend, "latest"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn has_linked_version_ignores_runtime_relative_targets() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let backend = test_backend(temp_dir.path().join("installs").join("dummy"));
+        fs::create_dir_all(backend.installs_path())?;
+
+        crate::file::make_symlink_or_file(
+            Path::new("./1.0.0"),
+            &backend.installs_path().join("latest"),
+        )?;
+
+        assert!(!has_linked_version(&backend, "latest"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_path_does_not_return_file_based_runtime_symlink() -> Result<()> {
+        reset_install_path_cache();
+
+        let temp_dir = tempfile::tempdir()?;
+        let short = format!(
+            "dummy-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut backend = BackendArg::new_raw(
+            short.clone(),
+            None,
+            short,
+            None,
+            BackendResolution::new(false),
+        );
+        backend.set_installs_path(temp_dir.path().join("installs").join("dummy"));
+
+        let install_path = backend.installs_path().join("1.0.1");
+        fs::create_dir_all(install_path.join("bin"))?;
+        fs::write(backend.installs_path().join("1.0"), "./1.0.1")?;
+
+        let request = ToolRequest::new(Arc::new(backend), "1.0", ToolSource::Argument).unwrap();
+        let tv = ToolVersion::new(request, "1.0.1".into());
+
+        let runtime_path = tv.runtime_path();
+        assert_eq!(runtime_path, install_path);
+        assert!(runtime_path.is_dir());
+
+        Ok(())
+    }
+
+    #[test]
+    fn with_locked_runtime_path_uses_install_path_for_fuzzy_request() -> Result<()> {
+        reset_install_path_cache();
+
+        let temp_dir = tempfile::tempdir()?;
+        let short = format!(
+            "dummy-locked-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut backend = BackendArg::new_raw(
+            short.clone(),
+            None,
+            short,
+            None,
+            BackendResolution::new(false),
+        );
+        backend.set_installs_path(temp_dir.path().join("installs").join("dummy"));
+
+        let install_path = backend.installs_path().join("3.14.6");
+        fs::create_dir_all(install_path.join("bin"))?;
+
+        // Reproduce the stale state during `mise up` (#10347): the fuzzy runtime
+        // symlink installs/dummy/3 still points at a previous version (3.13.9) while
+        // 3.14.6 is the version just installed -- runtime symlinks are only rebuilt
+        // after all installs finish. is_runtime_symlink() requires a "./" target; on
+        // Windows runtime symlinks are stored as a file containing the target.
+        let old_path = backend.installs_path().join("3.13.9");
+        fs::create_dir_all(old_path.join("bin"))?;
+        let runtime_link = backend.installs_path().join("3");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("./3.13.9", &runtime_link)?;
+        #[cfg(windows)]
+        fs::write(&runtime_link, "./3.13.9")?;
+
+        // Fuzzy request ("3") resolved to a concrete version ("3.14.6").
+        let request = ToolRequest::new(Arc::new(backend), "3", ToolSource::Argument).unwrap();
+        let tv = ToolVersion::new(request, "3.14.6".into());
+        assert!(!tv.resolved_from_lockfile());
+
+        // runtime_path() skips the stale fuzzy runtime symlink, which names a
+        // different installation, and resolves to the version just installed.
+        assert!(is_runtime_symlink(&runtime_link));
+        assert_eq!(tv.runtime_path(), install_path);
+
+        // with_locked() pins runtime_path() to the exact install just made, not the
+        // fuzzy runtime symlink, so the postinstall hook sees 3.14.6 (#10347).
+        assert_eq!(tv.clone().with_locked().runtime_path(), install_path);
+        assert_eq!(tv.clone().with_locked().runtime_path(), tv.install_path());
+        assert!(!tv.with_locked().resolved_from_lockfile());
+
+        Ok(())
+    }
+
+    /// Regression test for https://github.com/jdx/mise/discussions/9526
+    ///
+    /// `install_path()` must not cache a path that does not yet exist. If it
+    /// did, a tool that first asked for its install path before the install
+    /// completed would receive that cached path forever — even after the tool
+    /// installed somewhere else (e.g. via `--system` into a shared install
+    /// dir). Subsequent callers like core go's `exec_env` would then export
+    /// the wrong GOROOT/GOPATH, breaking go-backend tools that depend on go.
+    #[test]
+    fn install_path_does_not_cache_nonexistent_paths() -> Result<()> {
+        reset_install_path_cache();
+
+        let temp_dir = tempfile::tempdir()?;
+        let short = format!(
+            "dummy-cache-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let mut backend = BackendArg::new_raw(
+            short.clone(),
+            None,
+            short,
+            None,
+            BackendResolution::new(false),
+        );
+        backend.set_installs_path(temp_dir.path().join("installs").join("dummy-cache"));
+
+        let request = ToolRequest::new(Arc::new(backend), "1.0.0", ToolSource::Argument).unwrap();
+        let tv = ToolVersion::new(request, "1.0.0".into());
+
+        // First call: nothing exists yet. Should return the primary path but
+        // must NOT populate the cache.
+        let p1 = tv.install_path();
+        assert!(!p1.exists());
+        assert!(INSTALL_PATH_CACHE.get(&tv).is_none());
+
+        // Now "install" the tool by creating the dir.
+        fs::create_dir_all(&p1)?;
+
+        // Second call should still return the same path; this time it exists
+        // so the cache is populated.
+        let p2 = tv.install_path();
+        assert_eq!(p1, p2);
+        assert!(p2.exists());
+        assert!(INSTALL_PATH_CACHE.get(&tv).is_some());
+
+        Ok(())
+    }
+}

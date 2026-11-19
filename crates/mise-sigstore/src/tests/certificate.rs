@@ -1,0 +1,387 @@
+use super::*;
+
+#[test]
+fn select_tuf_config_default_uses_production_url() {
+    // No override → canonical Sigstore public-good TUF URL (default behavior).
+    assert_eq!(DEFAULT_TUF_URL, SigstoreInstance::PublicGood.tuf_url());
+    assert!(format!("{:?}", select_tuf_config(None).unwrap()).contains(DEFAULT_TUF_URL));
+}
+
+#[test]
+fn select_tuf_config_override_uses_mirror_url() {
+    // Override → the mirror URL, while still pinning the production root.
+    let mirror = "https://tuf-mirror.example.com/".to_string();
+    assert!(format!("{:?}", select_tuf_config(Some(mirror.clone())).unwrap()).contains(&mirror));
+}
+
+#[tokio::test]
+async fn select_tuf_config_sends_mirror_credentials_as_a_header() {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        let n = stream.read(&mut buf).unwrap();
+        let _ = stream.write_all(b"HTTP/1.1 500 X\r\nContent-Length: 0\r\n\r\n");
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    });
+
+    // The TUF client names its cache directory after the URL it is given and
+    // repeats it in errors, so it must never see the userinfo.
+    let config = select_tuf_config(Some(format!("http://user:p%40ss@{addr}/tuf"))).unwrap();
+    let debug = format!("{config:?}");
+    assert!(debug.contains(&format!("\"http://{addr}/tuf\"")), "{debug}");
+    assert!(!debug.contains("p%40ss"), "{debug}");
+
+    let error = TrustedRoot::from_tuf(config.without_cache())
+        .await
+        .expect_err("a failing mirror must fail")
+        .to_string();
+    assert!(
+        error.contains(&format!("GET http://{addr}/tuf/")),
+        "{error}"
+    );
+    assert!(!error.contains("p%40ss"), "{error}");
+    let request = server.join().unwrap();
+    // base64("user:p@ss")
+    assert!(
+        request.contains("authorization: Basic dXNlcjpwQHNz\r\n"),
+        "{request}"
+    );
+}
+
+#[test]
+fn attestations_url_includes_predicate_type() {
+    let client = AttestationClient::builder()
+        .base_url("https://api.github.com")
+        .build()
+        .unwrap();
+    let url = client
+        .attestations_url(&FetchParams {
+            owner: "owner".to_string(),
+            repo: Some("owner/repo".to_string()),
+            digest: "sha256:abc".to_string(),
+            limit: 30,
+            predicate_type: Some("https://slsa.dev/provenance/v1".to_string()),
+        })
+        .unwrap();
+    let query: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+
+    assert_eq!(url.path(), "/repos/owner/repo/attestations/sha256:abc");
+    assert_eq!(query.get("per_page").map(String::as_str), Some("30"));
+    assert_eq!(
+        query.get("predicate_type").map(String::as_str),
+        Some("https://slsa.dev/provenance/v1")
+    );
+}
+
+fn fixture_bundle(json: &str) -> Bundle {
+    serde_json::from_str(json).unwrap()
+}
+
+#[test]
+fn build_provenance_names_its_source_repository() {
+    let bundle = fixture_bundle(include_str!(
+        "../../tests/fixtures/github_build_provenance_jdx_mise.json"
+    ));
+    assert_eq!(
+        bundle_source_repository(&bundle).as_deref(),
+        Some("jdx/mise")
+    );
+}
+
+#[test]
+fn github_release_attestation_names_its_repository() {
+    let bundle = fixture_bundle(include_str!(
+        "../../tests/fixtures/github_release_attestation_jdx_mise.json"
+    ));
+    assert_eq!(
+        bundle_source_repository(&bundle).as_deref(),
+        Some("jdx/mise")
+    );
+}
+
+#[tokio::test]
+async fn fixture_bundles_verify_against_their_artifact() {
+    let _tuf_root = TUF_ROOT_LOCK.lock().await;
+    // mise-v2026.9.12-linux-x64.tar.gz, which both fixtures attest.
+    let digest =
+        Sha256Hash::from_hex("b4058dece685259910d3aba5782445996eea79dbdb3cf952a6eb81aadf0373ff")
+            .unwrap();
+    let mut trust_roots = TrustRoots::default();
+    for json in [
+        include_str!("../../tests/fixtures/github_build_provenance_jdx_mise.json"),
+        include_str!("../../tests/fixtures/github_release_attestation_jdx_mise.json"),
+    ] {
+        verify_bundle_with_trust_roots(
+            Artifact::from(&digest),
+            &fixture_bundle(json),
+            None,
+            &mut trust_roots,
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[test]
+fn public_good_bundles_cannot_opt_out_of_the_transparency_log() {
+    let digest =
+        Sha256Hash::from_hex("b4058dece685259910d3aba5782445996eea79dbdb3cf952a6eb81aadf0373ff")
+            .unwrap();
+    let root = embedded_sigstore_root();
+    let mut bundle = fixture_bundle(include_str!(
+        "../../tests/fixtures/github_build_provenance_jdx_mise.json"
+    ));
+    verify_bundle(Artifact::from(&digest), &bundle, None, &root).unwrap();
+
+    // No signature covers the log entry, so whoever serves the bundle can
+    // strip the inclusion proof or drop the Rekor entry altogether. Neither
+    // may switch off the tlog check for a public-good certificate.
+    let mut stripped = bundle.clone();
+    stripped.verification_material.tlog_entries[0].inclusion_proof = None;
+    bundle.verification_material.tlog_entries.clear();
+    for tampered in [&stripped, &bundle] {
+        let err = verify_bundle(Artifact::from(&digest), tampered, None, &root)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inclusion proof"), "{err}");
+    }
+}
+
+#[test]
+fn release_statements_are_only_trusted_from_the_release_attester() {
+    // A workflow certificate carrying a statement that claims to be a
+    // release of another repository: the certificate's own source
+    // repository wins, and the statement is never read.
+    let mut bundle = fixture_bundle(include_str!(
+        "../../tests/fixtures/github_build_provenance_jdx_mise.json"
+    ));
+    let sigstore_verify::types::SignatureContent::DsseEnvelope(envelope) = &mut bundle.content
+    else {
+        panic!("fixture is a DSSE bundle");
+    };
+    let forged = serde_json::json!({
+        "_type": "https://in-toto.io/Statement/v1",
+        "predicateType": "https://in-toto.io/attestation/release/v0.2",
+        "subject": [],
+        "predicate": {"repository": "victim/repo"},
+    });
+    envelope.payload = serde_json::to_vec(&forged).unwrap().into();
+    assert_eq!(
+        bundle_source_repository(&bundle).as_deref(),
+        Some("jdx/mise")
+    );
+}
+
+#[test]
+fn release_statement_repository_requires_a_release_predicate() {
+    let statement = |predicate_type: &str, repository: &str| {
+        serde_json::to_vec(&serde_json::json!({
+            "predicateType": predicate_type,
+            "predicate": {"repository": repository},
+        }))
+        .unwrap()
+    };
+    assert_eq!(
+        release_statement_repository(&statement(
+            "https://in-toto.io/attestation/release/v0.2",
+            "jdx/mise"
+        ))
+        .as_deref(),
+        Some("jdx/mise")
+    );
+    assert_eq!(
+        release_statement_repository(&statement("https://slsa.dev/provenance/v1", "jdx/mise")),
+        None
+    );
+    assert_eq!(
+        release_statement_repository(&statement(
+            "https://in-toto.io/attestation/release/v0.2",
+            "jdx/mise/../x"
+        )),
+        None
+    );
+}
+
+#[test]
+fn github_repository_from_uri_requires_owner_and_repo() {
+    assert_eq!(
+        github_repository_from_uri("https://github.com/jdx/mise").as_deref(),
+        Some("jdx/mise")
+    );
+    assert_eq!(github_repository_from_uri("https://github.com/jdx"), None);
+    assert_eq!(
+        github_repository_from_uri("https://github.com/jdx/mise/x"),
+        None
+    );
+    assert_eq!(
+        github_repository_from_uri("https://gitlab.com/jdx/mise"),
+        None
+    );
+}
+
+#[test]
+fn gitlab_project_from_uri_accepts_groups_and_subgroups() {
+    assert_eq!(
+        gitlab_project_from_uri("https://gitlab.com/group/project").as_deref(),
+        Some("group/project")
+    );
+    assert_eq!(
+        gitlab_project_from_uri("https://gitlab.com/group/sub/project").as_deref(),
+        Some("group/sub/project")
+    );
+    assert_eq!(gitlab_project_from_uri("https://gitlab.com/group"), None);
+    assert_eq!(gitlab_project_from_uri("https://gitlab.com/group//x"), None);
+    assert_eq!(gitlab_project_from_uri("https://gitlab.com/a/../b"), None);
+    assert_eq!(gitlab_project_from_uri("https://github.com/jdx/mise"), None);
+    assert_eq!(
+        gitlab_project_from_uri("https://gitlab.example.com/group/project"),
+        None
+    );
+}
+
+#[test]
+fn signer_workflow_requires_identity() {
+    let err = verify_signer_workflow_identity(None, Some(".github/workflows/release.yml"))
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("found no certificate identity"));
+}
+
+#[test]
+fn signer_workflow_rejects_mismatch() {
+    let err = verify_signer_workflow_identity(
+        Some("https://github.com/jdx/mise/.github/workflows/ci.yml@refs/tags/v1.0.0"),
+        Some(".github/workflows/release.yml"),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("Workflow verification failed"));
+}
+
+#[test]
+fn signer_workflow_accepts_match() {
+    verify_signer_workflow_identity(
+        Some("https://github.com/jdx/mise/.github/workflows/release.yml@refs/tags/v1.0.0"),
+        Some(".github/workflows/release.yml"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn signer_workflow_rejects_expected_containing_identity() {
+    let err = verify_signer_workflow_identity(
+        Some(".github/workflows/release.yml"),
+        Some("https://github.com/jdx/mise/.github/workflows/release.yml@refs/tags/v1.0.0"),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("Workflow verification failed"));
+}
+
+#[test]
+fn signer_workflow_accepts_repository_qualified_workflow() {
+    verify_signer_workflow_identity(
+        Some("https://github.com/jdx/mise/.github/workflows/release.yml@refs/tags/v1.0.0"),
+        Some("jdx/mise/.github/workflows/release.yml"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn signer_workflow_rejects_longer_workflow_file_name() {
+    let err = verify_signer_workflow_identity(
+        Some("https://github.com/evil/mise/.github/workflows/release.yml.evil.yml@refs/heads/main"),
+        Some(".github/workflows/release.yml"),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("Workflow verification failed"));
+}
+
+#[test]
+fn signer_workflow_rejects_match_inside_ref() {
+    let err = verify_signer_workflow_identity(
+        Some(
+            "https://github.com/evil/mise/.github/workflows/ci.yml@refs/heads/x/.github/workflows/release.yml",
+        ),
+        Some(".github/workflows/release.yml"),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("Workflow verification failed"));
+}
+
+#[test]
+fn signer_workflow_rejects_partial_leading_segment() {
+    let err = verify_signer_workflow_identity(
+        Some("https://github.com/jdx/mise/.github/workflows/prerelease.yml@refs/tags/v1.0.0"),
+        Some("release.yml"),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("Workflow verification failed"));
+}
+
+#[test]
+fn signer_workflow_rejects_empty_expected() {
+    let err = verify_signer_workflow_identity(
+        Some("https://github.com/jdx/mise/.github/workflows/release.yml@refs/tags/v1.0.0"),
+        Some(""),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("Workflow verification failed"));
+}
+
+#[test]
+fn signer_workflow_accepts_at_sign_in_workflow_file_name() {
+    verify_signer_workflow_identity(
+        Some("https://github.com/jdx/mise/.github/workflows/release@prod.yml@refs/tags/v1.0.0"),
+        Some(".github/workflows/release@prod.yml"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn signer_workflow_accepts_at_sign_in_ref() {
+    verify_signer_workflow_identity(
+        Some("https://github.com/jdx/mise/.github/workflows/release.yml@refs/heads/a@b"),
+        Some(".github/workflows/release.yml"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn signer_workflow_rejects_match_after_at_refs_inside_ref() {
+    let err = verify_signer_workflow_identity(
+        Some(
+            "https://github.com/evil/mise/.github/workflows/ci.yml@refs/heads/x/.github/workflows/release.yml@refs/z",
+        ),
+        Some(".github/workflows/release.yml"),
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(err.contains("Workflow verification failed"));
+}
+
+#[test]
+fn select_tuf_config_always_uses_mises_http_client() {
+    // The TUF client's own default client cannot fall back to the bundled roots
+    // on a system with no CA certificates, so even the default config needs
+    // mise's (#15774).
+    let default = TufConfig::production();
+    let with_client = crate::trust::with_http_client(TufConfig::production(), None).unwrap();
+    assert_ne!(format!("{default:?}"), format!("{with_client:?}"));
+}

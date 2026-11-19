@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "skipping: bootstrap firewall tests require Linux"
+  exit 0
+fi
+
+# Nothing here may elevate to inspect or change the host firewall.
+export MISE_SYSTEM_PACKAGES_SUDO=false
+ssh_connection="SSH_CONNECTION='203.0.113.10 54321 192.0.2.20 2222'"
+
+cat >mise.toml <<'TOML'
+[bootstrap.linux.firewall]
+backend = "nftables"
+default_incoming = "deny"
+
+[[bootstrap.linux.firewall.rules]]
+name = "wrong-peer"
+port = 2222
+protocol = "tcp"
+source = "198.51.100.0/24"
+action = "allow"
+TOML
+
+# Lockout validation happens before backend inspection or privilege elevation.
+assert_fail \
+  "$ssh_connection mise bootstrap firewall apply --yes" \
+  "no incoming TCP allow rule covers peer 203.0.113.10 on server port 2222"
+assert_fail "$ssh_connection mise bootstrap --yes" "no incoming TCP allow rule covers peer"
+# Read-only commands report the refused firewall as unknown.
+assert_contains \
+  "$ssh_connection mise bootstrap firewall apply --dry-run --yes 2>&1" \
+  "no incoming TCP allow rule covers peer 203.0.113.10 on server port 2222"
+assert_contains "$ssh_connection mise bootstrap firewall status" "unknown"
+assert_contains "$ssh_connection mise bootstrap plan" "unavailable: refusing firewall"
+
+cat >mise.toml <<'TOML'
+[bootstrap.linux.firewall]
+backend = "nftables"
+default_incoming = "deny"
+
+[[bootstrap.linux.firewall.rules]]
+name = "absent-ssh"
+state = "absent"
+port = 2222
+protocol = "tcp"
+source = "203.0.113.0/24"
+action = "allow"
+TOML
+
+assert_fail \
+  "$ssh_connection mise bootstrap firewall apply --yes" \
+  "no incoming TCP allow rule covers peer"
+
+cat >mise.toml <<'TOML'
+[bootstrap.linux.firewall]
+backend = "nftables"
+default_incoming = "deny"
+
+[[bootstrap.linux.firewall.rules]]
+name = "wrong-server"
+port = 2222
+protocol = "tcp"
+source = "203.0.113.0/24"
+destination = "192.0.2.21/32"
+action = "allow"
+TOML
+
+assert_fail \
+  "$ssh_connection mise bootstrap firewall apply --yes" \
+  "no incoming TCP allow rule covers peer"
+
+cat >mise.toml <<'TOML'
+[bootstrap.linux.firewall]
+allow_lockout = true
+
+[[bootstrap.linux.firewall.rules]]
+name = "invalid-port"
+port = 443
+TOML
+
+assert_fail "mise bootstrap firewall apply --dry-run --yes" "sets port without protocol"
+
+# A dry run that skips the firewall never inspects it, even to predict a
+# Compose project.
+mkdir -p project
+cat >fake-compose <<'EOF'
+#!/bin/sh
+case " $* " in
+*" config --services "*) echo cache ;;
+*" config --hash="*) echo "cache hash-v1" ;;
+*" ps "*) ;;
+*) exit 2 ;;
+esac
+EOF
+cat >mise.toml <<EOF
+[bootstrap.linux.firewall]
+backend = "nftables"
+allow_lockout = true
+
+[bootstrap.compose.cache]
+project_dir = "$PWD/project"
+command = ["sh", "$PWD/fake-compose"]
+EOF
+assert_contains "mise bootstrap --dry-run --yes --skip firewall" "would run"
+assert_contains "mise bootstrap --help" "firewall"
+assert_contains "mise bootstrap firewall --help" "Linux host firewall"

@@ -1,0 +1,532 @@
+use crate::backend::VersionInfo;
+use crate::backend::platform_target::PlatformTarget;
+use crate::backend::static_helpers::{
+    list_available_platforms_with_key, lookup_platform_key_for_target, lookup_platform_value,
+    lookup_platform_value_for_target, lookup_with_fallback,
+};
+use crate::toolset::ToolVersionOptions;
+use eyre::{Result, bail};
+
+/// The ordering policy a backend applies to remote versions.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum VersionOrder {
+    #[default]
+    Source,
+    Semver,
+    /// Oldest to newest by release date, so the last entry is the release
+    /// published most recently whatever its version. Only for backends whose
+    /// listing carries a release date.
+    PublishedAt,
+}
+
+impl VersionOrder {
+    #[cfg(test)]
+    pub(crate) fn from_options(options: &ToolVersionOptions) -> Result<Self> {
+        Self::from_options_or(options, Self::Source)
+    }
+
+    /// For a backend whose listing has no release dates: `published_at` is an error.
+    pub(crate) fn from_options_or(options: &ToolVersionOptions, default: Self) -> Result<Self> {
+        Self::parse(options, default, false)
+    }
+
+    /// For a backend whose listing carries release dates, so `published_at` is allowed.
+    pub(crate) fn from_dated_options_or(
+        options: &ToolVersionOptions,
+        default: Self,
+    ) -> Result<Self> {
+        Self::parse(options, default, true)
+    }
+
+    fn parse(options: &ToolVersionOptions, default: Self, dated: bool) -> Result<Self> {
+        let expected = if dated {
+            "version_order must be \"source\", \"semver\" or \"published_at\""
+        } else {
+            "version_order must be \"source\" or \"semver\""
+        };
+        match options.opts.get("version_order") {
+            None => Ok(default),
+            Some(toml::Value::String(value)) => match value.as_str() {
+                "source" => Ok(Self::Source),
+                "semver" => Ok(Self::Semver),
+                "published_at" if dated => Ok(Self::PublishedAt),
+                _ => bail!(expected),
+            },
+            Some(_) => bail!(expected),
+        }
+    }
+
+    pub(crate) fn order(self, versions: Vec<String>) -> Vec<String> {
+        self.order_by(versions, String::as_str)
+    }
+
+    /// Orders a listing that carries release dates. Releases without a usable
+    /// date sort before every dated one, in their source order, so they never
+    /// win `latest` over a release with a known date.
+    pub(crate) fn order_infos(self, versions: Vec<VersionInfo>) -> Vec<VersionInfo> {
+        if self != Self::PublishedAt {
+            return self.order_by(versions, |info| info.version.as_str());
+        }
+        let mut versions = versions;
+        // Stable: equal dates keep their source order.
+        versions.sort_by_key(VersionInfo::created_at_timestamp);
+        versions
+    }
+
+    pub(crate) fn order_by<T, F>(self, versions: Vec<T>, version: F) -> Vec<T>
+    where
+        F: for<'a> Fn(&'a T) -> &'a str,
+    {
+        // `PublishedAt` is applied to the dated listing by `order_infos`; the
+        // version lists derived from it are already in that order.
+        if self != Self::Semver {
+            return versions;
+        }
+
+        let mut opaque = Vec::new();
+        let mut semantic = Vec::new();
+        for (source_index, value) in versions.into_iter().enumerate() {
+            let version = version(&value);
+            let normalized = version
+                .strip_prefix('v')
+                .or_else(|| version.strip_prefix('V'))
+                .unwrap_or(version);
+            match semver::Version::parse(normalized) {
+                Ok(parsed) => semantic.push((source_index, value, parsed)),
+                Err(_) => opaque.push(value),
+            }
+        }
+        semantic.sort_by(|(left_index, _, left), (right_index, _, right)| {
+            left.cmp_precedence(right)
+                .then_with(|| left_index.cmp(right_index))
+        });
+        opaque.extend(semantic.into_iter().map(|(_, value, _)| value));
+        opaque
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BackendOptions<'a> {
+    raw: &'a ToolVersionOptions,
+}
+
+impl<'a> BackendOptions<'a> {
+    pub(crate) fn new(raw: &'a ToolVersionOptions) -> Self {
+        Self { raw }
+    }
+
+    pub(crate) fn raw(&self) -> &'a ToolVersionOptions {
+        self.raw
+    }
+
+    /// The per-tool `libc` option, normalized to `gnu` or `musl`. It makes Linux asset
+    /// selection strict for this tool, like the `libc` setting does for every tool.
+    /// `backend` names the backend in the error for a value it does not accept.
+    pub(crate) fn libc(&self, backend: &str) -> Result<Option<&'static str>> {
+        let Some(value) = self.raw.opts.get("libc") else {
+            return Ok(None);
+        };
+        match value.as_str() {
+            Some("gnu" | "glibc") => Ok(Some("gnu")),
+            Some("musl") => Ok(Some("musl")),
+            _ => bail!(
+                "invalid {backend} `libc` option {value}: expected \"glibc\", \"gnu\", or \"musl\""
+            ),
+        }
+    }
+
+    /// Returns the option only when the underlying TOML value is a string.
+    /// Prefer platform helpers for options that may be written as native TOML
+    /// scalars.
+    pub(crate) fn str(&self, key: &str) -> Option<&'a str> {
+        self.raw.get(key)
+    }
+
+    pub(crate) fn platform_string(&self, key: &str) -> Option<String> {
+        lookup_with_fallback(self.raw, key)
+    }
+
+    pub(crate) fn platform_value_without_base(&self, key: &str) -> Option<&'a toml::Value> {
+        lookup_platform_value(self.raw, key)
+    }
+
+    /// Returns a comma-separated option value from either a string or an array of
+    /// strings, warning about non-string array entries.
+    pub(crate) fn comma_joined(&self, key: &str) -> Option<String> {
+        match self.raw.opts.get(key) {
+            Some(toml::Value::Array(values)) => {
+                let values = values
+                    .iter()
+                    .filter_map(|value| {
+                        value.as_str().map(str::to_string).or_else(|| {
+                            warn!("invalid value in `{key}` array: {value}; expected string");
+                            None
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if values.is_empty() {
+                    None
+                } else {
+                    Some(values.join(","))
+                }
+            }
+            _ => self.raw.get_string(key),
+        }
+    }
+
+    pub(crate) fn platform_string_for_target(
+        &self,
+        key: &str,
+        target: &PlatformTarget,
+    ) -> Option<String> {
+        lookup_platform_key_for_target(self.raw, key, target).or_else(|| self.raw.get_string(key))
+    }
+
+    pub(crate) fn platform_string_for_target_without_base(
+        &self,
+        key: &str,
+        target: &PlatformTarget,
+    ) -> Option<String> {
+        lookup_platform_key_for_target(self.raw, key, target)
+    }
+
+    pub(crate) fn platform_value_for_target(
+        &self,
+        key: &str,
+        target: &PlatformTarget,
+    ) -> Option<&'a toml::Value> {
+        lookup_platform_value_for_target(self.raw, key, target).or_else(|| self.raw.opts.get(key))
+    }
+
+    pub(crate) fn platform_bool_for_target(&self, key: &str, target: &PlatformTarget) -> bool {
+        self.platform_string_for_target(key, target)
+            .is_some_and(|v| bool_str_or_default(key, &v, false))
+    }
+
+    pub(crate) fn bool(&self, key: &str) -> bool {
+        self.bool_with_default(key, false)
+    }
+
+    pub(crate) fn bool_with_default(&self, key: &str, default: bool) -> bool {
+        self.raw
+            .opts
+            .get(key)
+            .map_or(default, |value| bool_value_or_default(key, value, default))
+    }
+
+    pub(crate) fn available_platforms_with_key(&self, key: &str) -> Vec<String> {
+        list_available_platforms_with_key(self.raw, key)
+    }
+}
+
+pub(crate) fn is_truthy(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1")
+}
+
+pub(crate) fn is_falsey(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "false" | "0")
+}
+
+pub(crate) fn bool_value_or_default(key: &str, value: &toml::Value, default: bool) -> bool {
+    bool_value(key, value).unwrap_or(default)
+}
+
+pub(crate) fn bool_value(key: &str, value: &toml::Value) -> Option<bool> {
+    let parsed = match value {
+        toml::Value::Boolean(value) => Some(*value),
+        toml::Value::String(value) => parse_bool_str(value),
+        toml::Value::Integer(0) => Some(false),
+        toml::Value::Integer(1) => Some(true),
+        _ => None,
+    };
+    if parsed.is_none() {
+        warn_invalid_bool_value(key, value);
+    }
+    parsed
+}
+
+fn bool_str_or_default(key: &str, value: &str, default: bool) -> bool {
+    parse_bool_str(value).unwrap_or_else(|| {
+        warn_invalid_bool_value(key, value);
+        default
+    })
+}
+
+fn parse_bool_str(value: &str) -> Option<bool> {
+    if is_truthy(value) {
+        Some(true)
+    } else if is_falsey(value) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn warn_invalid_bool_value(key: &str, value: impl std::fmt::Display) {
+    warn!(
+        "invalid boolean value for tool option `{key}`: {value}; expected true, false, 1, or 0; using default"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::Platform;
+
+    fn opts_with_value(key: &str, value: toml::Value) -> ToolVersionOptions {
+        let mut opts = ToolVersionOptions::default();
+        opts.opts.insert(key.to_string(), value);
+        opts
+    }
+
+    #[test]
+    fn test_platform_value_prefers_platform_value() {
+        use crate::backend::static_helpers::platform_aliases;
+
+        let mut opts = opts_with_value("filter_bins", toml::Value::String("base".into()));
+        let (os, arch) = platform_aliases().into_iter().next().unwrap();
+        let mut linux = toml::Table::new();
+        linux.insert(
+            "filter_bins".into(),
+            toml::Value::Array(vec![toml::Value::String("platform".into())]),
+        );
+        let mut platforms = toml::Table::new();
+        platforms.insert(format!("{os}-{arch}"), toml::Value::Table(linux));
+        opts.opts
+            .insert("platforms".into(), toml::Value::Table(platforms));
+
+        assert_eq!(
+            BackendOptions::new(&opts).platform_value_without_base("filter_bins"),
+            Some(&toml::Value::Array(vec![toml::Value::String(
+                "platform".into()
+            )]))
+        );
+    }
+
+    #[test]
+    fn test_comma_joined_accepts_string_or_array() {
+        let string_opts = opts_with_value("tags", toml::Value::String("sqlite,fts5".into()));
+        assert_eq!(
+            BackendOptions::new(&string_opts)
+                .comma_joined("tags")
+                .as_deref(),
+            Some("sqlite,fts5")
+        );
+
+        let array_opts = opts_with_value(
+            "tags",
+            toml::Value::Array(vec![
+                toml::Value::String("sqlite".into()),
+                toml::Value::Integer(1),
+                toml::Value::String("fts5".into()),
+            ]),
+        );
+        assert_eq!(
+            BackendOptions::new(&array_opts)
+                .comma_joined("tags")
+                .as_deref(),
+            Some("sqlite,fts5")
+        );
+    }
+
+    #[test]
+    fn test_bool_parses_consistent_formats() {
+        assert!(
+            BackendOptions::new(&opts_with_value("flag", toml::Value::Boolean(true))).bool("flag")
+        );
+        assert!(
+            !BackendOptions::new(&opts_with_value("flag", toml::Value::Boolean(false)))
+                .bool("flag")
+        );
+        assert!(
+            BackendOptions::new(&opts_with_value("flag", toml::Value::String("TRUE".into())))
+                .bool("flag")
+        );
+        assert!(
+            !BackendOptions::new(&opts_with_value(
+                "flag",
+                toml::Value::String("FALSE".into())
+            ))
+            .bool("flag")
+        );
+        assert!(
+            BackendOptions::new(&opts_with_value("flag", toml::Value::String("1".into())))
+                .bool("flag")
+        );
+        assert!(
+            !BackendOptions::new(&opts_with_value("flag", toml::Value::String("0".into())))
+                .bool("flag")
+        );
+        assert!(
+            BackendOptions::new(&opts_with_value("flag", toml::Value::Integer(1))).bool("flag")
+        );
+        assert!(
+            !BackendOptions::new(&opts_with_value("flag", toml::Value::Integer(0))).bool("flag")
+        );
+    }
+
+    #[test]
+    fn test_bool_invalid_values_fall_back_to_default() {
+        assert!(!BackendOptions::new(&ToolVersionOptions::default()).bool("missing"));
+        assert!(
+            !BackendOptions::new(&opts_with_value("flag", toml::Value::String("00".into())))
+                .bool("flag")
+        );
+        assert!(
+            BackendOptions::new(&opts_with_value("flag", toml::Value::String("00".into())))
+                .bool_with_default("flag", true)
+        );
+        assert!(
+            BackendOptions::new(&opts_with_value("flag", toml::Value::Integer(2)))
+                .bool_with_default("flag", true)
+        );
+        assert_eq!(bool_value("flag", &toml::Value::String("00".into())), None);
+    }
+
+    #[test]
+    fn test_platform_bool_for_target_uses_requested_target() {
+        let mut opts = ToolVersionOptions::default();
+        let mut platforms = toml::Table::new();
+        let mut linux = toml::Table::new();
+        let mut windows = toml::Table::new();
+        linux.insert("no_app".into(), toml::Value::Boolean(false));
+        windows.insert("no_app".into(), toml::Value::Boolean(true));
+        platforms.insert("linux-x64".into(), toml::Value::Table(linux));
+        platforms.insert("windows-x64".into(), toml::Value::Table(windows));
+        opts.opts
+            .insert("platforms".into(), toml::Value::Table(platforms));
+
+        let values = BackendOptions::new(&opts);
+        let linux = PlatformTarget::new(Platform::parse("linux-x64").unwrap());
+        let windows = PlatformTarget::new(Platform::parse("windows-x64").unwrap());
+
+        assert!(!values.platform_bool_for_target("no_app", &linux));
+        assert!(values.platform_bool_for_target("no_app", &windows));
+    }
+
+    #[test]
+    fn test_version_order_parses_options() {
+        assert_eq!(
+            VersionOrder::from_options(&ToolVersionOptions::default()).unwrap(),
+            VersionOrder::Source
+        );
+        assert_eq!(
+            VersionOrder::from_options(&opts_with_value(
+                "version_order",
+                toml::Value::String("semver".into())
+            ))
+            .unwrap(),
+            VersionOrder::Semver
+        );
+        assert_eq!(
+            VersionOrder::from_options(&opts_with_value(
+                "version_order",
+                toml::Value::String("chronological".into())
+            ))
+            .unwrap_err()
+            .to_string(),
+            "version_order must be \"source\" or \"semver\""
+        );
+    }
+
+    #[test]
+    fn test_semver_order_ranks_semver_after_opaque_versions() {
+        let versions = ["2.0.0", "nightly", "1.0.0", "edge", "3.0.0"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            VersionOrder::Semver.order(versions),
+            ["nightly", "edge", "1.0.0", "2.0.0", "3.0.0"]
+        );
+    }
+
+    #[test]
+    fn test_semver_order_preserves_equal_precedence_and_opaque_order() {
+        let versions = ["nightly", "edge", "1.0.0+002", "1.0.0+001", "1.0.0"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(VersionOrder::Semver.order(versions.clone()), versions);
+    }
+
+    #[test]
+    fn test_semver_order_accepts_v_prefixed_versions() {
+        let versions = ["v11.11.0", "nightly", "v10.99.0", "v10.34.5"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(
+            VersionOrder::Semver.order(versions),
+            ["nightly", "v10.34.5", "v10.99.0", "v11.11.0"]
+        );
+    }
+
+    #[test]
+    fn test_semver_order_by_preserves_associated_metadata() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct Item {
+            version: String,
+            metadata: usize,
+        }
+
+        let items = vec![
+            Item {
+                version: "2.0.0".into(),
+                metadata: 2,
+            },
+            Item {
+                version: "1.0.0".into(),
+                metadata: 1,
+            },
+        ];
+        assert_eq!(
+            VersionOrder::Semver.order_by(items, |item| item.version.as_str()),
+            vec![
+                Item {
+                    version: "1.0.0".into(),
+                    metadata: 1,
+                },
+                Item {
+                    version: "2.0.0".into(),
+                    metadata: 2,
+                },
+            ]
+        );
+    }
+
+    fn info(version: &str, created_at: Option<&str>) -> VersionInfo {
+        VersionInfo {
+            version: version.into(),
+            created_at: created_at.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_published_at_orders_by_release_date_not_version() {
+        // GitHub lists the stable 0.170.0 ahead of the alpha published after it.
+        let versions = vec![
+            info("0.171.0-alpha.13", Some("2026-11-18T05:47:55Z")),
+            info("0.170.0", Some("2026-11-18T03:40:48Z")),
+            info("0.171.0-alpha.12", Some("2026-11-17T14:26:49Z")),
+            info("undated", None),
+        ];
+        let ordered: Vec<_> = VersionOrder::PublishedAt
+            .order_infos(versions)
+            .into_iter()
+            .map(|v| v.version)
+            .collect();
+        assert_eq!(
+            ordered,
+            ["undated", "0.171.0-alpha.12", "0.170.0", "0.171.0-alpha.13"]
+        );
+    }
+
+    #[test]
+    fn test_published_at_is_only_accepted_by_dated_backends() {
+        let opts = crate::toolset::parse_tool_options("version_order=published_at");
+        assert_eq!(
+            VersionOrder::from_dated_options_or(&opts, VersionOrder::Source).unwrap(),
+            VersionOrder::PublishedAt
+        );
+        assert!(VersionOrder::from_options_or(&opts, VersionOrder::Source).is_err());
+    }
+}

@@ -1,0 +1,875 @@
+use super::*;
+
+#[tokio::test]
+async fn test_asset_versions_include_older_monorepo_releases() {
+    use confique::Layer;
+
+    struct SettingsGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl Drop for SettingsGuard {
+        fn drop(&mut self) {
+            crate::testing::reset_settings(None);
+        }
+    }
+    let _settings = SettingsGuard {
+        _lock: crate::testing::lock_ignoring_poison(&crate::testing::SETTINGS_LOCK),
+    };
+    let mut server = mockito::Server::new_async().await;
+    let mut settings = mise_settings::SettingsPartial::empty();
+    settings.url_replacements = Some(indexmap::IndexMap::from([(
+        API_URL.to_string(),
+        server.url(),
+    )]));
+    settings.http_retries = Some(0);
+    crate::testing::reset_settings(Some(settings));
+
+    let repo = format!("owner/packslip-monorepo-{}", server.socket_address().port());
+    let asset = "packslip.sigstore.json";
+    let release = |tag: &str| GithubRelease {
+        assets: vec![make_asset(asset)],
+        ..make_release(tag)
+    };
+    // The first matching stable release can be too young for the caller's
+    // release-age policy. Older candidates must survive discovery too, even
+    // beyond the generic listing's three-page prerelease fallback.
+    let mut pages = vec![
+        vec![release("4.215.1"), make_release("server@1.0.0")],
+        vec![make_release("helm@1.0.0")],
+        vec![GithubRelease {
+            draft: true,
+            ..release("4.216.0")
+        }],
+        vec![release("4.215.0")],
+    ];
+    pages.extend((5..=10).map(|page| vec![make_release(&format!("server@1.0.{page}"))]));
+    let mut mocks = Vec::new();
+    for (index, releases) in pages.iter().enumerate() {
+        let path = if index == 0 {
+            format!("/repos/{repo}/releases?per_page=100")
+        } else {
+            format!("/packslip-page-{}", index + 1)
+        };
+        let mock = server
+            .mock("GET", path.as_str())
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(releases).unwrap())
+            .expect(1)
+            .with_header(
+                "link",
+                format!(
+                    "<{}/packslip-page-{}>; rel=\"next\"",
+                    server.url(),
+                    index + 2
+                )
+                .as_str(),
+            );
+        mocks.push(mock.create_async().await);
+    }
+    // GitHub rejects results beyond the first 1000, even when it supplies a
+    // next-page link. Discovery must keep its bounded request budget.
+    let beyond_limit = server
+        .mock("GET", "/packslip-page-11")
+        .with_status(422)
+        .expect(0)
+        .create_async()
+        .await;
+
+    let versions = list_release_versions_with_asset(&repo, asset)
+        .await
+        .unwrap();
+    assert_eq!(
+        versions
+            .iter()
+            .map(|r| r.tag_name.as_str())
+            .collect::<Vec<_>>(),
+        ["4.215.1", "4.215.0"]
+    );
+    for mock in mocks {
+        mock.assert_async().await;
+    }
+    beyond_limit.assert_async().await;
+}
+
+#[tokio::test]
+async fn test_empty_release_assets_are_not_cached() {
+    let mut server = mockito::Server::new_async().await;
+    let repo = "owner/empty-assets-cache-test";
+    let tag = "v1.0.0";
+    let path = format!("/repos/{repo}/releases/tags/{tag}");
+    let key = release_cache_key(&server.url(), repo, tag, true);
+
+    let cached_empty_release = make_release(tag);
+    {
+        let cache_group = get_release_cache(&key).await;
+        let cache = cache_group.get(&key).unwrap();
+        cache.write(&cached_empty_release).unwrap();
+    }
+
+    let empty_mock = server
+        .mock("GET", path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&cached_empty_release).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let release = get_release_for_url_with_versions_host(&server.url(), repo, tag, true)
+        .await
+        .unwrap();
+    assert!(release.assets.is_empty());
+    empty_mock.assert_async().await;
+    empty_mock.remove_async().await;
+
+    let populated_release = GithubRelease {
+        assets: vec![make_asset("tool-v1.0.0-linux-x86_64.tar.gz")],
+        ..make_release(tag)
+    };
+    let mock = server
+        .mock("GET", path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&populated_release).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let release = get_release_for_url_with_versions_host(&server.url(), repo, tag, true)
+        .await
+        .unwrap();
+    assert_eq!(release.assets.len(), 1);
+    assert_eq!(release.assets[0].name, "tool-v1.0.0-linux-x86_64.tar.gz");
+
+    let release = get_release_for_url_with_versions_host(&server.url(), repo, tag, true)
+        .await
+        .unwrap();
+    assert_eq!(release.assets.len(), 1);
+    mock.assert_async().await;
+}
+#[tokio::test]
+async fn test_versions_host_flag_splits_release_cache() {
+    let mut server = mockito::Server::new_async().await;
+    let repo = "owner/versions-host-cache-split-test";
+    let tag = "v1.0.0";
+    let path = format!("/repos/{repo}/releases/tags/{tag}");
+    let true_key = release_cache_key(&server.url(), repo, tag, true);
+
+    {
+        let cache_group = get_release_cache(&true_key).await;
+        let cache = cache_group.get(&true_key).unwrap();
+        cache
+            .write(&GithubRelease {
+                assets: vec![make_asset("cached-from-versions-host.tar.gz")],
+                ..make_release(tag)
+            })
+            .unwrap();
+    }
+
+    let direct_release = GithubRelease {
+        assets: vec![make_asset("direct-github-api.tar.gz")],
+        ..make_release(tag)
+    };
+    let mock = server
+        .mock("GET", path.as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&direct_release).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let release = get_release_for_url_with_versions_host(&server.url(), repo, tag, false)
+        .await
+        .unwrap();
+    assert_eq!(release.assets[0].name, "direct-github-api.tar.gz");
+    mock.assert_async().await;
+}
+// #10343: a first page made up entirely of prereleases must not yield "no
+// versions found" -- the fallback follows the Link header to a later page.
+#[tokio::test]
+async fn test_list_releases_paginates_past_all_prerelease_first_page() {
+    let mut server = mockito::Server::new_async().await;
+    let base = server.url();
+    let repo = "owner/all-prerelease-first-page";
+
+    let page1 = vec![
+        make_prerelease("v2.0.0-alpha.2"),
+        make_prerelease("v2.0.0-alpha.1"),
+    ];
+    let page2 = vec![make_release("v1.0.0")];
+
+    // The first page requests per_page=100 and is entirely prereleases.
+    let page1_mock = server
+        .mock("GET", format!("/repos/{repo}/releases").as_str())
+        .match_query(mockito::Matcher::UrlEncoded(
+            "per_page".into(),
+            "100".into(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header("link", format!("<{base}/page2>; rel=\"next\"").as_str())
+        .with_body(serde_json::to_string(&page1).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+    // The fallback follows the Link header to a second page that has a stable release.
+    let page2_mock = server
+        .mock("GET", "/page2")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&page2).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let releases = list_releases_(&base, repo, false).await.unwrap();
+    page1_mock.assert_async().await;
+    page2_mock.assert_async().await;
+    assert!(
+        releases
+            .iter()
+            .any(|r| r.tag_name == "v1.0.0" && !r.prerelease),
+        "stable release from page 2 should be discovered, got {:?}",
+        releases.iter().map(|r| &r.tag_name).collect::<Vec<_>>()
+    );
+}
+// The listing filter reaching back into the fetch loop: a stable release
+// with no assets is dropped from the version list, so for a caller that
+// drops it there is nothing on this page worth stopping for.
+#[tokio::test]
+async fn test_list_releases_paginates_past_an_assetless_stable_release() {
+    let mut server = mockito::Server::new_async().await;
+    let base = server.url();
+
+    // Published, not a draft, not a prerelease -- and nothing attached.
+    let assetless_page = vec![make_release("v2.0.0")];
+    let asset_page = vec![GithubRelease {
+        assets: vec![asset("tool-x86_64-unknown-linux-gnu.tar.gz")],
+        ..make_release("v1.0.0")
+    }];
+
+    let repo = "owner/assetless-stable-first-page";
+    let page1_mock = server
+        .mock("GET", format!("/repos/{repo}/releases").as_str())
+        .match_query(mockito::Matcher::UrlEncoded(
+            "per_page".into(),
+            "100".into(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header("link", format!("<{base}/page2>; rel=\"next\"").as_str())
+        .with_body(serde_json::to_string(&assetless_page).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+    let page2_mock = server
+        .mock("GET", "/page2")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&asset_page).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let releases = list_releases_(&base, repo, true).await.unwrap();
+    page1_mock.assert_async().await;
+    page2_mock.assert_async().await;
+    assert!(
+        releases.iter().any(|r| r.tag_name == "v1.0.0"),
+        "installable stable release from page 2 should be discovered, got {:?}",
+        releases.iter().map(|r| &r.tag_name).collect::<Vec<_>>()
+    );
+
+    // The same first page still stops the loop for a caller that keeps
+    // asset-less releases. Without this the test above would also pass if
+    // the bound had simply been removed for everyone.
+    let kept_repo = "owner/assetless-stable-kept";
+    let kept_page1_mock = server
+        .mock("GET", format!("/repos/{kept_repo}/releases").as_str())
+        .match_query(mockito::Matcher::UrlEncoded(
+            "per_page".into(),
+            "100".into(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header(
+            "link",
+            format!("<{base}/page2-kept>; rel=\"next\"").as_str(),
+        )
+        .with_body(serde_json::to_string(&assetless_page).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+    let kept_page2_mock = server
+        .mock("GET", "/page2-kept")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&asset_page).unwrap())
+        .expect(0)
+        .create_async()
+        .await;
+
+    let releases = list_releases_(&base, kept_repo, false).await.unwrap();
+    kept_page1_mock.assert_async().await;
+    kept_page2_mock.assert_async().await;
+    assert!(
+        releases.iter().all(|r| r.tag_name != "v1.0.0"),
+        "page 2 should not have been fetched, got {:?}",
+        releases.iter().map(|r| &r.tag_name).collect::<Vec<_>>()
+    );
+}
+// #10343: once a stable release is seen the fallback stops (no extra API calls).
+#[tokio::test]
+async fn test_list_releases_stops_when_first_page_has_stable() {
+    let mut server = mockito::Server::new_async().await;
+    let base = server.url();
+    let repo = "owner/stable-on-first-page";
+
+    let page1 = vec![make_prerelease("v1.1.0-alpha.1"), make_release("v1.0.0")];
+
+    let page1_mock = server
+        .mock("GET", format!("/repos/{repo}/releases").as_str())
+        .match_query(mockito::Matcher::UrlEncoded(
+            "per_page".into(),
+            "100".into(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header("link", format!("<{base}/page2>; rel=\"next\"").as_str())
+        .with_body(serde_json::to_string(&page1).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+    // A stable release is already present, so page 2 must NOT be fetched.
+    let page2_mock = server
+        .mock("GET", "/page2")
+        .with_status(200)
+        .with_body("[]")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let releases = list_releases_(&base, repo, false).await.unwrap();
+    page1_mock.assert_async().await;
+    page2_mock.assert_async().await;
+    assert!(releases.iter().any(|r| r.tag_name == "v1.0.0"));
+}
+// #10343: the prerelease fallback is bounded to MAX_RELEASE_FALLBACK_PAGES pages.
+#[tokio::test]
+async fn test_list_releases_fallback_pagination_is_bounded() {
+    let mut server = mockito::Server::new_async().await;
+    let base = server.url();
+    let repo = "owner/all-prerelease-many-pages";
+
+    let body = || serde_json::to_string(&vec![make_prerelease("v9.0.0-alpha")]).unwrap();
+
+    // Three all-prerelease pages, each linking to the next.
+    let p1 = server
+        .mock("GET", format!("/repos/{repo}/releases").as_str())
+        .match_query(mockito::Matcher::UrlEncoded(
+            "per_page".into(),
+            "100".into(),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header("link", format!("<{base}/p2>; rel=\"next\"").as_str())
+        .with_body(body())
+        .expect(1)
+        .create_async()
+        .await;
+    let p2 = server
+        .mock("GET", "/p2")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header("link", format!("<{base}/p3>; rel=\"next\"").as_str())
+        .with_body(body())
+        .expect(1)
+        .create_async()
+        .await;
+    let p3 = server
+        .mock("GET", "/p3")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header("link", format!("<{base}/p4>; rel=\"next\"").as_str())
+        .with_body(body())
+        .expect(1)
+        .create_async()
+        .await;
+    // The 4th page must never be requested (capped at MAX_RELEASE_FALLBACK_PAGES).
+    let p4 = server
+        .mock("GET", "/p4")
+        .with_status(200)
+        .with_body("[]")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let releases = list_releases_(&base, repo, false).await.unwrap();
+    p1.assert_async().await;
+    p2.assert_async().await;
+    p3.assert_async().await;
+    p4.assert_async().await;
+    assert_eq!(releases.len(), 3);
+}
+fn with_token_lock(future: impl std::future::Future<Output = ()>) {
+    let _lock = crate::testing::lock_ignoring_poison(&TEST_ENV_LOCK);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future);
+}
+
+// Regression for #6318: every paginated request must carry the Authorization header.
+// Before that fix page 2 was sent page 1's *response* headers and went out
+// unauthenticated; nothing pinned the fix until now.
+#[test]
+fn test_list_releases_sends_auth_on_every_page() {
+    with_token_lock(async {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let api = ghes_api_url(&base);
+        let repo = "owner/auth-on-every-page";
+        let host = url::Url::parse(&base)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
+        let _token = TokensFileOverrideGuard::set(&host, PAGINATE_TEST_TOKEN);
+        let auth = format!("Bearer {PAGINATE_TEST_TOKEN}");
+
+        let page1 = server
+            .mock("GET", format!("{API_PATH}/repos/{repo}/releases").as_str())
+            .match_query(mockito::Matcher::UrlEncoded(
+                "per_page".into(),
+                "100".into(),
+            ))
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", format!("<{api}/page2>; rel=\"next\"").as_str())
+            .with_body(serde_json::to_string(&vec![make_prerelease("v2.0.0-alpha.1")]).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+        let page2 = server
+            .mock("GET", format!("{API_PATH}/page2").as_str())
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&vec![make_release("v1.0.0")]).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let releases = list_releases_(&api, repo, false).await.unwrap();
+        page1.assert_async().await;
+        page2.assert_async().await;
+        assert_eq!(releases.len(), 2);
+    });
+}
+// Same regression for the tags loop -- see the release test above.
+#[test]
+fn test_list_tags_sends_auth_on_every_page() {
+    with_token_lock(async {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let api = ghes_api_url(&base);
+        let repo = "owner/auth-on-every-page";
+        let host = url::Url::parse(&base)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
+        let _token = TokensFileOverrideGuard::set(&host, PAGINATE_TEST_TOKEN);
+        let auth = format!("Bearer {PAGINATE_TEST_TOKEN}");
+
+        let page1 = server
+            .mock("GET", format!("{API_PATH}/repos/{repo}/tags").as_str())
+            .match_query(mockito::Matcher::UrlEncoded(
+                "per_page".into(),
+                "100".into(),
+            ))
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", format!("<{api}/page2>; rel=\"next\"").as_str())
+            .with_body(serde_json::to_string(&vec![tag_without_commit("v2.0.0")]).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+        let page2 = server
+            .mock("GET", format!("{API_PATH}/page2").as_str())
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&vec![tag_without_commit("v1.0.0")]).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let tags = list_tags_(&api, repo, true).await.unwrap();
+        page1.assert_async().await;
+        page2.assert_async().await;
+        assert_eq!(tags, ["v2.0.0", "v1.0.0"]);
+    });
+}
+// `list_tags_with_dates_` paginates unconditionally, so it needs the same guarantee.
+// Tags carry no `commit`, which keeps this to the two paginated requests.
+#[test]
+fn test_list_tags_with_dates_sends_auth_on_every_page() {
+    with_token_lock(async {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let api = ghes_api_url(&base);
+        let repo = "owner/auth-on-every-page-dates";
+        let host = url::Url::parse(&base)
+            .unwrap()
+            .host_str()
+            .unwrap()
+            .to_string();
+        let _token = TokensFileOverrideGuard::set(&host, PAGINATE_TEST_TOKEN);
+        let auth = format!("Bearer {PAGINATE_TEST_TOKEN}");
+
+        let page1 = server
+            .mock("GET", format!("{API_PATH}/repos/{repo}/tags").as_str())
+            .match_query(mockito::Matcher::UrlEncoded(
+                "per_page".into(),
+                "100".into(),
+            ))
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", format!("<{api}/page2>; rel=\"next\"").as_str())
+            .with_body(serde_json::to_string(&vec![tag_without_commit("v2.0.0")]).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+        let page2 = server
+            .mock("GET", format!("{API_PATH}/page2").as_str())
+            .match_header("authorization", auth.as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&vec![tag_without_commit("v1.0.0")]).unwrap())
+            .expect(1)
+            .create_async()
+            .await;
+
+        let tags = list_tags_with_dates_(&api, repo).await.unwrap();
+        page1.assert_async().await;
+        page2.assert_async().await;
+        assert_eq!(
+            tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["v2.0.0", "v1.0.0"]
+        );
+        assert!(tags.iter().all(|t| t.date.is_none()));
+    });
+}
+
+// A repository with thousands of tags must not cost a commit request per tag:
+// the known-dates listing pages the tags and leaves the dates to `tag_commit_date`.
+#[test]
+fn test_list_tags_with_known_dates_makes_no_commit_requests() {
+    with_token_lock(async {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let api = ghes_api_url(&base);
+        let repo = "owner/known-dates-no-commits";
+        let commit_url = format!("{api}/repos/{repo}/git/commits/abc");
+        let body = serde_json::json!([
+            {"name": "v2.0.0", "commit": {"sha": "abc", "url": commit_url}},
+            {"name": "v1.0.0", "commit": {"sha": "abc", "url": commit_url}},
+        ]);
+        let tags_mock = server
+            .mock("GET", format!("{API_PATH}/repos/{repo}/tags").as_str())
+            .match_query(mockito::Matcher::UrlEncoded(
+                "per_page".into(),
+                "100".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let commit_mock = server
+            .mock("GET", mockito::Matcher::Regex("git/commits".into()))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let tags = list_tags_with_known_dates_(&api, repo, true).await.unwrap();
+        tags_mock.assert_async().await;
+        commit_mock.assert_async().await;
+        assert_eq!(
+            tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["v2.0.0", "v1.0.0"]
+        );
+        assert!(tags.iter().all(|t| t.date.is_none()));
+    });
+}
+
+#[test]
+fn test_tag_commit_url_encodes_reserved_characters() {
+    assert_eq!(
+        tag_commit_url("https://api.github.com", "o/r", "release/v1#x?%"),
+        "https://api.github.com/repos/o/r/commits/release/v1%23x%3F%25"
+    );
+}
+// be5invis/Iosevka: each release carries ~450 assets, and api.github.com times
+// out on a list of 100 of them while serving a smaller page of the same list.
+#[tokio::test]
+async fn test_list_releases_asks_for_fewer_after_a_server_error() {
+    let mut server = mockito::Server::new_async().await;
+    let base = server.url();
+    let repo = "owner/huge-releases";
+    let path = format!("/repos/{repo}/releases");
+
+    let too_big = server
+        .mock("GET", path.as_str())
+        .match_query(mockito::Matcher::UrlEncoded(
+            "per_page".into(),
+            "100".into(),
+        ))
+        .with_status(504)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let smaller = server
+        .mock("GET", path.as_str())
+        .match_query(mockito::Matcher::UrlEncoded("per_page".into(), "30".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&vec![make_release("v1.0.0")]).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let releases = list_releases_(&base, repo, false).await.unwrap();
+    too_big.assert_async().await;
+    smaller.assert_async().await;
+    assert_eq!(releases.len(), 1);
+    assert_eq!(releases[0].tag_name, "v1.0.0");
+}
+
+// A 4xx is the answer, not a reason to ask again with a smaller page.
+#[tokio::test]
+async fn test_list_releases_does_not_shrink_the_page_on_a_client_error() {
+    let mut server = mockito::Server::new_async().await;
+    let base = server.url();
+    let repo = "owner/missing-releases";
+
+    let missing = server
+        .mock("GET", format!("/repos/{repo}/releases").as_str())
+        .match_query(mockito::Matcher::Any)
+        .with_status(404)
+        .expect(1)
+        .create_async()
+        .await;
+
+    assert!(list_releases_(&base, repo, false).await.is_err());
+    missing.assert_async().await;
+}
+
+// Both larger sizes can time out: the last resort is a page of ten.
+#[tokio::test]
+async fn test_list_releases_falls_back_to_the_smallest_page_size() {
+    let mut server = mockito::Server::new_async().await;
+    let base = server.url();
+    let repo = "owner/huge-releases-smallest";
+    let path = format!("/repos/{repo}/releases");
+
+    let mut failing = Vec::new();
+    for per_page in ["100", "30"] {
+        failing.push(
+            server
+                .mock("GET", path.as_str())
+                .match_query(mockito::Matcher::UrlEncoded(
+                    "per_page".into(),
+                    per_page.into(),
+                ))
+                .with_status(504)
+                .expect_at_least(1)
+                .create_async()
+                .await,
+        );
+    }
+    let smallest = server
+        .mock("GET", path.as_str())
+        .match_query(mockito::Matcher::UrlEncoded("per_page".into(), "10".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&vec![make_release("v1.0.0")]).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let releases = list_releases_(&base, repo, false).await.unwrap();
+    for mock in &failing {
+        mock.assert_async().await;
+    }
+    smallest.assert_async().await;
+    assert_eq!(releases.len(), 1);
+}
+
+// When even the smallest page fails, the listing fails with that error.
+#[tokio::test]
+async fn test_list_releases_fails_when_the_smallest_page_size_fails() {
+    let mut server = mockito::Server::new_async().await;
+    let base = server.url();
+    let repo = "owner/huge-releases-all-fail";
+    let path = format!("/repos/{repo}/releases");
+
+    // One mock per size: the client retries a 504 at the same URL, so a
+    // catch-all could be satisfied without the smaller sizes ever being asked.
+    let mut failing = Vec::new();
+    for per_page in ["100", "30", "10"] {
+        failing.push(
+            server
+                .mock("GET", path.as_str())
+                .match_query(mockito::Matcher::UrlEncoded(
+                    "per_page".into(),
+                    per_page.into(),
+                ))
+                .with_status(504)
+                .expect_at_least(1)
+                .create_async()
+                .await,
+        );
+    }
+
+    let err = list_releases_(&base, repo, false).await.unwrap_err();
+    for mock in &failing {
+        mock.assert_async().await;
+    }
+    assert!(is_server_error(&err), "got {err:#}");
+}
+
+// The `Link` header of the smaller page carries the page after it.
+#[tokio::test]
+async fn test_list_releases_paginates_after_shrinking_the_page() {
+    let mut server = mockito::Server::new_async().await;
+    let base = server.url();
+    let repo = "owner/huge-releases-paged";
+    let path = format!("/repos/{repo}/releases");
+
+    let too_big = server
+        .mock("GET", path.as_str())
+        .match_query(mockito::Matcher::UrlEncoded(
+            "per_page".into(),
+            "100".into(),
+        ))
+        .with_status(504)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let page1 = server
+        .mock("GET", path.as_str())
+        .match_query(mockito::Matcher::UrlEncoded("per_page".into(), "30".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_header("link", format!("<{base}/page2>; rel=\"next\"").as_str())
+        .with_body(serde_json::to_string(&vec![make_prerelease("v2.0.0-alpha.1")]).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+    let page2 = server
+        .mock("GET", "/page2")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&vec![make_release("v1.0.0")]).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let releases = list_releases_(&base, repo, false).await.unwrap();
+    too_big.assert_async().await;
+    page1.assert_async().await;
+    page2.assert_async().await;
+    assert_eq!(
+        releases
+            .iter()
+            .map(|r| r.tag_name.as_str())
+            .collect::<Vec<_>>(),
+        ["v2.0.0-alpha.1", "v1.0.0"]
+    );
+}
+
+#[tokio::test]
+async fn test_refreshing_asset_versions_replaces_the_cached_listing() {
+    use confique::Layer;
+
+    struct SettingsGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    impl Drop for SettingsGuard {
+        fn drop(&mut self) {
+            crate::testing::reset_settings(None);
+        }
+    }
+    let _settings = SettingsGuard {
+        _lock: crate::testing::lock_ignoring_poison(&crate::testing::SETTINGS_LOCK),
+    };
+    let mut server = mockito::Server::new_async().await;
+    let mut settings = mise_settings::SettingsPartial::empty();
+    settings.url_replacements = Some(indexmap::IndexMap::from([(
+        API_URL.to_string(),
+        server.url(),
+    )]));
+    settings.http_retries = Some(0);
+    crate::testing::reset_settings(Some(settings));
+
+    let repo = format!("owner/packslip-refresh-{}", server.socket_address().port());
+    let asset = "packslip.sigstore.json";
+    let release = |tag: &str| GithubRelease {
+        assets: vec![make_asset(asset)],
+        ..make_release(tag)
+    };
+    let path = format!("/repos/{repo}/releases?per_page=100");
+    let before = server
+        .mock("GET", path.as_str())
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::to_string(&vec![release("pkg@1.0.0")]).unwrap())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let tags = |versions: &[ReleaseVersion]| {
+        versions
+            .iter()
+            .map(|r| r.tag_name.clone())
+            .collect::<Vec<_>>()
+    };
+    let first = list_release_versions_with_asset(&repo, asset)
+        .await
+        .unwrap();
+    assert_eq!(tags(&first), ["pkg@1.0.0"]);
+    before.assert_async().await;
+
+    // The release published since is absent from the cached listing, which a
+    // plain read keeps serving.
+    let after = server
+        .mock("GET", path.as_str())
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::to_string(&vec![release("pkg@2.0.0"), release("pkg@1.0.0")]).unwrap(),
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let cached = list_release_versions_with_asset(&repo, asset)
+        .await
+        .unwrap();
+    assert_eq!(tags(&cached), ["pkg@1.0.0"]);
+
+    let refreshed = refresh_release_versions_with_asset(&repo, asset)
+        .await
+        .unwrap();
+    assert_eq!(tags(&refreshed), ["pkg@2.0.0", "pkg@1.0.0"]);
+    after.assert_async().await;
+    let reread = list_release_versions_with_asset(&repo, asset)
+        .await
+        .unwrap();
+    assert_eq!(tags(&reread), ["pkg@2.0.0", "pkg@1.0.0"]);
+}

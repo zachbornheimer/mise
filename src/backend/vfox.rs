@@ -1,0 +1,1535 @@
+use crate::{env, plugins::PluginEnum, timeout};
+use async_trait::async_trait;
+use eyre::{WrapErr, bail, eyre};
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Debug;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock, mpsc};
+use std::thread;
+use url::Url;
+use walkdir::WalkDir;
+
+use crate::args::BackendArg;
+use crate::backend::VersionInfo;
+use crate::backend::backend_type::BackendType;
+use crate::backend::platform_target::PlatformTarget;
+use crate::backend::{Backend, runtime_path_for_install_path};
+use crate::cache::{CacheManager, CacheManagerBuilder};
+use crate::config::{Config, Settings, SettingsExt};
+use crate::dirs;
+use crate::env_diff::EnvMap;
+use crate::hash::{hash_sha256_to_str, hash_to_str};
+use crate::install_context::InstallContext;
+use crate::lockfile::{PlatformInfo, ProvenanceType};
+use crate::plugins::Plugin;
+use crate::plugins::vfox_plugin::VfoxPlugin;
+use crate::toolset::{ToolOptions, ToolVersion, Toolset, install_state};
+use crate::ui::multi_progress_report::MultiProgressReport;
+
+type AliasCaches = HashMap<String, Arc<CacheManager<BTreeMap<String, String>>>>;
+type ExecEnvCaches = HashMap<PathBuf, Arc<ExecEnvCache>>;
+
+/// A vfox exec_env result, kept on disk and, once read or fetched, in memory.
+struct ExecEnvCache {
+    file: CacheManager<CachedExecEnv>,
+    env: tokio::sync::OnceCell<EnvMap>,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CachedExecEnv {
+    env: EnvMap,
+    /// The variables the hook read through `os.getenv`, with a hash of the
+    /// value it saw: a hook can read a secret, and the cache is a plain file.
+    env_reads: BTreeMap<String, Option<String>>,
+    /// The files the hook asked to watch, with their modification time then
+    /// (`None` when missing).
+    watch_files: Vec<(PathBuf, Option<u128>)>,
+    /// False when the hook asked not to be cached. Such an entry holds no
+    /// result; it is kept so an older result is not served instead.
+    cacheable: bool,
+    /// Where the hook resolved relative watched files; the result only
+    /// applies in that directory.
+    cwd: Option<PathBuf>,
+}
+
+impl CachedExecEnv {
+    /// Whether the result can be served without checking the environment.
+    fn still_applies(&self) -> bool {
+        self.cacheable
+            && self
+                .cwd
+                .as_ref()
+                .is_none_or(|cwd| std::env::current_dir().is_ok_and(|current| current == *cwd))
+            && self
+                .watch_files
+                .iter()
+                .all(|(path, modified)| modified_nanos(path) == *modified)
+    }
+}
+
+fn modified_nanos(path: &Path) -> Option<u128> {
+    let modified = path.metadata().ok()?.modified().ok()?;
+    let since_epoch = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(since_epoch.as_nanos())
+}
+
+fn hash_env_reads(reads: BTreeMap<String, Option<String>>) -> BTreeMap<String, Option<String>> {
+    reads
+        .into_iter()
+        .map(|(key, value)| (key, value.as_deref().map(hash_sha256_to_str)))
+        .collect()
+}
+
+/// Whether every variable a hook read still has the value it saw, looked up
+/// the way Lua `os.getenv` looks it up in the hook's environment.
+fn env_reads_match(
+    reads: &BTreeMap<String, Option<String>>,
+    env: &indexmap::IndexMap<String, String>,
+) -> bool {
+    reads.iter().all(|(key, seen)| {
+        let current = env.get(key).or_else(|| {
+            if cfg!(windows) {
+                env.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, v)| v)
+            } else {
+                None
+            }
+        });
+        current.map(|value| hash_sha256_to_str(value)) == *seen
+    })
+}
+
+/// Whether `version` can name a plugin alias like `recommended`. Pinned
+/// versions, `latest`, `system` and `ref:`-style requests never do, so they
+/// skip the lookup.
+fn could_be_alias(version: &str) -> bool {
+    !version.is_empty()
+        && !version.starts_with(|c: char| c.is_ascii_digit())
+        && !matches!(version, "latest" | "system")
+        && !version.contains(':')
+}
+
+#[derive(Debug)]
+pub(crate) struct VfoxBackend {
+    ba: Arc<BackendArg>,
+    plugin: Arc<VfoxPlugin>,
+    plugin_enum: PluginEnum,
+    pathname: String,
+    tool_name: Option<String>,
+    metadata_deps: OnceLock<Vec<String>>,
+    system_deps: OnceLock<Vec<crate::system::deps::SystemDep>>,
+    metadata_snapshot_cache: OnceLock<CacheManager<VfoxMetadataSnapshot>>,
+}
+
+/// Disk-cached subset of a filesystem vfox plugin's metadata. Loading metadata
+/// boots a Lua VM and executes the plugin's top-level metadata.lua, which can
+/// do arbitrary work (e.g. probe system packages), so it must not re-run on
+/// every mise invocation.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct VfoxMetadataSnapshot {
+    legacy_filenames: Vec<String>,
+    depends: Vec<String>,
+    system_dependencies: Vec<vfox::SystemDependency>,
+    /// `PLUGIN.downloads`; false means the plugin installs without a download.
+    #[serde(default = "default_downloads")]
+    downloads: bool,
+}
+
+fn default_downloads() -> bool {
+    true
+}
+
+/// Fingerprint of every Lua source under a plugin, used as the metadata cache
+/// key.
+///
+/// metadata.lua may `require` sibling modules and derive its table from them,
+/// so keying on its own mtime alone would serve stale metadata when only a
+/// module changed — editing a file in place leaves the directory's mtime
+/// untouched, so the directory is no help either. Hashing the sources is exact
+/// and costs a few KB of reads, against the Lua VM boot it avoids. Computed
+/// lazily: plugins whose metadata is never requested read nothing.
+fn lua_sources_fingerprint(plugin_path: &Path) -> String {
+    let mut sources: Vec<(String, Vec<u8>)> = WalkDir::new(plugin_path)
+        // Lua resolves symlinks, so the fingerprint has to as well: a plugin
+        // linked into place (`mise plugins link`) or carrying a symlinked
+        // module would otherwise contribute nothing and never invalidate.
+        // Symlink cycles surface as errors here and are skipped below.
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "lua"))
+        .filter_map(|e| {
+            let rel = e
+                .path()
+                .strip_prefix(plugin_path)
+                .unwrap_or(e.path())
+                .to_string_lossy()
+                .to_string();
+            std::fs::read(e.path()).ok().map(|bytes| (rel, bytes))
+        })
+        .collect();
+    sources.sort_by(|a, b| a.0.cmp(&b.0));
+    hash_to_str(&sources)
+}
+
+fn remove_env_var(env: &mut indexmap::IndexMap<String, String>, key: &str) {
+    #[cfg(windows)]
+    {
+        if let Some(existing) = env
+            .keys()
+            .find(|existing| existing.eq_ignore_ascii_case(key))
+            .cloned()
+        {
+            env.shift_remove(&existing);
+        }
+    }
+    #[cfg(not(windows))]
+    env.shift_remove(key);
+}
+
+fn normalize_install_log(line: &str) -> String {
+    if let Some(raw_url) = line.strip_prefix("Downloading ") {
+        let artifact = Url::parse(raw_url).ok().and_then(|url| {
+            url.path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        });
+        artifact.map_or_else(|| "download".to_string(), |name| format!("download {name}"))
+    } else if line.starts_with("Verifying ") && line.ends_with(" checksum") {
+        "checksum".to_string()
+    } else if line.starts_with("Verify ") && line.ends_with(" attestation") {
+        "verify attestation".to_string()
+    } else if line.starts_with("Extracting ") {
+        "extract".to_string()
+    } else {
+        line.to_string()
+    }
+}
+
+fn set_env_var(
+    env: &mut indexmap::IndexMap<String, String>,
+    key: impl Into<String>,
+    value: impl Into<String>,
+) {
+    let key = key.into();
+    remove_env_var(env, &key);
+    env.insert(key, value.into());
+}
+
+fn add_tool_option_env(env: &mut indexmap::IndexMap<String, String>, options: &ToolOptions) {
+    for (key, value) in options.opts_as_strings() {
+        let key = key.to_uppercase();
+        set_env_var(env, format!("MISE_TOOL_OPTS__{key}"), value);
+    }
+}
+
+fn is_tool_option_env_key(key: &str) -> bool {
+    let matches = |key: &str| key.starts_with("MISE_TOOL_OPTS__");
+    if cfg!(windows) {
+        matches(&key.to_uppercase())
+    } else {
+        matches(key)
+    }
+}
+
+fn restore_config_tool_option_env(
+    env: &mut indexmap::IndexMap<String, String>,
+    config_env: &indexmap::IndexMap<String, String>,
+) {
+    for (key, value) in config_env {
+        if is_tool_option_env_key(key) {
+            set_env_var(env, key.clone(), value.clone());
+        }
+    }
+}
+
+#[async_trait]
+impl Backend for VfoxBackend {
+    fn get_type(&self) -> BackendType {
+        match self.plugin_enum {
+            PluginEnum::VfoxBackend(_) => BackendType::VfoxBackend(self.plugin.name().to_string()),
+            PluginEnum::Vfox(_) => BackendType::Vfox,
+            _ => unreachable!(),
+        }
+    }
+
+    fn ba(&self) -> &Arc<BackendArg> {
+        &self.ba
+    }
+
+    /// A plugin can report that an installed version no longer matches the
+    /// request, e.g. because a tool option selects add-on components that are
+    /// not installed yet. mise then repairs it through `repair_install`.
+    /// A plugin with a `MiseInstallSatisfied` hook decides for itself whether an
+    /// install still matches the request's options (and repairs it in place when
+    /// not), so those options do not split installs; the hook never sees an install
+    /// that a new identity would hide from it. Plugins without the hook have no
+    /// such mechanism and their options do distinguish installs.
+    fn install_identity_options(
+        &self,
+        tv: &ToolVersion,
+    ) -> std::collections::BTreeMap<String, String> {
+        if !self.is_backend_plugin() && self.plugin_has_hook("mise_install_satisfied") {
+            return self
+                .resolve_lockfile_options(
+                    &tv.request,
+                    &crate::backend::platform_target::PlatformTarget::from_current(),
+                )
+                .unwrap_or_default();
+        }
+        crate::backend::static_helpers::request_identity_options(self, tv)
+    }
+
+    async fn is_install_satisfied(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+        check_symlink: bool,
+    ) -> eyre::Result<bool> {
+        if !self.is_version_installed(config, tv, check_symlink) {
+            return Ok(false);
+        }
+        if self.is_backend_plugin() || !self.plugin_has_hook("mise_install_satisfied") {
+            return Ok(true);
+        }
+        match self.mise_install_satisfied(config, tv).await {
+            Ok(result) => {
+                if !result.satisfied {
+                    debug!(
+                        "{} install is not satisfied: {}",
+                        tv.style(),
+                        result.reason.as_deref().unwrap_or("reported by plugin")
+                    );
+                }
+                Ok(result.satisfied)
+            }
+            // A broken check must not make mise reinstall a working tool on
+            // every command, so treat the install as current.
+            Err(err) => {
+                warn!(
+                    "{} MiseInstallSatisfied hook failed, treating install as current: {err:#}",
+                    tv.style()
+                );
+                Ok(true)
+            }
+        }
+    }
+
+    /// When `MiseInstallSatisfied` rejects an existing install, run
+    /// `PostInstall` on it again instead of downloading and extracting the
+    /// version from scratch, so a failure leaves the working install in place.
+    async fn repair_install(&self, ctx: &InstallContext, tv: &ToolVersion) -> eyre::Result<bool> {
+        if self.is_backend_plugin() || !self.plugin_has_hook("mise_install_satisfied") {
+            return Ok(false);
+        }
+        let (mut vfox, _log_rx) = self.plugin.vfox()?;
+        let pr = Arc::clone(&ctx.pr);
+        vfox.set_log_handler(move |line| pr.set_message(line));
+        let (cmd_env, tool_options) = self.install_cmd_env(ctx, tv).await?;
+        vfox.cmd_env = Some(cmd_env);
+        ctx.pr.set_message("post-install".to_string());
+        vfox.repair_install(
+            &self.pathname,
+            &tv.version,
+            tv.install_path(),
+            tool_options.into_backend_options().into_map(),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn verify_repaired_install(
+        &self,
+        ctx: &InstallContext,
+        tv: &ToolVersion,
+    ) -> eyre::Result<()> {
+        // Like the initial check, a hook error must not fail the install.
+        let result = match self.mise_install_satisfied(&ctx.config, tv).await {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(
+                    "{} MiseInstallSatisfied hook failed after PostInstall, treating install as current: {err:#}",
+                    tv.style()
+                );
+                return Ok(());
+            }
+        };
+        if !result.satisfied {
+            bail!(
+                "{} still does not satisfy its tool options after PostInstall: {}\n\
+                 hint: run `mise install --force {}` to reinstall it from scratch",
+                tv.style(),
+                result.reason.as_deref().unwrap_or("reported by plugin"),
+                tv.ba().short,
+            );
+        }
+        Ok(())
+    }
+
+    fn get_dependencies(&self) -> eyre::Result<Vec<&str>> {
+        let deps = self.metadata_deps.get_or_init(|| {
+            self.load_metadata_deps().unwrap_or_else(|e| {
+                warn!(
+                    "failed to load vfox plugin metadata deps for {}: {e}",
+                    self.pathname
+                );
+                vec![]
+            })
+        });
+        Ok(deps.iter().map(|s| s.as_str()).collect())
+    }
+
+    fn system_dependencies(&self) -> Vec<crate::system::deps::SystemDep> {
+        self.system_deps
+            .get_or_init(|| {
+                self.load_system_deps().unwrap_or_else(|e| {
+                    warn!(
+                        "failed to load vfox plugin system dependencies for {}: {e}",
+                        self.pathname
+                    );
+                    vec![]
+                })
+            })
+            .clone()
+    }
+
+    fn mark_prereleases_from_version_pattern(&self) -> bool {
+        true
+    }
+
+    fn supports_lockfile_url(&self) -> bool {
+        // TODO: expose a plugin hook (e.g. BackendLockInfo) so custom Lua backends
+        // can surface a download URL + checksum, and flip this back on for them.
+        if self.is_backend_plugin() {
+            return false;
+        }
+        // A tool plugin that declares `downloads = false` has no URL to lock.
+        // When its metadata cannot be read, keep requiring one.
+        self.plugin_metadata_snapshot()
+            .ok()
+            .flatten()
+            .is_none_or(|m| m.downloads)
+    }
+
+    fn remote_version_listing_tool_option_keys(&self) -> &'static [&'static str] {
+        // TODO: support a vfox backend plugin capability/metadata field for
+        // declaring which tool options affect BackendListVersions. The
+        // vendored plugins do not currently expose version-listing options, so
+        // keep versions-host behavior unchanged until there is a real contract.
+        &[]
+    }
+
+    async fn _list_remote_versions(&self, config: &Arc<Config>) -> eyre::Result<Vec<VersionInfo>> {
+        let this = self;
+        timeout::run_with_timeout_async(
+            || async {
+                let (mut vfox, _log_rx) = this.plugin.vfox()?;
+                this.ensure_plugin_installed(config).await?;
+                if let Ok(dep_env) = this.dependency_env(config).await {
+                    vfox.cmd_env = Some(dep_env.into_iter().collect());
+                }
+
+                // Use backend methods if the plugin supports them
+                if this.is_backend_plugin() {
+                    debug!("Using backend method for plugin: {}", this.pathname);
+                    let tool_name = this.get_tool_name()?;
+                    let opts = config
+                        .get_tool_opts_with_overrides(&this.ba)
+                        .await?
+                        .into_backend_options()
+                        .into_map();
+                    let listing = vfox
+                        .backend_list_versions_and_aliases(&this.pathname, tool_name, opts)
+                        .await
+                        .wrap_err("Backend list versions method failed")?;
+                    return Ok(listing
+                        .versions
+                        .into_iter()
+                        .map(|v| VersionInfo {
+                            version: v.version,
+                            created_at: valid_created_at(&this.pathname, v.created_at),
+                            ..Default::default()
+                        })
+                        .collect());
+                }
+
+                // Use default vfox behavior for traditional plugins
+                let versions = vfox.list_available_versions(&this.pathname).await?;
+                Ok(versions
+                    .into_iter()
+                    .rev()
+                    .map(|v| VersionInfo {
+                        version: v.version,
+                        rolling: v.rolling,
+                        checksum: v.checksum,
+                        created_at: valid_created_at(&this.pathname, v.created_at),
+                        ..Default::default()
+                    })
+                    .collect())
+            },
+            Settings::get().fetch_remote_versions_timeout(),
+        )
+        .await
+    }
+
+    async fn resolve_dynamic_alias(&self, version: &str) -> eyre::Result<Option<String>> {
+        if !self.is_backend_plugin() || !could_be_alias(version) {
+            return Ok(None);
+        }
+        let config = Config::get().await?;
+        // `v1.2.3` may be a literal release, so an installed version resolves as
+        // written when the lookup fails. Anything else could be an alias name, and
+        // passing it through would install under that name, so the error stands.
+        match self.backend_aliases(&config).await {
+            Ok(aliases) => Ok(aliases.get(version).cloned()),
+            Err(err) if self.list_installed_versions().iter().any(|v| v == version) => {
+                debug!("vfox alias lookup for {} failed: {err:#}", self.pathname);
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn install_version_(
+        &self,
+        ctx: &InstallContext,
+        tv: ToolVersion,
+    ) -> eyre::Result<ToolVersion> {
+        let mut tv = tv;
+        self.ensure_plugin_installed(&ctx.config).await?;
+        let (mut vfox, _log_rx) = self.plugin.vfox()?;
+        let pr = Arc::clone(&ctx.pr);
+        vfox.set_log_handler(move |line| pr.set_message(normalize_install_log(&line)));
+        let pr = Arc::clone(&ctx.pr);
+        vfox.set_download_progress(move |written, total| {
+            // The total opens a transfer, so announce it once per attempt (the
+            // callback starts each one at 0) and only move the position after.
+            if written == 0 {
+                pr.set_length(total.unwrap_or(0));
+            }
+            pr.set_position(written);
+        });
+        let (cmd_env, tool_options) = self.install_cmd_env(ctx, &tv).await?;
+        if !cmd_env.is_empty() {
+            vfox.cmd_env = Some(cmd_env);
+        }
+
+        // Use backend methods if the plugin supports them
+        if self.is_backend_plugin() {
+            let tool_name = self.get_tool_name()?;
+            vfox.backend_install(
+                &self.pathname,
+                tool_name,
+                &tv.version,
+                tv.install_path(),
+                tv.download_path(),
+                tool_options.into_backend_options().into_map(),
+            )
+            .await
+            .wrap_err("Backend install method failed")?;
+            return Ok(tv);
+        }
+
+        // Reuse non-SLSA lockfile provenance, but re-verify SLSA so the configured
+        // signer is checked even when a checksum is available. Unlike aqua/github,
+        // the vfox backend doesn't populate PlatformInfo.checksum.
+        let platform_key = self.get_platform_key();
+        let has_lockfile_provenance = tv
+            .lock_platforms
+            .get(&platform_key)
+            .is_some_and(|pi| pi.provenance.is_some());
+        let locked_slsa = tv
+            .lock_platforms
+            .get(&platform_key)
+            .and_then(|pi| pi.provenance.as_ref())
+            .is_some_and(ProvenanceType::is_slsa);
+        vfox.skip_verification = has_lockfile_provenance && !locked_slsa;
+        // In locked mode the download must be the artifact the lockfile pinned.
+        if ctx.locked {
+            vfox.locked_checksum = tv
+                .lock_platforms
+                .get(&platform_key)
+                .and_then(|pi| pi.checksum.clone());
+        }
+
+        // Save expected provenance before take() so we can detect type changes afterward,
+        // then clear it so we can detect whether install re-sets it.
+        // Safety: .take() removes provenance from tv before install. If install
+        // fails, tv is discarded via ?, so the removed value is never observed.
+        let expected_provenance = tv
+            .lock_platforms
+            .get_mut(&platform_key)
+            .and_then(|pi| pi.provenance.take());
+
+        // Use default vfox behavior for traditional plugins
+        let result = vfox
+            .install_with_download_dir_and_options(
+                &self.pathname,
+                &tv.version,
+                tv.install_path(),
+                tv.download_path(),
+                tool_options.into_backend_options().into_map(),
+            )
+            .await?;
+
+        // Record provenance if attestation verification succeeded
+        if let Some(att) = result.verified_attestation {
+            let provenance = verified_attestation_to_provenance(att);
+            let pi = tv.lock_platforms.entry(platform_key.clone()).or_default();
+            pi.provenance = Some(provenance);
+        } else if let Some(ref expected) = expected_provenance
+            && result.checksum_verified
+            && !expected.is_slsa()
+        {
+            // For non-SLSA attestations, the verified checksum permits reuse of
+            // lockfile provenance when attestation verification was skipped.
+            // When the plugin has no checksums, we leave got=None so the enforce check
+            // catches the missing attestation as a potential downgrade.
+            let pi = tv.lock_platforms.entry(platform_key.clone()).or_default();
+            pi.provenance = Some(expected.clone());
+        }
+
+        // Enforce lockfile provenance — prevent downgrade attacks.
+        // If a plugin removed its attestation config, got is None and this triggers.
+        // If attestation type changed, the discriminant mismatch triggers.
+        // If verification was skipped, expected was restored above so this passes.
+        if let Some(ref expected) = expected_provenance {
+            let got = tv
+                .lock_platforms
+                .get(&platform_key)
+                .and_then(|pi| pi.provenance.as_ref());
+            if !got.is_some_and(|g| std::mem::discriminant(g) == std::mem::discriminant(expected)) {
+                if expected.is_slsa() {
+                    return Err(eyre!(
+                        "Lockfile requires SLSA provenance for {tv}, but the vfox plugin did not verify it. \
+                         Add slsa_signer_identity and slsa_signer_issuer to the plugin's \
+                         PreInstall attestation, or refresh the lockfile after choosing another verification method."
+                    ));
+                }
+                let got_str = got
+                    .map(|g| g.to_string())
+                    .unwrap_or_else(|| "no verification".to_string());
+                return Err(eyre!(
+                    "Lockfile requires {expected} provenance for {tv} but {got_str} was used. \
+                     This may indicate a downgrade attack. Update the lockfile if the plugin's \
+                     attestation configuration has intentionally changed."
+                ));
+            }
+        }
+
+        // Store checksum for rolling version tracking
+        if let Some(sha256) = result.sha256
+            && let Err(e) = install_state::write_checksum(&tv.install_path(), &sha256)
+        {
+            warn!("failed to write checksum for {}: {e}", tv);
+        }
+
+        Ok(tv)
+    }
+
+    async fn list_bin_paths(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+    ) -> eyre::Result<Vec<PathBuf>> {
+        let path = self
+            ._exec_env(config, tv)
+            .await?
+            .iter()
+            .find(|(k, _)| k.to_uppercase() == "PATH")
+            .map(|(_, v)| v.to_string());
+        if let Some(path) = path {
+            Ok(env::split_paths(&path)
+                .map(|path| runtime_path_for_install_path(tv, path))
+                .collect())
+        } else {
+            Ok(vec![tv.runtime_path().join("bin")])
+        }
+    }
+
+    async fn exec_env(
+        &self,
+        config: &Arc<Config>,
+        _ts: &Toolset,
+        tv: &ToolVersion,
+    ) -> eyre::Result<EnvMap> {
+        Ok(self
+            ._exec_env(config, tv)
+            .await?
+            .into_iter()
+            .filter(|(k, _)| k.to_uppercase() != "PATH")
+            .collect())
+    }
+
+    fn plugin(&self) -> Option<&PluginEnum> {
+        Some(&self.plugin_enum)
+    }
+
+    async fn uninstall_version_impl(
+        &self,
+        config: &Arc<Config>,
+        _pr: &dyn crate::ui::progress_report::SingleReport,
+        tv: &ToolVersion,
+    ) -> eyre::Result<()> {
+        if !self.plugin.is_installed() {
+            return Ok(());
+        }
+
+        let (mut vfox, log_rx) = self.plugin.vfox()?;
+        Self::forward_plugin_logs(log_rx);
+        vfox.cmd_env = Some(self.cmd_env_for_tv(config, tv).await);
+        if self.is_backend_plugin() {
+            let options = self
+                .tool_options_for_tv(config, tv)
+                .await
+                .into_backend_options()
+                .into_map();
+            vfox.backend_uninstall(
+                &self.pathname,
+                self.get_tool_name()?,
+                &tv.version,
+                tv.install_path(),
+                tv.download_path(),
+                options,
+            )
+            .await
+            .wrap_err("Backend uninstall method failed")?;
+            return Ok(());
+        }
+        vfox.pre_uninstall(&self.pathname, &tv.version, tv.install_path())
+            .await?;
+        Ok(())
+    }
+
+    async fn _idiomatic_filenames(&self) -> eyre::Result<Vec<String>> {
+        if let Some(snapshot) = self.plugin_metadata_snapshot()? {
+            return Ok(snapshot.legacy_filenames);
+        }
+        let (vfox, _log_rx) = self.plugin.vfox()?;
+
+        let metadata = vfox.metadata(&self.pathname).await?;
+        Ok(metadata.legacy_filenames)
+    }
+
+    async fn _parse_idiomatic_file(&self, path: &Path) -> eyre::Result<Vec<String>> {
+        let (vfox, _log_rx) = self.plugin.vfox()?;
+        let response = vfox.parse_legacy_file(&self.pathname, path).await?;
+        if let Some(version) = response.version {
+            return Ok(version.split_whitespace().map(|s| s.to_string()).collect());
+        }
+        Ok(vec![])
+    }
+
+    async fn get_tarball_url(
+        &self,
+        tv: &ToolVersion,
+        target: &PlatformTarget,
+    ) -> eyre::Result<Option<String>> {
+        let config = Config::get().await?;
+        self.ensure_plugin_installed(&config).await?;
+
+        let (os, arch) = Self::to_vfox_platform(target);
+
+        let (mut vfox, _log_rx) = self.plugin.vfox()?;
+        vfox.cmd_env = Some(self.cmd_env_for_tv(&config, tv).await);
+        let options = self
+            .tool_options_for_tv(&config, tv)
+            .await
+            .into_backend_options()
+            .into_map();
+        let pre_install = vfox
+            .pre_install_for_platform_with_options(&self.pathname, &tv.version, os, arch, options)
+            .await?;
+
+        Ok(pre_install.url)
+    }
+
+    async fn resolve_lock_info(
+        &self,
+        tv: &ToolVersion,
+        target: &PlatformTarget,
+    ) -> eyre::Result<PlatformInfo> {
+        // Backend plugins use backend_install and have no PreInstall hook;
+        // fall back to the default implementation.
+        if self.is_backend_plugin() {
+            return Ok(PlatformInfo::default());
+        }
+
+        let config = Config::get().await?;
+        self.ensure_plugin_installed(&config).await?;
+
+        let (os, arch) = Self::to_vfox_platform(target);
+
+        let (mut vfox, _log_rx) = self.plugin.vfox()?;
+        vfox.cmd_env = Some(self.cmd_env_for_tv(&config, tv).await);
+        let options = self
+            .tool_options_for_tv(&config, tv)
+            .await
+            .into_backend_options()
+            .into_map();
+        let (url, att, download_headers) = vfox
+            .pre_install_provenance_for_platform_with_options(
+                &self.pathname,
+                &tv.version,
+                os,
+                arch,
+                options,
+            )
+            .await?;
+
+        let provenance = att.map(verified_attestation_to_provenance);
+
+        Ok(PlatformInfo {
+            url,
+            download_headers,
+            provenance,
+            ..Default::default()
+        })
+    }
+}
+
+impl VfoxBackend {
+    fn forward_plugin_logs(log_rx: mpsc::Receiver<String>) {
+        thread::spawn(move || {
+            for line in log_rx {
+                // TODO: put this in ctx.pr.set_message()
+                info!("{}", line);
+            }
+        });
+    }
+
+    /// The aliases a backend plugin reports from `BackendListVersions`, cached
+    /// like the version list so resolving `@recommended` doesn't run the plugin
+    /// every time.
+    async fn backend_aliases(
+        &self,
+        config: &Arc<Config>,
+    ) -> eyre::Result<BTreeMap<String, String>> {
+        static CACHES: OnceLock<std::sync::Mutex<AliasCaches>> = OnceLock::new();
+        let cache = {
+            let mut caches = CACHES.get_or_init(Default::default).lock().unwrap();
+            caches
+                .entry(self.ba.full())
+                .or_insert_with(|| {
+                    let mut cm =
+                        CacheManagerBuilder::new(self.ba.cache_path().join("aliases.msgpack.z"))
+                            .with_fresh_duration(Settings::get().fetch_remote_versions_cache());
+                    // A plugin update can move an alias, so it expires the cache.
+                    if let Some(plugin_path) = self.plugin().map(|p| p.path()) {
+                        cm = cm
+                            .with_fresh_file(plugin_path.clone())
+                            .with_fresh_file(plugin_path.join("hooks/backend_list_versions.lua"));
+                    }
+                    Arc::new(cm.build())
+                })
+                .clone()
+        };
+        // Offline, an expired cache still answers and a missing one means no
+        // aliases, so the plugin never contacts its registry.
+        if Settings::get().offline() {
+            return Ok(cache.get_cached().unwrap_or_default());
+        }
+        let aliases = cache
+            .get_or_try_init_async(async || {
+                timeout::run_with_timeout_async(
+                    || async {
+                        let (mut vfox, _log_rx) = self.plugin.vfox()?;
+                        self.ensure_plugin_installed(config).await?;
+                        if let Ok(dep_env) = self.dependency_env(config).await {
+                            vfox.cmd_env = Some(dep_env.into_iter().collect());
+                        }
+                        let opts = config
+                            .get_tool_opts_with_overrides(&self.ba)
+                            .await?
+                            .into_backend_options()
+                            .into_map();
+                        let listing = vfox
+                            .backend_list_versions_and_aliases(
+                                &self.pathname,
+                                self.get_tool_name()?,
+                                opts,
+                            )
+                            .await
+                            .wrap_err("Backend list versions method failed")?;
+                        Ok(listing.aliases)
+                    },
+                    Settings::get().fetch_remote_versions_timeout(),
+                )
+                .await
+            })
+            .await?;
+        Ok(aliases.clone())
+    }
+
+    fn is_backend_plugin(&self) -> bool {
+        matches!(&self.plugin_enum, PluginEnum::VfoxBackend(_))
+    }
+
+    /// Map mise platform names to the names expected by vfox plugins.
+    fn to_vfox_platform(target: &PlatformTarget) -> (&str, &str) {
+        let os = match target.os_name() {
+            "macos" => "darwin",
+            os => os,
+        };
+        let arch = match target.arch_name() {
+            "x64" => "amd64",
+            arch => arch,
+        };
+        (os, arch)
+    }
+
+    fn get_tool_name(&self) -> eyre::Result<&str> {
+        self.tool_name
+            .as_deref()
+            .ok_or_else(|| eyre::eyre!("VfoxBackend requires a tool name (plugin:tool format)"))
+    }
+
+    async fn cmd_env_for_tv(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+    ) -> indexmap::IndexMap<String, String> {
+        let mut cmd_env = self
+            .dependency_env(config)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        add_tool_option_env(&mut cmd_env, &self.tool_options_for_tv(config, tv).await);
+        if let Ok(config_env) = config.env().await {
+            restore_config_tool_option_env(&mut cmd_env, &config_env);
+        }
+        cmd_env
+    }
+
+    async fn tool_options_for_tv(&self, config: &Arc<Config>, tv: &ToolVersion) -> ToolOptions {
+        let mut options = config
+            .get_tool_opts_for_request(&self.ba, &tv.request)
+            .await
+            .unwrap_or_default();
+        options.apply_overrides(&tv.request.options());
+        options
+    }
+
+    pub(crate) fn from_arg(ba: BackendArg, backend_plugin_name: Option<String>) -> Self {
+        let pathname = match &backend_plugin_name {
+            Some(plugin_name) => plugin_name.clone(),
+            None => crate::backend::tool_directory_name(&ba.short),
+        };
+
+        let plugin_path = dirs::PLUGINS.join(&pathname);
+        let mut plugin = VfoxPlugin::new(pathname.clone(), plugin_path.clone());
+        plugin.full = Some(ba.full());
+        let plugin = Arc::new(plugin);
+
+        // Prefer an explicit plugin:tool short name over the resolved backend.
+        // Legacy lockfiles can store only the plugin name as the backend, which
+        // must not replace the tool portion of the original request. Bare aliases
+        // still need the tool name from their resolved backend.
+        let tool_name = backend_plugin_name.as_ref().map(|plugin_name| {
+            ba.short
+                .split_once(':')
+                .filter(|(plugin, _)| plugin == plugin_name)
+                .map(|(_, tool)| tool.to_string())
+                .unwrap_or_else(|| ba.tool_name())
+        });
+
+        Self {
+            metadata_snapshot_cache: OnceLock::new(),
+            plugin: plugin.clone(),
+            plugin_enum: match backend_plugin_name {
+                Some(_) => PluginEnum::VfoxBackend(plugin),
+                None => PluginEnum::Vfox(plugin),
+            },
+            ba: Arc::new(ba),
+            pathname,
+            tool_name,
+            metadata_deps: OnceLock::new(),
+            system_deps: OnceLock::new(),
+        }
+    }
+
+    /// This plugin's metadata: idiomatic filenames, tool dependencies and
+    /// system dependencies.
+    ///
+    /// An installed plugin directory wins so a user override still applies, and
+    /// it is read through the disk cache — loading it boots a Lua VM and runs
+    /// the plugin's top-level code. An embedded plugin is used otherwise;
+    /// reading only the directory would silently drop the declarations of every
+    /// embedded plugin, since those ship compiled into the binary and have no
+    /// directory. `None` when there is no plugin at all.
+    /// The environment for install hooks: dependency tools, tool options,
+    /// `install_env`, and `tools = true` value directives.
+    async fn install_cmd_env(
+        &self,
+        ctx: &InstallContext,
+        tv: &ToolVersion,
+    ) -> eyre::Result<(indexmap::IndexMap<String, String>, ToolOptions)> {
+        let mut cmd_env: indexmap::IndexMap<String, String> = self
+            .dependency_env_for_install(ctx, tv)
+            .await?
+            .into_iter()
+            .collect();
+        let tool_options = self.tool_options_for_tv(&ctx.config, tv).await;
+        add_tool_option_env(&mut cmd_env, &tool_options);
+        let mut install_env_removals = Vec::new();
+        for (key, value) in tv.install_env() {
+            match value.into_string() {
+                Some(value) => {
+                    set_env_var(&mut cmd_env, key, value);
+                }
+                None => {
+                    remove_env_var(&mut cmd_env, &key);
+                    install_env_removals.push(key);
+                }
+            }
+        }
+        // Surface `tools = true` `[env]` *value* directives (e.g.
+        // `CLOUDSDK_PYTHON = "{{ tools.python.path }}/bin/python3"`) so the plugin's
+        // install hooks (including os.execute) see the resolved value during a
+        // combined `mise install`, mirroring the separate-install case where a
+        // re-activated shell re-exports it.
+        //
+        // Resolve against a fully-resolved toolset of this tool's dependencies, NOT
+        // ctx.ts: ctx.ts is the raw install toolset (`Toolset::from(ToolRequestSet)`)
+        // whose `.versions` are empty until `resolve()` runs *after* installs, so its
+        // `tools.*` tera map is empty and `{{ tools.python.path }}` would render "".
+        // The install dependency context is resolved offline and includes both backend deps
+        // and the per-tool mise.toml `depends` option (`gcloud = { depends =
+        // ["python"] }`) with real install paths, and is install-safe (it uses
+        // `get_tool_request_set()`, not the deadlock-prone `config.get_toolset()`).
+        // Best-effort: env *modules* are excluded via `ToolsFilter::ToolsOnlyVals`,
+        // any value evaluation error falls back to the tool-less env, and PATH is left to
+        // the strict install dependency environment. (#10282, follow-up to #10432)
+        {
+            let base: EnvMap = cmd_env.clone().into_iter().collect();
+            let dependencies = ctx.dependency_context(&tv.request).await?;
+            let tool_vals = dependencies.toolset.tool_val_env(&ctx.config, &base).await;
+            match tool_vals {
+                Ok(vals) => {
+                    for (k, v) in vals {
+                        // PATH stays owned by dependency_env, under any casing on Windows.
+                        if !crate::env::is_path_key(&k) {
+                            set_env_var(&mut cmd_env, k, v);
+                        }
+                    }
+                }
+                Err(e) => debug!("vfox: skipping tools=true value directives: {e:#}"),
+            }
+        }
+        for key in install_env_removals {
+            remove_env_var(&mut cmd_env, &key);
+        }
+        if let Ok(config_env) = ctx.config.env().await {
+            restore_config_tool_option_env(&mut cmd_env, &config_env);
+        }
+        Ok((cmd_env, tool_options))
+    }
+
+    /// Check for a hook without loading the plugin, since install checks run
+    /// on hot paths such as `mise x`.
+    fn plugin_has_hook(&self, filename: &str) -> bool {
+        let plugin_path = dirs::PLUGINS.join(&self.pathname);
+        if plugin_path.exists() {
+            return plugin_path
+                .join("hooks")
+                .join(format!("{filename}.lua"))
+                .is_file();
+        }
+        vfox::embedded_plugins::get_embedded_plugin(&self.pathname)
+            .is_some_and(|plugin| plugin.hooks.iter().any(|(name, _)| *name == filename))
+    }
+
+    async fn mise_install_satisfied(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+    ) -> eyre::Result<vfox::MiseInstallSatisfiedResult> {
+        let (mut vfox, log_rx) = self.plugin.vfox()?;
+        Self::forward_plugin_logs(log_rx);
+        vfox.cmd_env = Some(self.cmd_env_for_tv(config, tv).await);
+        let options = self
+            .tool_options_for_tv(config, tv)
+            .await
+            .into_backend_options()
+            .into_map();
+        let result = vfox
+            .mise_install_satisfied(&self.pathname, &tv.version, tv.install_path(), options)
+            .await?;
+        Ok(result.unwrap_or_default())
+    }
+
+    fn plugin_metadata_snapshot(&self) -> eyre::Result<Option<VfoxMetadataSnapshot>> {
+        let plugin_path = dirs::PLUGINS.join(&self.pathname);
+        let installed = plugin_path.exists();
+        if !installed && vfox::embedded_plugins::get_embedded_plugin(&self.pathname).is_none() {
+            return Ok(None);
+        }
+        let load = || {
+            let plugin = vfox::Plugin::from_name_or_dir(&self.pathname, &plugin_path)?;
+            let metadata = plugin.get_metadata()?;
+            Ok(VfoxMetadataSnapshot {
+                legacy_filenames: metadata.legacy_filenames,
+                depends: metadata.depends,
+                system_dependencies: metadata.system_dependencies,
+                downloads: metadata.downloads,
+            })
+        };
+        if !installed {
+            // Embedded: the Lua is compiled in, so loading costs no I/O and
+            // there are no source files to key a cache on.
+            return Ok(Some(load()?));
+        }
+        let cache = self.metadata_snapshot_cache.get_or_init(|| {
+            CacheManagerBuilder::new(self.ba.cache_path().join("metadata.msgpack.z"))
+                .with_cache_key(lua_sources_fingerprint(&plugin_path))
+                .build()
+        });
+        Ok(Some(cache.get_or_try_init(load)?.clone()))
+    }
+
+    fn load_metadata_deps(&self) -> eyre::Result<Vec<String>> {
+        Ok(self
+            .plugin_metadata_snapshot()?
+            .map(|m| m.depends)
+            .unwrap_or_default())
+    }
+
+    fn load_system_deps(&self) -> eyre::Result<Vec<crate::system::deps::SystemDep>> {
+        let Some(snapshot) = self.plugin_metadata_snapshot()? else {
+            return Ok(vec![]);
+        };
+        let mut deps = vec![];
+        for raw in snapshot.system_dependencies {
+            match crate::system::deps::SystemDep::try_from(raw) {
+                Ok(dep) => deps.push(dep),
+                Err(e) => warn!(
+                    "ignoring invalid systemDependencies entry in vfox plugin {}: {e}",
+                    self.pathname
+                ),
+            }
+        }
+        Ok(deps)
+    }
+
+    async fn _exec_env(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+    ) -> eyre::Result<BTreeMap<String, String>> {
+        let opts = self.tool_options_for_tv(config, tv).await;
+        let install_path = tv.install_path();
+        let opts_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            opts.hash(&mut hasher);
+            install_path.hash(&mut hasher);
+            // Refs such as `ref:a/b` and `ref:a-b` share an install path, but
+            // a hook can read the raw version.
+            tv.version.hash(&mut hasher);
+            hasher.finish()
+        };
+        let cache_file = tv
+            .cache_path()
+            .join(format!("exec_env_{:x}.msgpack.z", opts_hash));
+        // Inline table options give every backend lookup a new VfoxBackend
+        // (see `backend::get`), so the caches are kept here, keyed by file,
+        // rather than on the backend; otherwise each lookup runs the hook again.
+        static CACHES: OnceLock<std::sync::Mutex<ExecEnvCaches>> = OnceLock::new();
+        let cache = CACHES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .entry(cache_file.clone())
+            .or_insert_with(|| {
+                let mut cm = CacheManagerBuilder::new(&cache_file)
+                    .with_fresh_file(dirs::DATA.to_path_buf())
+                    .with_fresh_file(install_path.clone());
+                // A fresh file that doesn't exist leaves the cache stale forever,
+                // and an embedded plugin has no directory. Adding or removing an
+                // override, even a link to an older directory, changes the plugins
+                // directory. A link whose target is gone is kept, so it reads as
+                // changed.
+                for path in [dirs::PLUGINS.to_path_buf(), self.plugin.plugin_path.clone()] {
+                    if path.exists() || path.is_symlink() {
+                        cm = cm.with_fresh_file(path);
+                    }
+                }
+                Arc::new(ExecEnvCache {
+                    file: cm.build(),
+                    env: Default::default(),
+                })
+            })
+            .clone();
+        cache
+            .env
+            .get_or_try_init(async || {
+                // The hook's result also depends on what it declared and on
+                // the variables it read, so a cached one is used only while
+                // those are unchanged. Working out the variables costs a
+                // little, so only for a hook that read any.
+                let mut cmd_env = None;
+                if cache.file.has_fresh_value() {
+                    match cache.file.get_cached() {
+                        Ok(cached) if !cached.still_applies() => {}
+                        Ok(cached) => {
+                            if cached.env_reads.is_empty() {
+                                return Ok(cached.env);
+                            }
+                            let current = self.cmd_env_for_tv(config, tv).await;
+                            if env_reads_match(&cached.env_reads, &current) {
+                                return Ok(cached.env);
+                            }
+                            cmd_env = Some(current);
+                        }
+                        Err(err) => {
+                            warn!(
+                                "failed to parse cache file: {} {err:#}",
+                                cache_file.display()
+                            )
+                        }
+                    }
+                }
+                self.ensure_plugin_installed(config).await?;
+                let (mut vfox, _log_rx) = self.plugin.vfox()?;
+                vfox.cmd_env = Some(match cmd_env {
+                    Some(cmd_env) => cmd_env,
+                    None => self.cmd_env_for_tv(config, tv).await,
+                });
+                let recorder = vfox::HookDependencyRecorder::default();
+                vfox.hook_dependencies = Some(recorder.clone());
+
+                // Use backend methods if the plugin supports them
+                let env_keys = if self.is_backend_plugin() {
+                    let tool_name = self.get_tool_name()?;
+                    vfox.backend_exec_env(
+                        &self.pathname,
+                        tool_name,
+                        &tv.version,
+                        tv.install_path(),
+                        opts.backend_options().clone().into_map(),
+                    )
+                    .await
+                    .wrap_err("Backend exec env method failed")?
+                } else {
+                    vfox.env_keys_for_install_dir(
+                        &self.pathname,
+                        &tv.version,
+                        &install_path,
+                        opts.backend_options().as_map(),
+                    )
+                    .await?
+                };
+
+                let env = env_keys
+                    .into_iter()
+                    .fold(BTreeMap::new(), |mut acc, env_key| {
+                        let key = &env_key.key;
+                        if let Some(val) = acc.get(key) {
+                            let mut paths = env::split_paths(val).collect::<Vec<PathBuf>>();
+                            paths.push(PathBuf::from(&env_key.value));
+                            acc.insert(
+                                env_key.key.clone(),
+                                env::join_paths(paths)
+                                    .unwrap()
+                                    .to_string_lossy()
+                                    .to_string(),
+                            );
+                        } else {
+                            acc.insert(key.clone(), env_key.value.clone());
+                        }
+                        acc
+                    });
+                let deps = std::mem::take(&mut *recorder.lock().unwrap());
+                let cached = if deps.cacheable {
+                    CachedExecEnv {
+                        env: env.clone(),
+                        env_reads: hash_env_reads(deps.env_reads),
+                        watch_files: deps
+                            .watch_files
+                            .into_iter()
+                            .map(|path| {
+                                let modified = modified_nanos(&path);
+                                (path, modified)
+                            })
+                            .collect(),
+                        cacheable: true,
+                        cwd: deps.cwd,
+                    }
+                } else {
+                    CachedExecEnv {
+                        env: EnvMap::new(),
+                        env_reads: BTreeMap::new(),
+                        watch_files: vec![],
+                        cacheable: false,
+                        cwd: None,
+                    }
+                };
+                if let Err(err) = cache.file.write(&cached) {
+                    warn!(
+                        "failed to write cache file: {} {err:#}",
+                        cache_file.display()
+                    );
+                }
+                Ok(env)
+            })
+            .await
+            .cloned()
+    }
+
+    async fn ensure_plugin_installed(&self, config: &Arc<Config>) -> eyre::Result<()> {
+        self.plugin
+            .ensure_installed(config, &MultiProgressReport::get(), false, false)
+            .await
+    }
+}
+
+/// Convert a verified attestation from the vfox crate into the lockfile provenance type.
+fn verified_attestation_to_provenance(att: vfox::VerifiedAttestation) -> ProvenanceType {
+    match att {
+        vfox::VerifiedAttestation::GithubAttestations { .. } => ProvenanceType::GithubAttestations,
+        // The provenance_path is a local filesystem path to the downloaded SLSA
+        // provenance file — ephemeral and only valid during this install session.
+        // Use url: None to match how github and aqua backends handle SLSA at lock-time.
+        vfox::VerifiedAttestation::Slsa { .. } => ProvenanceType::Slsa { url: None },
+        vfox::VerifiedAttestation::Cosign { .. } => ProvenanceType::Cosign,
+    }
+}
+
+/// Passes a plugin-reported release date through only if it is an absolute
+/// RFC 3339 timestamp (not a relative duration like `1d`, which
+/// `parse_into_timestamp` also accepts), so a malformed date leaves the version undated instead of failing the listing.
+fn valid_created_at(plugin: &str, created_at: Option<String>) -> Option<String> {
+    let ts = created_at?;
+    if ts.parse::<jiff::Timestamp>().is_err() {
+        trace!("vfox plugin {plugin} returned an invalid created_at {ts:?}; leaving it undated");
+        return None;
+    }
+    Some(ts)
+}
+
+/// Download `url` with the request headers a plugin's `PreInstall` returned,
+/// as an install does, so `mise lock` can hash an artifact that needs them.
+pub(crate) async fn download_with_plugin_headers(
+    url: &str,
+    path: &Path,
+    headers: &reqwest::header::HeaderMap,
+) -> eyre::Result<()> {
+    let url = Url::parse(url)?;
+    let mut vfox = vfox::Vfox::new();
+    vfox.set_url_rewriter(crate::http::apply_url_replacements);
+    vfox.set_http_headers_resolver(crate::http::netrc_headers);
+    // The vfox client has no timeouts of its own; bound the whole download
+    // by `http_download_timeout`, as the default download path does.
+    let limit = Settings::get().http_download_timeout();
+    tokio::time::timeout(limit, vfox.download_to(&url, path, Some(headers)))
+        .await
+        .map_err(|_| {
+            eyre!(
+                "timed out downloading from {} after {limit:?}",
+                url.origin().ascii_serialization()
+            )
+        })??;
+    Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_could_be_alias() {
+        assert!(could_be_alias("recommended"));
+        assert!(!could_be_alias("9.10.3"));
+        assert!(!could_be_alias("latest"));
+        assert!(!could_be_alias("system"));
+        assert!(!could_be_alias("ref:main"));
+        assert!(!could_be_alias(""));
+    }
+
+    #[test]
+    fn test_env_reads_are_stored_hashed() {
+        let reads = hash_env_reads(BTreeMap::from([
+            ("TOKEN".to_string(), Some("s3cret".to_string())),
+            ("UNSET".to_string(), None),
+        ]));
+        assert!(!format!("{reads:?}").contains("s3cret"));
+
+        let env =
+            |token: &str| indexmap::IndexMap::from([("TOKEN".to_string(), token.to_string())]);
+        assert!(env_reads_match(&reads, &env("s3cret")));
+        assert!(!env_reads_match(&reads, &env("other")));
+        assert!(!env_reads_match(&reads, &indexmap::IndexMap::new()));
+        let set = indexmap::IndexMap::from([
+            ("TOKEN".to_string(), "s3cret".to_string()),
+            ("UNSET".to_string(), "now set".to_string()),
+        ]);
+        assert!(!env_reads_match(&reads, &set));
+    }
+
+    #[test]
+    fn test_valid_created_at() {
+        let ok = Some("2026-01-31T12:00:00Z".to_string());
+        assert_eq!(valid_created_at("p", ok.clone()), ok);
+        assert_eq!(valid_created_at("p", Some("yesterday-ish".into())), None);
+        assert_eq!(valid_created_at("p", Some("1d".into())), None);
+        assert_eq!(valid_created_at("p", Some("2026-01-31".into())), None);
+        assert_eq!(valid_created_at("p", None), None);
+    }
+
+    #[test]
+    fn test_normalize_install_log() {
+        assert_eq!(
+            normalize_install_log("Downloading https://example.com/releases/tool.tar.gz"),
+            "download tool.tar.gz"
+        );
+        assert_eq!(
+            normalize_install_log("Downloading https://example.com/?token=secret"),
+            "download"
+        );
+        assert_eq!(
+            normalize_install_log("Verifying \"/tmp/tool.tar.gz\" checksum"),
+            "checksum"
+        );
+        assert_eq!(
+            normalize_install_log("Verify \"/tmp/tool.tar.gz\" attestation"),
+            "verify attestation"
+        );
+        assert_eq!(
+            normalize_install_log("Extracting \"/tmp/tool.tar.gz\" to \"/tools/tool\""),
+            "extract"
+        );
+        assert_eq!(normalize_install_log("plugin message"), "plugin message");
+    }
+
+    #[test]
+    fn test_add_tool_option_env() {
+        let mut options = ToolOptions::default();
+        options
+            .insert_option(
+                "extensions".to_string(),
+                toml::Value::String("opentelemetry\nswoole".to_string()),
+            )
+            .unwrap();
+        options
+            .insert_option("retries".to_string(), toml::Value::Integer(2))
+            .unwrap();
+        options.depends = Some(vec!["dependency".to_string()]);
+        options.install_env.insert(
+            "PRIVATE".to_string(),
+            crate::config::env_directive::EnvValue::String("value".to_string()),
+        );
+
+        let mut env = indexmap::indexmap! {
+            "MISE_TOOL_OPTS__EXTENSIONS".to_string() => "ambient".to_string(),
+        };
+        add_tool_option_env(&mut env, &options);
+
+        assert_eq!(
+            env.get("MISE_TOOL_OPTS__EXTENSIONS").unwrap(),
+            "opentelemetry\nswoole"
+        );
+        assert_eq!(env.get("MISE_TOOL_OPTS__RETRIES").unwrap(), "2");
+        assert!(!env.contains_key("MISE_TOOL_OPTS__DEPENDS"));
+        assert!(!env.contains_key("MISE_TOOL_OPTS__INSTALL_ENV"));
+    }
+
+    #[test]
+    fn test_restore_config_tool_option_env() {
+        let mut env = indexmap::indexmap! {
+            "MISE_TOOL_OPTS__EXTENSIONS".to_string() => "generated".to_string(),
+        };
+        let config_env = indexmap::indexmap! {
+            "MISE_TOOL_OPTS__EXTENSIONS".to_string() => "configured".to_string(),
+            "UNRELATED".to_string() => "ignored".to_string(),
+        };
+
+        restore_config_tool_option_env(&mut env, &config_env);
+
+        assert_eq!(env["MISE_TOOL_OPTS__EXTENSIONS"], "configured");
+        assert!(!env.contains_key("UNRELATED"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_tool_option_env_names_are_case_insensitive_on_windows() {
+        let mut env = indexmap::indexmap! {
+            "mise_tool_opts__extensions".to_string() => "ambient".to_string(),
+        };
+        let mut options = ToolOptions::default();
+        options
+            .insert_option(
+                "extensions".to_string(),
+                toml::Value::String("configured".to_string()),
+            )
+            .unwrap();
+
+        add_tool_option_env(&mut env, &options);
+
+        assert_eq!(env.len(), 1);
+        assert_eq!(env["MISE_TOOL_OPTS__EXTENSIONS"], "configured");
+    }
+
+    #[tokio::test]
+    async fn test_vfox_props() {
+        let _config = Config::get().await.unwrap();
+        let backend = VfoxBackend::from_arg("vfox:version-fox/vfox-golang".into(), None);
+        assert_eq!(backend.pathname, "vfox-version-fox-vfox-golang");
+        assert_eq!(
+            backend.plugin.full,
+            Some("vfox:version-fox/vfox-golang".to_string())
+        );
+    }
+
+    #[test]
+    fn test_backend_plugin_tool_name_preserves_explicit_short() {
+        let ba = BackendArg::new(
+            "toolshed:get-skills".to_string(),
+            Some("toolshed".to_string()),
+        );
+        let backend = VfoxBackend::from_arg(ba, Some("toolshed".to_string()));
+
+        assert_eq!(backend.tool_name.as_deref(), Some("get-skills"));
+    }
+
+    #[test]
+    fn test_backend_plugin_tool_name_resolves_bare_alias() {
+        let ba = BackendArg::new(
+            "skills".to_string(),
+            Some("toolshed:get-skills".to_string()),
+        );
+        let backend = VfoxBackend::from_arg(ba, Some("toolshed".to_string()));
+
+        assert_eq!(backend.tool_name.as_deref(), Some("get-skills"));
+    }
+
+    #[test]
+    fn test_verified_attestation_to_provenance_type() {
+        // GitHub attestations
+        let att = vfox::VerifiedAttestation::GithubAttestations {
+            owner: "owner".into(),
+            repo: "repo".into(),
+            signer_workflow: None,
+        };
+        let prov = verified_attestation_to_provenance(att);
+        assert!(matches!(prov, ProvenanceType::GithubAttestations));
+
+        // SLSA provenance — url is None because the local path is ephemeral
+        let att = vfox::VerifiedAttestation::Slsa {
+            provenance_path: PathBuf::from("/tmp/slsa.json"),
+        };
+        let prov = verified_attestation_to_provenance(att);
+        assert!(matches!(prov, ProvenanceType::Slsa { url: None }));
+
+        // Cosign signature
+        let att = vfox::VerifiedAttestation::Cosign {
+            sig_or_bundle_path: PathBuf::from("/tmp/sig.bundle"),
+            public_key_path: Some(PathBuf::from("/tmp/key.pub")),
+        };
+        let prov = verified_attestation_to_provenance(att);
+        assert!(matches!(prov, ProvenanceType::Cosign));
+    }
+}

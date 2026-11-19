@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+
+if [[ "$(uname -s)" != "Linux" ]]; then
+  echo "skipping: bootstrap system service tests require Linux"
+  exit 0
+fi
+
+missing_service="mise-bootstrap-missing-$$"
+invalid_notify_file="$PWD/invalid-notify"
+
+cat <<EOF >mise.toml
+[bootstrap.files."$invalid_notify_file"]
+content = "unchanged"
+notify = ["not-configured"]
+EOF
+
+# Notification typos fail during preflight, before an earlier phase can leave
+# the host partially provisioned.
+assert_fail "mise bootstrap --yes" "notifies unconfigured bootstrap service"
+assert_fail "mise bootstrap --skip services --yes" "notifies unconfigured bootstrap service"
+assert_fail "mise bootstrap files apply --yes" "notifies unconfigured bootstrap service"
+assert_fail "test -e $invalid_notify_file"
+
+cat <<EOF >mise.toml
+[bootstrap.services.$missing_service]
+state = "stopped"
+enabled = false
+EOF
+
+# A missing unit remains visible but fails closed instead of treating absence
+# as a safe stopped/disabled state. This test never changes the host.
+assert_contains "mise bootstrap services status" "$missing_service"
+assert_contains "mise bootstrap services status" "unknown"
+assert_contains "mise bootstrap services status --json" '"action": "unknown"'
+assert_fail "mise bootstrap services status --missing"
+assert_contains "mise bootstrap status" "$missing_service"
+assert_fail "mise bootstrap status --missing"
+assert_contains "mise bootstrap plan" "service:$missing_service"
+assert_not_contains "mise bootstrap plan" "not inspected"
+assert_contains "mise bootstrap services apply --dry-run --yes 2>&1" "manual action required"
+assert_fail "mise bootstrap services apply --yes" "refusing unsafe change"
+assert_succeed "mise bootstrap --only services --dry-run --yes"
+
+# scope = "user" without command or builtin manages a unit that already exists
+# in the systemd user manager. A unit that is not there fails closed, the same
+# as a system unit.
+cat <<EOF2 >mise.toml
+[bootstrap.services.$missing_service]
+scope = "user"
+state = "stopped"
+enabled = false
+EOF2
+
+assert_contains "mise bootstrap services status" "$missing_service"
+assert_contains "mise bootstrap services status" "unknown"
+assert_contains "mise bootstrap plan" "service:$missing_service"
+assert_fail "mise bootstrap services apply --yes" "refusing unsafe change"
+assert_not_contains "mise bootstrap services status" "dev.mise.$missing_service"
+assert_fail "test -e $HOME/.config/systemd/user/dev.mise.$missing_service.service"
+
+# The options that define a service have nothing to change on an existing unit.
+cat <<EOF2 >mise.toml
+[bootstrap.services.$missing_service]
+scope = "user"
+restart = "always"
+EOF2
+assert_fail "mise bootstrap services status" "manages an existing systemd user unit"
+
+# `state = "unchanged"` leaves a unit's runtime state alone, which mise cannot
+# promise for a service it defines and starts itself.
+cat <<EOF2 >mise.toml
+[bootstrap.services.$missing_service]
+scope = "user"
+command = "sleep 1"
+state = "unchanged"
+EOF2
+assert_fail "mise bootstrap services status" "which applies to system services and existing user units"

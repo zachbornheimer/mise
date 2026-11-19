@@ -1,0 +1,1101 @@
+use std::path::PathBuf;
+
+use eyre::{Result, bail};
+use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
+
+use crate::config::config_file::ConfigFile;
+use crate::config::config_file::is_path_trusted;
+use crate::config::config_file::mise_toml::MiseToml;
+use crate::config::{
+    Config, ConfigPathOptions, GlobalWriteSection, is_global_config, resolve_target_config_path,
+};
+use crate::dirs;
+use crate::file;
+use crate::path::PathExt;
+use crate::system;
+use crate::system::files::{FileManifest, FileMode, FileRequest};
+use crate::system::history::OperationScope;
+use crate::system::history::journal;
+use crate::ui::prompt;
+
+/// Start deploying a file, or copy its edits back to the source
+///
+/// For a target that is not managed yet, saves its contents as a source under
+/// `dotfiles.root` (or at the path given with `--source`), adds a `[dotfiles]`
+/// entry, and applies it unless you pass `--no-apply`. For a target that is
+/// already managed, updates its source from the live file. `--dry-run` previews
+/// the source and config changes without writing them.
+///
+/// A target inside the tree of a dotfile group is captured into that group's
+/// source instead, without a new `[dotfiles]` entry: the deepest group whose
+/// target contains it, or the one named with `--group`.
+#[derive(Debug, usage_rs::Args)]
+#[usage(
+    example(
+        "mise dot add ~/.zshrc",
+        help = "Start managing ~/.zshrc from your dotfiles directory"
+    ),
+    example(
+        "mise dot add --mode copy ~/.config/starship.toml",
+        help = "Copy the file into place instead of symlinking it"
+    ),
+    example(
+        "mise dot add --source dotfiles/gitconfig ~/.gitconfig",
+        help = "Choose where the source is stored"
+    ),
+    example(
+        "mise dot add --group home ~/.config/starship.toml",
+        help = "Capture the file into a dotfile group's tree"
+    ),
+    example(
+        "mise dot add --changed",
+        help = "Copy edits of every changed copy-mode file back to its source"
+    )
+)]
+pub(crate) struct DotfilesAdd {
+    /// Targets to add or update
+    #[usage(value_name = "TARGET")]
+    pub(super) targets: Vec<String>,
+
+    /// Update the sources of every changed file managed in copy mode
+    #[usage(long)]
+    pub(super) changed: bool,
+
+    /// Overwrite existing sources without prompting
+    #[usage(long, short)]
+    pub(super) force: bool,
+
+    /// Write to the global config (the default)
+    ///
+    /// New entries go to the `write_targets.dotfiles` file when that setting is
+    /// set.
+    #[usage(long, short, conflicts = ["local", "path"])]
+    pub(super) global: bool,
+
+    /// Write to the project config instead of the global config
+    #[usage(long, short, conflicts = ["global", "path"])]
+    pub(super) local: bool,
+
+    /// Mode for a target that is not managed yet: symlink, symlink-each, copy, or
+    /// template (default: the `dotfiles.default_mode` setting)
+    ///
+    /// A target that is already managed keeps its mode.
+    #[usage(long, short)]
+    pub(super) mode: Option<String>,
+
+    /// Print the config and source changes without writing anything
+    #[usage(long, short = 'n')]
+    pub(super) dry_run: bool,
+
+    /// Add the entry without applying it
+    #[usage(long)]
+    pub(super) no_apply: bool,
+
+    /// Write to this config file or directory
+    // No `--file` alias here: `-f` on this command is `--force`, and `targets` accepts any
+    // string, so `-f <path>` silently adds the config file as a dotfile instead of writing
+    // to it. See `mise unset --path` for the commands where the short form is free.
+    #[usage(long, short, value_name = "PATH", conflicts = ["global", "local"])]
+    pub(super) path: Option<PathBuf>,
+
+    /// Source path to use for a single target
+    ///
+    /// A relative path starts from the current directory. The entry records it
+    /// relative to the config file's directory when it lies inside it, and as
+    /// an absolute path otherwise.
+    #[usage(long, short, value_name = "PATH")]
+    pub(super) source: Option<PathBuf>,
+
+    /// Skip the confirmation prompt
+    #[usage(long, short)]
+    pub(super) yes: bool,
+
+    /// Prompt for `[bootstrap.secrets]` values that templates need and the
+    /// environment does not set
+    #[usage(long)]
+    pub(super) prompt_secrets: bool,
+
+    /// Capture into the tree of this dotfile group
+    #[usage(long, value_name = "NAME", conflicts = ["source"])]
+    pub(super) group: Option<String>,
+}
+
+impl DotfilesAdd {
+    /// Validate and capture the requested targets as one transactional update.
+    pub(crate) async fn run(mut self) -> Result<()> {
+        for target in &mut self.targets {
+            *target = system::files::target_arg_from_cwd(target)?;
+        }
+        let mode = self.validate()?;
+        OperationScope::wrap("bootstrap dotfiles add", self.dry_run, self.run_inner(mode)).await
+    }
+
+    fn validate(&self) -> Result<FileMode> {
+        if self.changed && !self.targets.is_empty() {
+            bail!("--changed does not accept target arguments");
+        }
+        if !self.changed && self.targets.is_empty() {
+            bail!("at least one target or --changed is required");
+        }
+        if self.source.is_some() && self.targets.len() != 1 {
+            bail!("--source can only be used with one target");
+        }
+        match self.mode.as_deref() {
+            Some("track" | "track-local") => bail!(
+                "`--mode track` tracks a file where it is and takes no source; use `mise dot track <path>`"
+            ),
+            Some("absent") => bail!(
+                "`--mode absent` removes a file rather than capturing it; declare `mode = \"absent\"` in [dotfiles]"
+            ),
+            // capturing would copy the secret into the dotfiles root as plaintext
+            Some("fnox") => bail!(
+                "`--mode fnox` takes no source; store the file with `fnox set --file <path>` and declare `mode = \"fnox\"` in [dotfiles]"
+            ),
+            Some(mode) => {
+                FileMode::parse(mode).ok_or_else(|| eyre::eyre!("unknown dotfile mode: {mode}"))
+            }
+            None => Ok(system::files::default_mode()),
+        }
+    }
+
+    async fn run_inner(mut self, mode: FileMode) -> Result<()> {
+        let config = Config::get().await?;
+        let secrets = system::secrets::resolve(&config, self.prompt_secrets)?;
+        let managed = system::files::files_from_config(&config)?;
+        if self.changed {
+            for req in &managed {
+                if req.mode != FileMode::Copy {
+                    continue;
+                }
+                let mut changed = vec![];
+                if req.source.is_dir() {
+                    // a group's tree captures file by file; other directory
+                    // copies are not captured by --changed
+                    if req.group.is_some() && req.target.is_dir() {
+                        // a group that cannot be walked must not hide the others
+                        let files = match system::files::directory_source_files(req) {
+                            Ok(files) => files,
+                            Err(err) => {
+                                warn!(
+                                    "dotfiles: skipped group {}: {err}",
+                                    req.group.as_deref().unwrap_or_default()
+                                );
+                                vec![]
+                            }
+                        };
+                        for (source, target) in files {
+                            if source.is_file()
+                                && !source.is_symlink()
+                                && target.is_file()
+                                && !target.is_symlink()
+                                && is_changed(&source, &target)?
+                            {
+                                changed.push(target.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                } else if req.target.is_file()
+                    && !req.target.is_symlink()
+                    && matches!(
+                        system::files::check(&config, req, &secrets)?,
+                        system::files::FileState::Differs(_)
+                    )
+                {
+                    changed.push(req.target_raw.clone());
+                }
+                if changed.is_empty() {
+                    continue;
+                }
+                if !is_global_config(&req.origin.config) && !is_path_trusted(&req.origin.config) {
+                    bail!(
+                        "--changed requires trusted configuration: {}",
+                        req.origin.config.display_user()
+                    );
+                }
+                self.targets.extend(changed);
+            }
+            if self.targets.is_empty() {
+                super::warn_if_dotfiles_ignored(&config);
+                info!("dotfiles: no changed copy-mode files");
+                return Ok(());
+            }
+        }
+        let config_path = resolve_target_config_path(ConfigPathOptions {
+            global: self.global || !self.local,
+            path: self.path.clone(),
+            env: None,
+            cwd: None,
+            prefer_toml: true,
+            prevent_home_local: true,
+            global_write_section: (self.global || !self.local)
+                .then_some(GlobalWriteSection::Dotfiles),
+            ..Default::default()
+        })?;
+
+        let mut planned = vec![];
+        let managed_edits = system::edits::edits_from_config(&config)?;
+        for target_raw in &self.targets {
+            let target = system::files::resolve_target_arg(target_raw)
+                .components()
+                .collect::<PathBuf>();
+            if target.is_relative() {
+                bail!("{target_raw}: target must be absolute or start with ~/");
+            }
+            if managed
+                .iter()
+                .any(|req| req.mode == FileMode::Track && req.target == target)
+            {
+                bail!(
+                    "{target_raw}: tracked in place; pass `--mode copy` after `mise dot untrack {target_raw}` to seed a source instead"
+                );
+            }
+            if managed
+                .iter()
+                .any(|req| req.mode == FileMode::Permissions && req.target == target)
+            {
+                bail!(
+                    "{target_raw}: only its permissions are managed; remove that permissions-only [dotfiles] entry, or give it a source, before adding the file"
+                );
+            }
+            if managed_edits.iter().any(|req| {
+                system::files::matches_target(
+                    &req.path,
+                    &req.path_raw,
+                    std::slice::from_ref(target_raw),
+                )
+            }) {
+                bail!(
+                    "{target_raw}: target is already managed by [dotfiles] edits; remove or rename those entries before adding a whole-file dotfile"
+                );
+            }
+            let existing = managed.iter().find(|req| {
+                system::files::matches_target(
+                    &req.target,
+                    &req.target_raw,
+                    std::slice::from_ref(target_raw),
+                )
+            });
+            if let Some(req) = existing
+                && req.mode == FileMode::Absent
+            {
+                bail!(
+                    "{target_raw}: declared absent in {}; remove that entry before adding the file",
+                    req.origin.config.display_user()
+                );
+            }
+            if let Some(req) = existing
+                && req.mode == FileMode::Fnox
+            {
+                bail!(
+                    "{target_raw}: stored in fnox by {}; change it with `mise dot edit {target_raw}`",
+                    req.origin.config.display_user()
+                );
+            }
+            // capturing a directory copies every file under it, secrets too,
+            // and a symlink can reach a fnox target under another name
+            let canonical =
+                |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let target_canonical = canonical(&target);
+            if let Some(req) = managed.iter().find(|req| {
+                req.mode == FileMode::Fnox
+                    && (req.target.starts_with(&target)
+                        || canonical(&req.target).starts_with(&target_canonical))
+            }) {
+                bail!(
+                    "{target_raw}: reaches {}, which {} stores in fnox; capturing it would copy the secret into the dotfiles root, so add the other files one at a time",
+                    req.target.display_user(),
+                    req.origin.config.display_user()
+                );
+            }
+            // capturing copies the target tree into the source verbatim,
+            // which would store `.bashrc` where the entry reads `dot-bashrc`
+            if let Some(req) = existing
+                && req.dot_prefix
+            {
+                bail!(
+                    "{target_raw}: declared with dot_prefix in {}; edit its source {} directly",
+                    req.origin.config.display_user(),
+                    req.source.display_user()
+                );
+            }
+            // capturing copies the rendered target over the source, which
+            // drops the template code and stores any `exec()` output in it
+            if let Some(req) = existing
+                && req.mode == FileMode::Template
+                && !self.force
+            {
+                bail!(
+                    "{target_raw}: declared as a template in {}; edit its source {} directly, or pass --force to overwrite it with the rendered file",
+                    req.origin.config.display_user(),
+                    req.source.display_user()
+                );
+            }
+            // a path inside a group's tree is captured into its source
+            let routed = match existing {
+                Some(_) => {
+                    if let Some(group) = &self.group {
+                        warn!(
+                            "dotfiles: {target_raw} is already managed by its own entry; --group {group} was ignored"
+                        );
+                    }
+                    None
+                }
+                None if self.source.is_some() => None,
+                None => {
+                    system::dotfile_groups::route_add(&managed, &target, self.group.as_deref())?
+                }
+            };
+            if let Some(req) = routed {
+                // the group deploys only what Git's index lists, so a file
+                // moved into its source would not be linked back
+                if req.manifest == Some(FileManifest::Git) {
+                    bail!(
+                        "{target_raw}: dotfile group {} deploys only files in Git's index (manifest = \"git\"); copy it into {} and `git add` it instead",
+                        req.group.as_deref().unwrap_or_default(),
+                        req.source.display_user()
+                    );
+                }
+                let rel = target.strip_prefix(&req.target)?;
+                if self.mode.is_some() && req.mode != mode {
+                    warn!(
+                        "dotfiles: {target_raw} belongs to group {} with mode {}; --mode {} was ignored",
+                        req.group.as_deref().unwrap_or_default(),
+                        req.mode.name(),
+                        mode.name()
+                    );
+                }
+                let item = PlannedAdd {
+                    target_raw: normalized_target_raw(&target),
+                    source: req.source.join(system::dotfile_groups::source_rel_for(
+                        &req.source,
+                        rel,
+                        req.dot_prefix,
+                    )),
+                    source_spelling: None,
+                    target,
+                    mode: req.mode,
+                    implied_source: true,
+                    explicit_mode: false,
+                    already_managed: Some(req.clone()),
+                    group_capture: true,
+                };
+                if !planned
+                    .iter()
+                    .any(|planned: &PlannedAdd| planned.target == item.target)
+                {
+                    planned.push(item);
+                }
+                continue;
+            }
+            let mut source_spelling = None;
+            let source = if let Some(req) = existing {
+                req.source.clone()
+            } else if let Some(source) = &self.source {
+                let resolved = system::files::resolve_source_arg(source)?;
+                source_spelling = config_relative_source(source, &resolved, &config_path);
+                resolved
+            } else {
+                system::files::implied_source(&target)?
+            };
+            let write_mode = existing.map(|req| req.mode).unwrap_or(mode);
+            if let Some(req) = existing
+                && self.mode.is_some()
+                && req.mode != mode
+            {
+                warn!(
+                    "dotfiles: {} is already managed with mode {}; --mode {} was ignored",
+                    target_raw,
+                    req.mode.name(),
+                    mode.name()
+                );
+            }
+            let item = PlannedAdd {
+                target_raw: normalized_target_raw(&target),
+                target,
+                source,
+                source_spelling,
+                mode: write_mode,
+                implied_source: self.source.is_none(),
+                explicit_mode: self.mode.is_some(),
+                already_managed: existing.cloned(),
+                group_capture: false,
+            };
+            // Wildcard expansion and equivalent spellings can resolve more
+            // than one argument to the same config key. The eventual config
+            // write is unique by target, so plan its filesystem work once too.
+            if !planned
+                .iter()
+                .any(|planned: &PlannedAdd| planned.target == item.target)
+            {
+                planned.push(item);
+            }
+        }
+
+        let mut prospective = managed.clone();
+        for item in &planned {
+            if let Some(existing) = &item.already_managed
+                && let Some(index) = prospective.iter().position(|request| {
+                    request.target == existing.target
+                        && request.source == existing.source
+                        && request.mode == existing.mode
+                        && request.origin.config == existing.origin.config
+                })
+            {
+                prospective.remove(index);
+            }
+            prospective.push(item.validation_request(&config_path));
+        }
+        system::files::validate_composed_file_footprints(&prospective)?;
+
+        if self.dry_run {
+            for item in &planned {
+                if item.already_managed.is_none() {
+                    miseprintln!(
+                        "{}: \"{}\" = {}",
+                        config_path.display_user(),
+                        item.target_raw,
+                        inline_entry(item)
+                    );
+                }
+                if item.target.exists() {
+                    miseprintln!(
+                        "cp {} {}",
+                        item.target.display_user(),
+                        item.source.display_user()
+                    );
+                }
+                if !self.no_apply {
+                    miseprintln!("{}", describe_apply(item));
+                }
+            }
+            return Ok(());
+        }
+
+        let backup_dir = tempfile::tempdir()?;
+        let original_config = if config_path.exists() {
+            Some(file::read(&config_path)?)
+        } else {
+            None
+        };
+        let mut source_backups = vec![];
+        let mut target_backups = vec![];
+        let mut moved_targets = vec![];
+        let mut apply_started = false;
+        let result = (|| -> Result<()> {
+            let mut accepted = vec![];
+            let mut updated_targets = vec![];
+            let mut apply_requests = vec![];
+            for (index, item) in planned.iter().enumerate() {
+                if item.target.exists() && !same_file(&item.target, &item.source) {
+                    if item.source.exists()
+                        && !self.force
+                        && !self.yes
+                        && console::user_attended_stderr()
+                    {
+                        let ok = prompt::confirm(format!(
+                            "dotfiles: overwrite source {} from {}?",
+                            item.source.display_user(),
+                            item.target.display_user()
+                        ))?
+                        .is_yes();
+                        if !ok {
+                            info!("dotfiles: skipped {}", item.target_raw);
+                            continue;
+                        }
+                    }
+                    source_backups.push((
+                        item.source.clone(),
+                        backup_path(
+                            &item.source,
+                            &backup_dir.path().join("sources").join(index.to_string()),
+                        )?,
+                    ));
+                    let move_before_apply = item.mode == FileMode::Symlink
+                        || (item.mode == FileMode::SymlinkEach
+                            && (item.already_managed.is_none() || item.group_capture));
+                    if !self.no_apply && move_before_apply && !item.target.is_symlink() {
+                        let pending = journal::begin_changes(
+                            "dotfiles",
+                            &item.target_raw,
+                            [item.target.clone(), item.source.clone()],
+                        )?;
+                        remove_path(&item.source)?;
+                        if let Some(parent) = item.source.parent() {
+                            file::create_dir_all(parent)?;
+                        }
+                        match file::try_rename(&item.target, &item.source) {
+                            Ok(()) => {
+                                moved_targets.push(MovedTarget {
+                                    target: item.target.clone(),
+                                    source: item.source.clone(),
+                                    recovery: None,
+                                });
+                            }
+                            Err(err) if err.kind() == std::io::ErrorKind::CrossesDevices => {
+                                let parent = item.target.parent().ok_or_else(|| {
+                                    eyre::eyre!(
+                                        "cannot stage target without a parent: {}",
+                                        item.target.display_user()
+                                    )
+                                })?;
+                                let recovery = tempfile::Builder::new()
+                                    .prefix(".mise-dotfiles-rollback-")
+                                    .tempdir_in(parent)?;
+                                let recovery_path = recovery.path().join("target");
+                                // Keep the original on its own filesystem until
+                                // the entire transaction succeeds. This makes
+                                // rollback an atomic rename instead of another
+                                // potentially failing recursive removal.
+                                file::rename(&item.target, &recovery_path)?;
+                                moved_targets.push(MovedTarget {
+                                    target: item.target.clone(),
+                                    source: item.source.clone(),
+                                    recovery: Some(recovery),
+                                });
+                                system::files::copy_path(&recovery_path, &item.source)?;
+                            }
+                            Err(err) => bail!(
+                                "failed rename: {} -> {}: {err}",
+                                item.target.display_user(),
+                                item.source.display_user()
+                            ),
+                        }
+                        journal::commit_changes(pending);
+                        info!(
+                            "dotfiles: moved {} to {}",
+                            item.target.display_user(),
+                            item.source.display_user()
+                        );
+                    } else {
+                        target_backups.push((
+                            item.target.clone(),
+                            backup_path(
+                                &item.target,
+                                &backup_dir.path().join("targets").join(index.to_string()),
+                            )?,
+                        ));
+                        if let Some(request) = item.already_managed.as_ref().filter(|request| {
+                            request.manifest == Some(FileManifest::Git) && !item.group_capture
+                        }) {
+                            system::files::capture_git_manifest(request)?;
+                        } else {
+                            system::files::copy_path(&item.target, &item.source)?;
+                        }
+                        info!(
+                            "dotfiles: copied {} to {}",
+                            item.target.display_user(),
+                            item.source.display_user()
+                        );
+                    }
+                } else if !item.source.exists() {
+                    target_backups.push((
+                        item.target.clone(),
+                        backup_path(
+                            &item.target,
+                            &backup_dir.path().join("targets").join(index.to_string()),
+                        )?,
+                    ));
+                    source_backups.push((item.source.clone(), PathBackup::Missing));
+                    if let Some(parent) = item.source.parent() {
+                        file::create_dir_all(parent)?;
+                    }
+                    file::write(&item.source, "")?;
+                    info!("dotfiles: created {}", item.source.display_user());
+                } else if !self.no_apply {
+                    target_backups.push((
+                        item.target.clone(),
+                        backup_path(
+                            &item.target,
+                            &backup_dir.path().join("targets").join(index.to_string()),
+                        )?,
+                    ));
+                }
+                if item.group_capture {
+                    info!(
+                        "dotfiles: added {} to group {}",
+                        item.target_raw,
+                        item.already_managed
+                            .as_ref()
+                            .and_then(|req| req.group.as_deref())
+                            .unwrap_or_default()
+                    );
+                } else if item.already_managed.is_some() {
+                    updated_targets.push(item.target_raw.as_str());
+                }
+                accepted.push(item);
+                // --changed captures live edits that already match the target, and
+                // applying the whole group would overwrite an edit whose
+                // capture the user declined
+                if self.changed && item.group_capture {
+                    continue;
+                }
+                // files captured into one group tree apply it once
+                let request = item.managed_request(&config_path);
+                if !apply_requests.iter().any(|existing: &FileRequest| {
+                    existing.target == request.target
+                        && existing.source == request.source
+                        && existing.mode == request.mode
+                }) {
+                    apply_requests.push(request);
+                }
+            }
+
+            let apply_opts = system::files::ApplyOpts {
+                dry_run: false,
+                verbose: false,
+                force: false,
+                force_hint: "run `mise dot apply --force`",
+                yes: true,
+            };
+            let apply_plan = if !self.no_apply && !apply_requests.is_empty() {
+                let mut active_after_add = managed.clone();
+                for item in &accepted {
+                    if let Some(existing) = &item.already_managed
+                        && let Some(index) = active_after_add.iter().position(|request| {
+                            request.target == existing.target
+                                && request.source == existing.source
+                                && request.mode == existing.mode
+                                && request.origin.config == existing.origin.config
+                        })
+                    {
+                        active_after_add.remove(index);
+                    }
+                    active_after_add.push(item.managed_request(&config_path));
+                }
+                Some(system::files::plan_apply_with_active(
+                    &config,
+                    &apply_requests,
+                    &active_after_add,
+                    &apply_opts,
+                    &secrets,
+                )?)
+            } else {
+                None
+            };
+
+            let added_targets = accepted
+                .iter()
+                .filter(|item| item.already_managed.is_none())
+                .collect::<Vec<_>>();
+            if !added_targets.is_empty() {
+                if !config_path.exists() {
+                    let cf = MiseToml::init(&config_path);
+                    cf.save()?;
+                }
+                let raw = file::read_to_string(&config_path)?;
+                let mut doc: DocumentMut = raw.parse()?;
+                ensure_dotfiles_table(&mut doc);
+                for item in &added_targets {
+                    write_entry(&mut doc, item);
+                }
+                sort_dotfiles_table(&mut doc);
+                file::write(&config_path, doc.to_string())?;
+                for item in &added_targets {
+                    info!(
+                        "dotfiles: added {} to {}",
+                        item.target_raw,
+                        config_path.display_user()
+                    );
+                }
+            }
+            if !updated_targets.is_empty() {
+                info!("dotfiles: updated {}", updated_targets.join(", "));
+            }
+            if let Some(plan) = apply_plan {
+                apply_started = true;
+                system::files::execute_apply(&config, plan, &apply_opts, &mut vec![])?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            if let Err(rollback_err) = rollback_add(
+                &source_backups,
+                &target_backups,
+                &mut moved_targets,
+                apply_started,
+                &config_path,
+                original_config.as_deref(),
+            ) {
+                bail!("{err}\ndotfiles: rollback failed: {rollback_err}");
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+/// Whether a live copy-mode file no longer matches its source.
+fn is_changed(source: &std::path::Path, target: &std::path::Path) -> Result<bool> {
+    Ok(file::read(source)? != file::read(target)?)
+}
+
+#[derive(Debug)]
+struct PlannedAdd {
+    target_raw: String,
+    target: PathBuf,
+    source: PathBuf,
+    /// how the entry spells a relative `--source`: relative to the config
+    /// file's directory, which the loader resolves it against
+    source_spelling: Option<String>,
+    mode: FileMode,
+    implied_source: bool,
+    explicit_mode: bool,
+    already_managed: Option<FileRequest>,
+    /// a new file captured into the tree of `already_managed`, a group
+    group_capture: bool,
+}
+
+impl PlannedAdd {
+    /// Build the request that will exist after capture, using the live target
+    /// as the future source footprint when add is about to copy or move it.
+    fn validation_request(&self, config_path: &std::path::Path) -> FileRequest {
+        let mut request = self.managed_request(config_path);
+        // the group tree keeps its shape; the captured file joins it
+        if self.group_capture {
+            return request;
+        }
+        if request.manifest.is_none()
+            && self.target.exists()
+            && !same_file(&self.target, &self.source)
+        {
+            request.source = self.target.clone();
+        } else if !self.source.exists() && self.mode != FileMode::SymlinkEach {
+            // Add creates an empty source file in this case. Content mode gives
+            // the validator that known leaf shape without touching the disk.
+            request.mode = FileMode::Content;
+            request.content = Some(String::new());
+        }
+        request
+    }
+
+    /// Preserve an existing declaration's options when an add refreshes its
+    /// source; newly added declarations use the command-derived request.
+    fn managed_request(&self, config_path: &std::path::Path) -> FileRequest {
+        self.already_managed
+            .clone()
+            .unwrap_or_else(|| self.as_request(config_path))
+    }
+
+    /// Convert a newly added target into its configured file request.
+    fn as_request(&self, config_path: &std::path::Path) -> FileRequest {
+        FileRequest {
+            target_raw: self.target_raw.clone(),
+            target: self.target.clone(),
+            source: self.source.clone(),
+            content: None,
+            mode: self.mode,
+            exclude: vec![],
+            include: None,
+            manifest: None,
+            permissions: None,
+            base: config_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf(),
+            policy: system::files::FilePolicy::for_mode(self.mode),
+            variants: vec![],
+            enabled: true,
+            remove_empty: false,
+            create_if_missing: false,
+            dot_prefix: false,
+            relative: system::files::relative_symlinks(self.mode, None),
+            group: None,
+            depends: vec![],
+            origin: crate::system::resources::ResourceOrigin {
+                config: config_path.to_path_buf(),
+                config_root: crate::config::config_file::config_root::config_root(config_path),
+                environment: crate::config::environments_for_config_path(config_path),
+                source: Some(self.source.clone()),
+            },
+        }
+    }
+}
+
+fn ensure_dotfiles_table(doc: &mut DocumentMut) {
+    if !doc.as_table().contains_key("dotfiles") {
+        doc["dotfiles"] = Item::Table(Table::new());
+    }
+}
+
+fn sort_dotfiles_table(doc: &mut DocumentMut) {
+    if let Some(table) = doc["dotfiles"].as_table_mut() {
+        table.sort_values();
+    }
+}
+
+fn write_entry(doc: &mut DocumentMut, item: &PlannedAdd) {
+    doc["dotfiles"][&item.target_raw] = Item::Value(inline_entry(item));
+}
+
+fn inline_entry(item: &PlannedAdd) -> Value {
+    let mut table = InlineTable::new();
+    if !item.implied_source {
+        let source = item
+            .source_spelling
+            .clone()
+            .unwrap_or_else(|| item.source.display_user().to_string());
+        table.insert("source", Value::String(toml_edit::Formatted::new(source)));
+    } else if let Some(req) = &item.already_managed
+        && !system::files::source_is_implied(req)
+    {
+        table.insert(
+            "source",
+            Value::String(toml_edit::Formatted::new(
+                item.source.display_user().to_string(),
+            )),
+        );
+    }
+    if item.explicit_mode || item.mode != FileMode::Symlink {
+        table.insert(
+            "mode",
+            Value::String(toml_edit::Formatted::new(item.mode.name().to_string())),
+        );
+    }
+    Value::InlineTable(table)
+}
+
+/// Spell a relative `--source` relative to the config file's directory when
+/// it lies inside it, so the entry stays portable with the config. Other
+/// sources are written absolute.
+fn config_relative_source(
+    arg: &std::path::Path,
+    resolved: &std::path::Path,
+    config_path: &std::path::Path,
+) -> Option<String> {
+    if !file::replace_path(arg).is_relative() {
+        return None;
+    }
+    let rel = resolved.strip_prefix(config_path.parent()?).ok()?;
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    let rel = rel.to_string_lossy();
+    if cfg!(windows) {
+        Some(rel.replace('\\', "/"))
+    } else {
+        Some(rel.into_owned())
+    }
+}
+
+fn normalized_target_raw(target: &std::path::Path) -> String {
+    let normalized = target.components().collect::<PathBuf>();
+    match normalized.strip_prefix(*dirs::HOME) {
+        Ok(rel) if !rel.as_os_str().is_empty() => format!("~/{}", rel.display()),
+        Ok(_) => "~".to_string(),
+        Err(_) => normalized.to_string_lossy().to_string(),
+    }
+}
+
+fn describe_apply(item: &PlannedAdd) -> String {
+    let source = item.source.display_user();
+    let target = item.target.display_user();
+    match item.mode {
+        FileMode::Symlink => format!("ln -sf {source} {target}"),
+        FileMode::SymlinkEach => format!("ln -sf {source}/* into {target}/"),
+        FileMode::Copy if item.source.is_dir() => format!("cp -r {source} {target}"),
+        FileMode::Copy => format!("cp {source} {target}"),
+        FileMode::Template => format!("render {source} -> {target}"),
+        FileMode::Content
+        | FileMode::Track
+        | FileMode::Absent
+        | FileMode::Permissions
+        | FileMode::Fnox => {
+            unreachable!("dotfiles add always captures a source file")
+        }
+    }
+}
+
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+enum PathBackup {
+    Missing,
+    Copied(PathBuf),
+    Symlink(PathBuf),
+}
+
+fn backup_path(path: &std::path::Path, backup: &std::path::Path) -> Result<PathBackup> {
+    if path.is_symlink() {
+        Ok(PathBackup::Symlink(std::fs::read_link(path)?))
+    } else if path.exists() {
+        system::files::copy_path(path, backup)?;
+        Ok(PathBackup::Copied(backup.to_path_buf()))
+    } else {
+        Ok(PathBackup::Missing)
+    }
+}
+
+fn restore_paths(backups: &[(PathBuf, PathBackup)]) -> Result<()> {
+    let mut errors = vec![];
+    for (path, backup) in backups.iter().rev() {
+        let result = (|| -> Result<()> {
+            remove_path(path)?;
+            match backup {
+                PathBackup::Missing => {}
+                PathBackup::Copied(backup) => system::files::copy_path(backup, path)?,
+                PathBackup::Symlink(target) => {
+                    if let Some(parent) = path.parent() {
+                        file::create_dir_all(parent)?;
+                    }
+                    file::make_symlink(target, path)?;
+                }
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            errors.push(format!("{}: {err}", path.display_user()));
+        }
+    }
+    if !errors.is_empty() {
+        bail!("{}", errors.join("\n"));
+    }
+    Ok(())
+}
+
+fn remove_path(path: &std::path::Path) -> Result<()> {
+    if path.is_symlink() || path.is_file() {
+        file::remove_file(path)?;
+    } else if path.is_dir() {
+        file::remove_all(path)?;
+    }
+    Ok(())
+}
+
+struct MovedTarget {
+    target: PathBuf,
+    source: PathBuf,
+    /// A same-filesystem staging directory used by cross-device captures.
+    /// Keeping it alive preserves the original until the transaction commits.
+    recovery: Option<tempfile::TempDir>,
+}
+
+impl MovedTarget {
+    fn keep_recovery(&mut self) -> Option<PathBuf> {
+        self.recovery
+            .take()
+            .map(|recovery| recovery.keep().join("target"))
+    }
+}
+
+fn rollback_add(
+    source_backups: &[(PathBuf, PathBackup)],
+    target_backups: &[(PathBuf, PathBackup)],
+    moved_targets: &mut [MovedTarget],
+    restore_targets: bool,
+    config_path: &std::path::Path,
+    original_config: Option<&[u8]>,
+) -> Result<()> {
+    let mut errors = vec![];
+    for moved in moved_targets.iter_mut().rev() {
+        let result = (|| -> Result<()> {
+            remove_path(&moved.target)?;
+            if let Some(parent) = moved.target.parent() {
+                file::create_dir_all(parent)?;
+            }
+            if let Some(recovery) = &moved.recovery {
+                file::rename(recovery.path().join("target"), &moved.target)
+            } else {
+                file::move_file(&moved.source, &moved.target)
+            }
+        })();
+        if let Err(err) = result {
+            let mut message = format!(
+                "moved target {} from {}: {err}",
+                moved.target.display_user(),
+                moved.source.display_user()
+            );
+            if let Some(recovery) = moved.keep_recovery() {
+                message.push_str(&format!(
+                    "; original preserved at {}",
+                    recovery.display_user()
+                ));
+            }
+            errors.push(message);
+        }
+    }
+    if restore_targets && let Err(err) = restore_paths(target_backups) {
+        errors.push(format!("targets: {err}"));
+    }
+    if let Err(err) = restore_paths(source_backups) {
+        errors.push(format!("sources: {err}"));
+    }
+    let config_result = match original_config {
+        Some(contents) => file::write(config_path, contents),
+        None => remove_path(config_path),
+    };
+    if let Err(err) = config_result {
+        errors.push(format!("config: {err}"));
+    }
+    if !errors.is_empty() {
+        bail!("{}", errors.join("\n"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollback_uses_staged_cross_device_original() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        let source = root.path().join("source");
+        let source_backup = root.path().join("source-backup");
+        let recovery = tempfile::tempdir_in(root.path()).unwrap();
+        let recovery_target = recovery.path().join("target");
+
+        file::create_dir_all(&recovery_target).unwrap();
+        file::write(recovery_target.join("file"), "live target").unwrap();
+        file::create_dir_all(&source).unwrap();
+        file::write(source.join("file"), "captured copy").unwrap();
+        file::create_dir_all(&source_backup).unwrap();
+        file::write(source_backup.join("file"), "old source").unwrap();
+
+        let mut moved_targets = vec![MovedTarget {
+            target: target.clone(),
+            source: source.clone(),
+            recovery: Some(recovery),
+        }];
+        rollback_add(
+            &[(source.clone(), PathBackup::Copied(source_backup))],
+            &[],
+            &mut moved_targets,
+            false,
+            &root.path().join("config.toml"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            file::read_to_string(target.join("file")).unwrap(),
+            "live target"
+        );
+        assert_eq!(
+            file::read_to_string(source.join("file")).unwrap(),
+            "old source"
+        );
+    }
+
+    #[test]
+    fn failed_rollback_can_keep_staged_original() {
+        let root = tempfile::tempdir().unwrap();
+        let recovery = tempfile::tempdir_in(root.path()).unwrap();
+        let recovery_target = recovery.path().join("target");
+        file::write(&recovery_target, "original").unwrap();
+        let mut moved = MovedTarget {
+            target: root.path().join("target"),
+            source: root.path().join("source"),
+            recovery: Some(recovery),
+        };
+
+        let kept = moved.keep_recovery().unwrap();
+        drop(moved);
+
+        assert_eq!(file::read_to_string(kept).unwrap(), "original");
+    }
+}

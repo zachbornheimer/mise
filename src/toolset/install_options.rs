@@ -1,0 +1,79 @@
+use crate::config::SettingsExt;
+use std::path::PathBuf;
+
+use crate::config::settings::Settings;
+use crate::toolset::tool_version::ResolveOptions;
+
+#[derive(Debug, Clone)]
+pub struct InstallOptions {
+    pub reason: String,
+    /// The caller prints its own final installation results.
+    pub hide_success_summary: bool,
+    pub force: bool,
+    pub jobs: Option<usize>,
+    pub raw: bool,
+    /// only install missing tools if passed as arguments
+    pub missing_args_only: bool,
+    /// install lazy declarations because the user explicitly named a tool
+    pub include_lazy: bool,
+    /// completely disable auto-installation when auto_install setting is false
+    pub skip_auto_install: bool,
+    pub auto_install_disable_tools: Option<Vec<String>>,
+    pub resolve_options: ResolveOptions,
+    /// How the toolset resolves again after an install. Only what it leaves unresolved
+    /// matters here; the versions to install come from `resolve_options`.
+    pub after_install_resolve: ResolveOptions,
+    pub dry_run: bool,
+    /// Only run hooks defined in global config files.
+    pub global_hooks_only: bool,
+    /// require lockfile URLs to be present; fail if not
+    pub locked: bool,
+    /// Override the install directory (e.g. for --system or --shared)
+    pub install_dir: Option<PathBuf>,
+    /// Derive each tool's install directory from the scope of the config file that
+    /// declares it. Lazy first-use dispatch installs a provider together with its
+    /// dependencies, and those can come from different scopes.
+    pub scoped_install_dirs: bool,
+    /// skip confirmation prompts (e.g. installing missing plugin system deps).
+    /// Defaults to the global `yes` setting; `mise bootstrap --yes` also sets it.
+    pub yes: bool,
+    /// The user explicitly passed `--yes` for this invocation or install operation.
+    /// Unlike `yes`, this is not enabled implicitly by CI mode.
+    pub explicit_yes: bool,
+    /// Install without the lockfile policy a configuration sets for its tools
+    /// (`tool_config.locked`): for `mise installs migrate`, which moves a version
+    /// already installed rather than one the lockfile chose.
+    pub ignore_tool_config_locked: bool,
+    /// Reload global configuration after installation.
+    ///
+    /// Task-only tools resolved while a run is active must leave the live config
+    /// alone because sibling tasks may still be using it.
+    pub reload_config: bool,
+}
+
+impl Default for InstallOptions {
+    fn default() -> Self {
+        InstallOptions {
+            jobs: Some(Settings::get().jobs),
+            raw: Settings::get().raw,
+            reason: "install".to_string(),
+            hide_success_summary: false,
+            force: false,
+            missing_args_only: true,
+            include_lazy: false,
+            skip_auto_install: false,
+            auto_install_disable_tools: Settings::get().auto_install_disable_tools.clone(),
+            resolve_options: Default::default(),
+            after_install_resolve: Default::default(),
+            dry_run: false,
+            global_hooks_only: false,
+            locked: Settings::get().locked,
+            install_dir: None,
+            scoped_install_dirs: false,
+            yes: Settings::get().yes,
+            explicit_yes: Settings::cli_yes(),
+            ignore_tool_config_locked: false,
+            reload_config: true,
+        }
+    }
+}

@@ -1,0 +1,877 @@
+use crate::cli::Cli;
+use eyre::Result;
+use std::ffi::OsString;
+use strum::EnumString;
+
+/// Answer mise's hidden completion protocol with its runtime completion metadata.
+///
+/// The tables compiled by usage-rs cover static commands, flags, choices, and path hints. mise
+/// also augments those tables at runtime with `run=` completers and task commands mounted from
+/// `mise tasks --usage`; those only exist in [`super::usage::completion_spec`]. Try that richer
+/// spec first, preserving its path fallback marker, then leave only unsupported requests to the
+/// compiled usage-rs tables.
+pub(crate) fn completion_request(argv: &[OsString]) -> Option<String> {
+    let argv = split_line_option(argv);
+    let argv = argv.as_slice();
+    let request = usage_rs::complete::CompletionRequest::parse(argv)?;
+    if request.candidates_for.is_some() || at_typed_completer(&request) {
+        return Cli::completion_request(argv);
+    }
+
+    let mut spec = super::usage::completion_spec();
+    let restarted = restart_after_task_separator(&spec, &request);
+    let request = restarted.as_ref().unwrap_or(&request);
+    // A cursor past the last word is on an empty one.
+    let word = request
+        .split
+        .words
+        .get(request.split.cword)
+        .map_or("", String::as_str);
+    tell_task_mounts_the_word(&mut spec.cmd, word);
+    complete_spec(&spec, request)
+        .ok()
+        .or_else(|| Cli::completion_request(argv))
+}
+
+/// Pass the word being completed to the mounts that list tasks.
+///
+/// A mount's command is fixed text, so without this `mise tasks --usage` cannot tell `mise run
+/// <TAB>` from `mise run //<TAB>` and offers every spelling of every task. With the word it
+/// offers the one that fits, and keeps the others as hidden aliases.
+fn tell_task_mounts_the_word(cmd: &mut usage::SpecCommand, word: &str) {
+    for mount in &mut cmd.mounts {
+        if mount.run == "mise tasks --usage" {
+            mount.run = format!(
+                "mise tasks --usage --complete-word={}",
+                shell_words::quote(word)
+            );
+        }
+    }
+    for sub in cmd.subcommands.values_mut() {
+        tell_task_mounts_the_word(sub, word);
+    }
+}
+
+/// Whether the cursor is on a value a `#[usage(complete = …)]` function answers.
+///
+/// Those are compiled into the binary, so answer them from the compiled tables directly. The
+/// runtime spec only has the `run=` usage-rs writes for them, which calls back into mise for
+/// values alone — its answer drops the descriptions, so a value containing a colon cannot be
+/// misread as `value:description`.
+fn at_typed_completer(request: &usage_rs::complete::CompletionRequest) -> bool {
+    fn meta_for<'a>(
+        meta: &'a usage_rs::spec::CommandMeta<'a>,
+        cmd: &usage_rs::Command<'_>,
+    ) -> Option<&'a usage_rs::spec::CommandMeta<'a>> {
+        if std::ptr::eq(meta.cmd, cmd) {
+            return Some(meta);
+        }
+        meta.subcommands.iter().find_map(|sub| meta_for(sub, cmd))
+    }
+
+    let spec = Cli::spec();
+    let position = usage_rs::complete::walk(spec.root.cmd, request.split.argv());
+    let Some(meta) = meta_for(spec.root, position.cmd) else {
+        return false;
+    };
+    match (position.awaiting_value, position.next_arg) {
+        (Some(flag), _) => meta
+            .flags
+            .iter()
+            .any(|f| std::ptr::eq(f.flag, flag) && f.complete.is_some()),
+        (None, Some(arg)) => meta
+            .args
+            .iter()
+            .any(|a| std::ptr::eq(a.arg, arg) && a.complete.is_some()),
+        (None, None) => false,
+    }
+}
+
+/// Rewrite `--line=LINE` as `--line LINE`.
+///
+/// The `run=` usage-rs emits for a typed completer (`#[usage(complete = …)]`) passes the line as
+/// `--line={{ words | … }}`, but `CompletionRequest::parse` only reads `--line` followed by a
+/// separate word and skips the joined form. The completer would then see an empty line: no
+/// prefix, and none of its command's flags. Remove once usage-rs includes jdx/usage#1487.
+fn split_line_option(argv: &[OsString]) -> Vec<OsString> {
+    argv.iter()
+        .flat_map(
+            |arg| match arg.to_str().and_then(|a| a.strip_prefix("--line=")) {
+                Some(line) => vec![OsString::from("--line"), OsString::from(line)],
+                None => vec![arg.clone()],
+            },
+        )
+        .collect()
+}
+
+/// The same native protocol for a verified Packslip resource, without loading
+/// project configuration or requiring a separate usage executable.
+pub(crate) fn usage_spec_request(argv: &[OsString]) -> Option<Result<String>> {
+    if argv
+        .first()
+        .is_none_or(|arg| arg != "__usage_complete_word")
+    {
+        return None;
+    }
+    Some((|| {
+        let path = argv
+            .get(1)
+            .and_then(|arg| arg.to_str())
+            .ok_or_else(|| eyre::eyre!("missing completion specification"))?;
+        let path = crate::packslip::completions::decode_spec_path(path)?;
+        let spec = crate::file::read_to_string(path)?
+            .parse::<usage::Spec>()
+            .map_err(|err| eyre::eyre!("invalid usage specification: {err}"))?;
+        let request_argv: Vec<_> = std::iter::once(OsString::from("__complete_word__"))
+            .chain(argv.iter().skip(2).cloned())
+            .collect();
+        let request = usage_rs::complete::CompletionRequest::parse(&request_argv)
+            .ok_or_else(|| eyre::eyre!("invalid completion request"))?;
+        complete_spec(&spec, &request)
+    })())
+}
+
+/// Answer one completion request from `spec`, in the shape `request`'s shell reads.
+///
+/// Rendered with [`usage_rs::complete::render_request`] rather than plain `render`, because the
+/// answer has to carry more than its candidates. Bash's default `COMP_WORDBREAKS` contains `:`,
+/// so Readline replaces only the fragment after the last colon and keeps what precedes it;
+/// `render_request` names that preserved prefix so the generated wrapper can trim it from full
+/// candidates. Task names are the reason this matters here: `update:deps:no-cooldown` completed
+/// after `update:deps:` is otherwise inserted whole, behind the prefix Readline kept.
+fn complete_spec(
+    spec: &usage::Spec,
+    request: &usage_rs::complete::CompletionRequest,
+) -> Result<String> {
+    let answer = usage_cli::complete_answer(
+        spec,
+        &request.split.words,
+        request.split.cword,
+        request.shell.as_str(),
+    )
+    .map_err(|err| eyre::eyre!("{err}"))?;
+    let candidates = if answer.files {
+        vec![]
+    } else {
+        answer
+            .candidates
+            .into_iter()
+            // Project data answers here; a value carrying a control character would be read
+            // as protocol rather than as a candidate.
+            .filter(|(value, _)| is_completable(value))
+            .filter(|(value, description)| !shadowed_by_command(spec, request, value, description))
+            .map(|(value, description)| {
+                let description = strip_control_chars(&description);
+                if description.is_empty() {
+                    usage_rs::complete::Candidate::new(value)
+                } else {
+                    usage_rs::complete::Candidate::described(value, description)
+                }
+            })
+            .collect()
+    };
+    let answer = usage_rs::complete::Completions {
+        candidates,
+        files: answer.files.then_some(usage_rs::complete::Files::Any),
+    };
+    Ok(usage_rs::complete::render_request(&answer, request))
+}
+
+/// Treat the words after the last `:::` of a `mise run` line as a fresh `mise run` line.
+///
+/// `:::` starts the next task, but tasks are subcommands mounted under `run`, and usage checks
+/// a `restart_token` only on the innermost command it has parsed, which by then is the first
+/// task. Left alone, `mise run a f1 ::: <Tab>` completes more arguments of `a`.
+fn restart_after_task_separator(
+    spec: &usage::Spec,
+    request: &usage_rs::complete::CompletionRequest,
+) -> Option<usage_rs::complete::CompletionRequest> {
+    let split = &request.split;
+    let sep = split
+        .words
+        .get(..split.cword)?
+        .iter()
+        .rposition(|w| w == ":::")?;
+    if sep == 0 {
+        return None;
+    }
+    if !runs_tasks(spec, &split.words[1..sep]) {
+        return None;
+    }
+    let mut restarted = request.clone();
+    let mut words = vec![split.words[0].clone(), "run".to_string()];
+    words.extend(split.words[sep + 1..].iter().cloned());
+    restarted.split.cword = split.cword - sep + 1;
+    restarted.split.words = words;
+    Some(restarted)
+}
+
+/// Whether the words before a `:::` make a `mise run` line: `run`, `tasks run`, or a task
+/// named in place of a command (`mise <task>`, or `mise -- <task>` for a task named like one).
+fn runs_tasks(spec: &usage::Spec, words: &[String]) -> bool {
+    let takes_value = |word: &str| {
+        if word.contains('=') {
+            return false;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            return spec
+                .cmd
+                .flags
+                .iter()
+                .any(|f| f.arg.is_some() && f.long.iter().any(|l| l == long));
+        }
+        // A short cluster takes a value only when its first value-taking flag ends the word.
+        let Some(cluster) = word.strip_prefix('-') else {
+            return false;
+        };
+        let mut chars = cluster.chars();
+        while let Some(c) = chars.next() {
+            let Some(flag) = spec.cmd.flags.iter().find(|f| f.short.contains(&c)) else {
+                return false;
+            };
+            if flag.arg.is_some() {
+                return chars.as_str().is_empty();
+            }
+        }
+        false
+    };
+    // The next command word, past flags and the values they take, and whether a `--` ended
+    // the flags first.
+    fn next_word<'a>(
+        rest: &mut std::slice::Iter<'a, String>,
+        takes_value: &dyn Fn(&str) -> bool,
+    ) -> Option<(&'a String, bool)> {
+        while let Some(word) = rest.next() {
+            if word == "--" {
+                return rest.next().map(|w| (w, true));
+            }
+            if !word.starts_with('-') {
+                return Some((word, false));
+            }
+            if takes_value(word) {
+                rest.next();
+            }
+        }
+        None
+    }
+    let mut rest = words.iter();
+    let Some((first, after_dashes)) = next_word(&mut rest, &takes_value) else {
+        return false;
+    };
+    let Some(cmd) = spec.cmd.find_subcommand(first) else {
+        return true;
+    };
+    if after_dashes {
+        return true;
+    }
+    match cmd.name.as_str() {
+        "run" => true,
+        "tasks" => next_word(&mut rest, &takes_value)
+            .is_some_and(|(w, _)| cmd.find_subcommand(w).is_some_and(|c| c.name == "run")),
+        _ => false,
+    }
+}
+
+/// Whether `value` can be offered to a shell as a candidate.
+///
+/// An answer is one line per candidate with tab-separated fields, and a line opening with `\x01`
+/// is an instruction to the generated script: zsh pastes what follows `\x01extensions` into a
+/// glob, where a qualifier such as `(e:cmd:)` runs `cmd`. usage-rs writes values as they are,
+/// relying on none containing a control character. That holds for its compiled tables but not
+/// for task names or `run=` completer output, which come from project files that need not be
+/// trusted. A value that could be read as protocol, or that would start a line of its own, is
+/// left out rather than escaped: no name a shell can complete needs a control character.
+/// Whether a candidate is a task named like a command `mise <name>` runs instead.
+///
+/// With a default subcommand, the first word completes both the commands and the mounted task
+/// names. A task called `upgrade` is then offered beside the built-in `upgrade`, and a shell
+/// that lists one entry per name shows the task's description over the command's. `mise
+/// upgrade` runs the command, so the task is only reachable as `mise run upgrade`. A candidate
+/// that carries a command's name or alias without that command's description is the task.
+fn shadowed_by_command(
+    spec: &usage::Spec,
+    request: &usage_rs::complete::CompletionRequest,
+    value: &str,
+    description: &str,
+) -> bool {
+    if spec.default_subcommand.is_none() {
+        return false;
+    }
+    // Only the first word that is not a flag, or a flag's separate value, picks a command.
+    let Some(before) = request.split.words.get(1..request.split.cword) else {
+        return false;
+    };
+    let takes_value = |word: &str| {
+        let flag = |f: &&usage::SpecFlag| match word.strip_prefix("--") {
+            Some(long) => f.long.iter().any(|l| l == long),
+            None => word.chars().nth(1).is_some_and(|c| f.short.contains(&c)),
+        };
+        // `--jobs=2` and `-j2` carry their value; a short cluster such as `-xj` is not parsed.
+        !word.contains('=')
+            && (word.starts_with("--") || word.chars().count() == 2)
+            && spec
+                .cmd
+                .flags
+                .iter()
+                .find(flag)
+                .is_some_and(|f| f.arg.is_some())
+    };
+    // After `--`, even right behind a flag, the next word is a task, not a command.
+    if before.iter().any(|word| word == "--") {
+        return false;
+    }
+    let mut words = before.iter();
+    while let Some(word) = words.next() {
+        if !word.starts_with('-') {
+            return false;
+        }
+        if takes_value(word) {
+            words.next();
+        }
+    }
+    spec.cmd.subcommands.values().any(|cmd| {
+        let named = cmd.name == value
+            || cmd
+                .aliases
+                .iter()
+                .chain(&cmd.hidden_aliases)
+                .any(|alias| alias == value);
+        let help = cmd.help.as_deref().unwrap_or_default().lines().next();
+        named && help.unwrap_or_default() != description
+    })
+}
+
+fn is_completable(value: &str) -> bool {
+    !value.chars().any(char::is_control)
+}
+
+/// A description with its control characters turned into spaces.
+///
+/// Descriptions come from the same untrusted places as values. They are shown rather than
+/// inserted, and usage-rs only folds line breaks and tabs in them, so anything else, such as an
+/// escape sequence, would otherwise reach the terminal as it is.
+fn strip_control_chars(description: &str) -> String {
+    description
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// Generate shell completions
+///
+/// Prints a completion script for SHELL, or with --install writes it where that
+/// shell loads completions from. The script asks mise for candidates as you type,
+/// so it also completes your project's task names and tool versions. See
+/// https://mise.jdx.dev/shell-setup.html#autocompletion.
+#[derive(Debug, usage_rs::Args)]
+#[usage(
+    aliases = ["complete", "completions"],
+    verbatim_doc_comment,
+    example(
+        "mise completion zsh --install",
+        help = "Install completions for zsh; bash, fish, and powershell work the same way"
+    ),
+    example(
+        "mise completion zsh",
+        help = "Print the script to inspect it or save it somewhere else"
+    ),
+    example(
+        "mise completion zsh --tool hk --install",
+        help = "Install completions for hk, a tool installed with the packslip backend"
+    )
+)]
+pub(crate) struct Completion {
+    /// Shell type to generate completions for (required)
+    #[usage(required_unless = "shell_type", value_enum)]
+    shell: Option<Shell>,
+
+    /// Shell type to generate completions for
+    #[usage(long = "shell", short = 's', hide = true, value_enum)]
+    shell_type: Option<Shell>,
+
+    /// No longer has any effect; kept so older setup scripts keep working
+    #[usage(long, verbatim_doc_comment, hide = true)]
+    include_bash_completion_lib: bool,
+
+    /// No longer has any effect; kept so older setup scripts keep working
+    #[usage(long, verbatim_doc_comment, hide = true)]
+    usage: bool,
+
+    /// Install the script where this shell looks for it, instead of printing it
+    ///
+    /// It writes only the script file, never a shell startup file or PowerShell
+    /// profile. If your shell needs a one-time setup line, such as zsh's `fpath+=`
+    /// or PowerShell's dot-source, mise prints it for you to add.
+    #[usage(long, verbatim_doc_comment, effect = "write")]
+    install: bool,
+
+    /// Replace a file at the target path that mise did not write
+    #[usage(long, requires = "--install", effect = "write")]
+    force: bool,
+
+    /// Generate completions for a tool installed with the `packslip:` backend
+    ///
+    /// TOOL is the tool or one of its executables; with --install, pass the
+    /// executable's name. The script matches the version active in the current
+    /// directory and comes from the most verifiable source its packslip offers: a
+    /// file the vendor shipped, a script derived from its CLI spec, or a command of
+    /// the tool's own. With --install, mise writes a small stub that asks mise for
+    /// the script each time the shell completes the tool, so it follows version
+    /// changes without being rewritten.
+    #[usage(long, verbatim_doc_comment)]
+    tool: Option<String>,
+}
+
+impl Completion {
+    pub(crate) async fn run(self) -> Result<()> {
+        let shell = self.shell.or(self.shell_type).unwrap();
+        if let Some(tool) = &self.tool {
+            if self.install {
+                return self.install_tool_stub(tool, shell.into());
+            }
+            let config = crate::config::Config::get().await?;
+            let script =
+                crate::packslip::completion_script(&config, tool, shell.packslip_name()).await?;
+            miseprintln!("{}", script.trim());
+            return Ok(());
+        }
+        if self.install {
+            return self.install_script(shell.into());
+        }
+        let script = Cli::completion_script(shell.into());
+        miseprintln!("{}", script.trim());
+
+        Ok(())
+    }
+
+    /// Put a stub for a tool where this shell looks for its completion. The stub defers to
+    /// `mise completion <shell> --tool <tool>` at completion time, so the script always matches
+    /// the version that is active, and the file never needs rewriting on a version switch.
+    fn install_tool_stub(&self, tool: &str, shell: usage_rs::complete::Shell) -> Result<()> {
+        use usage_rs::install::{self, OnForeign};
+
+        // The stub is filed under the command's name and completes that
+        // name, so it must be the executable as typed, not a tool id such
+        // as github.com/owner/repo.
+        if !crate::file::is_plain_file_name(tool) {
+            eyre::bail!(
+                "--install takes the executable's name, not a tool id; run `mise completion {} --tool {tool}` to see what the id resolves to",
+                shell.as_str()
+            );
+        }
+        let stub = crate::packslip::stub(tool, shell)?;
+        let on_foreign = if self.force {
+            OnForeign::Overwrite
+        } else {
+            OnForeign::Refuse
+        };
+        let plan = install::plan_for("mise", tool, shell, &install::Env::from_process())
+            .map_err(eyre::Report::new)?;
+        let done = install::write(&plan, &stub, on_foreign).map_err(|err| match &err {
+            install::Error::Foreign { .. } => eyre::eyre!(
+                "{err}\n\nPass --force to replace it, or redirect `mise completion {} --tool {tool}` yourself.",
+                shell.as_str()
+            ),
+            _ => eyre::Report::new(err),
+        })?;
+        Self::report_install(&done);
+        Ok(())
+    }
+
+    /// Say where a script went and what, if anything, is left to do. Everything goes to
+    /// stderr, so stdout stays empty under `--install`.
+    fn report_install(done: &usage_rs::install::Installed) {
+        use usage_rs::install::{self, Wrote};
+        eprintln!(
+            "installing to {}",
+            crate::file::display_path(&done.plan.path)
+        );
+        if done.wrote == Wrote::Unchanged {
+            eprintln!("already up to date");
+        }
+        if let Some(line) = done.plan.loading.instruction() {
+            let file = match &done.plan.loading {
+                install::Loading::Manual { file, .. } => file.as_str(),
+                _ => "your shell's startup file",
+            };
+            eprintln!("\nadd this to {file}, once:\n\n{line}\n");
+        }
+        if let Some(note) = done.plan.note {
+            eprintln!("note: {note}");
+        }
+    }
+
+    /// Put the script where this shell looks for it, and say what is left to do.
+    ///
+    /// The location comes from usage rather than from a table here, so `mise completion zsh
+    /// --install` and `usage g completion zsh mise --install` cannot disagree about where a mise
+    /// completion lives.
+    fn install_script(&self, shell: usage_rs::complete::Shell) -> Result<()> {
+        use usage_rs::install::{self, OnForeign};
+
+        let on_foreign = if self.force {
+            OnForeign::Overwrite
+        } else {
+            OnForeign::Refuse
+        };
+        // The environment is described from this process rather than reached for inside the
+        // resolver, which is what lets a test point the same code path somewhere harmless.
+        let done = Cli::install_completion(shell, &install::Env::from_process(), on_foreign)
+            .map_err(|err| match &err {
+                install::Error::Foreign { .. } => eyre::eyre!(
+                    "{err}\n\nPass --force to replace it, or redirect the script yourself."
+                ),
+                _ => eyre::Report::new(err),
+            })?;
+
+        // The examples below document `mise completion zsh > …`, and prose on stdout would land
+        // in that file, so the report goes to stderr.
+        Self::report_install(&done);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, EnumString, strum::Display, usage_rs::ValueEnum)]
+#[strum(serialize_all = "snake_case")]
+#[usage(rename_all = "snake_case")]
+enum Shell {
+    Bash,
+    Fish,
+    #[strum(serialize = "nu")]
+    #[usage(name = "nu", visible_alias = "nushell")]
+    Nu,
+    #[strum(serialize = "powershell")]
+    #[usage(name = "powershell", visible_alias = "pwsh")]
+    Powershell,
+    Zsh,
+}
+
+impl Shell {
+    /// The shell's name in a packslip's `completion` entries.
+    fn packslip_name(self) -> &'static str {
+        match self {
+            Shell::Bash => "bash",
+            Shell::Fish => "fish",
+            Shell::Nu => "nu",
+            Shell::Powershell => "powershell",
+            Shell::Zsh => "zsh",
+        }
+    }
+}
+
+impl From<Shell> for usage_rs::complete::Shell {
+    fn from(shell: Shell) -> Self {
+        match shell {
+            Shell::Bash => Self::Bash,
+            Shell::Fish => Self::Fish,
+            Shell::Nu => Self::Nu,
+            Shell::Powershell => Self::PowerShell,
+            Shell::Zsh => Self::Zsh,
+        }
+    }
+}
+
+#[cfg(test)]
+mod shell_name_tests {
+    use super::*;
+    use usage_rs::spec::ValueEnum;
+
+    #[test]
+    fn usage_spec_completes_from_a_native_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // APFS rejects non-UTF-8 filenames; Linux filesystems permit them.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let name = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(b"spec with spaces-\xff.kdl".to_vec())
+        };
+        #[cfg(any(windows, target_os = "macos"))]
+        let name = OsString::from("spec with spaces-\u{03bb}.kdl");
+        let path = dir.path().join(name);
+        std::fs::write(&path, "name \"probe\"\nflag \"--from-spec\"\n").unwrap();
+        let encoded = crate::packslip::completions::encode_spec_path(&path);
+        let argv: Vec<OsString> = [
+            "__usage_complete_word",
+            &encoded,
+            "--shell",
+            "bash",
+            "--line",
+            "probe --from",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let answer = usage_spec_request(&argv).unwrap().unwrap();
+        assert!(answer.contains("--from-spec"), "{answer}");
+    }
+
+    #[test]
+    fn a_bash_answer_reports_the_colon_prefix_readline_keeps() {
+        // Bash's default COMP_WORDBREAKS contains `:`, so Readline replaces only `no` in
+        // `mise update:deps:no<TAB>`. The answer has to name the `update:deps:` prefix it
+        // keeps, or the generated wrapper inserts the full candidate after it and produces
+        // `update:deps:update:deps:no-cooldown`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.kdl");
+        std::fs::write(
+            &path,
+            "name \"mise\"\ncmd \"update:deps\"\ncmd \"update:deps:no-cooldown\"\n",
+        )
+        .unwrap();
+        let encoded = crate::packslip::completions::encode_spec_path(&path);
+        let argv: Vec<OsString> = [
+            "__usage_complete_word",
+            &encoded,
+            "--shell",
+            "bash",
+            "--line",
+            "mise update:deps:no",
+            "--bash-word",
+            "no",
+            "--bash-wordbreaks",
+            " \t\n\"'><=;|&(:",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let answer = usage_spec_request(&argv).unwrap().unwrap();
+        assert!(answer.contains("update:deps:no-cooldown"), "{answer}");
+        assert!(answer.contains("\u{1}prefix\tupdate:deps:\n"), "{answer:?}");
+    }
+
+    #[test]
+    fn pwsh_is_accepted_as_powershell() {
+        assert!(matches!(
+            <Shell as ValueEnum>::from_choice("pwsh"),
+            Some(Shell::Powershell)
+        ));
+        assert!(matches!(
+            <Shell as ValueEnum>::from_choice("powershell"),
+            Some(Shell::Powershell)
+        ));
+    }
+
+    #[test]
+    fn nushell_is_accepted_as_nu() {
+        assert!(matches!(
+            <Shell as ValueEnum>::from_choice("nu"),
+            Some(Shell::Nu)
+        ));
+        assert!(matches!(
+            <Shell as ValueEnum>::from_choice("nushell"),
+            Some(Shell::Nu)
+        ));
+    }
+
+    #[test]
+    fn the_primary_names_are_unchanged() {
+        // Only the *names* -- the alias is rendered into the CLI docs, so asserting it absent
+        // here would state something false. This pins that adding it renamed nothing.
+        let listed: Vec<&str> = Shell::DETAILS.iter().map(|choice| choice.value).collect();
+        assert_eq!(listed, ["bash", "fish", "nu", "powershell", "zsh"]);
+    }
+
+    #[test]
+    fn a_typed_completer_reads_the_joined_line_option() {
+        // The form the `run=` of a `#[usage(complete = …)]` field passes back.
+        let argv: Vec<OsString> = [
+            "__complete_word__",
+            "--candidates",
+            "key",
+            "--line=mise config set settings.pyth",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let answer = completion_request(&argv).unwrap();
+        assert!(answer.lines().any(|l| l == "settings.python"), "{answer}");
+        assert!(!answer.contains("settings.jobs"), "{answer}");
+    }
+
+    #[test]
+    fn a_typed_completer_keeps_its_descriptions() {
+        let argv: Vec<OsString> = [
+            "__complete_word__",
+            "--shell",
+            "fish",
+            "--line",
+            "mise config get tools.node.v",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let answer = completion_request(&argv).unwrap();
+        assert!(
+            answer.contains("tools.node.version\tversion of the tool to install\n"),
+            "{answer}"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_command_completes_files_after_its_first_word() {
+        let ask = |line: &str| {
+            let argv: Vec<OsString> = ["__complete_word__", "--shell", "bash", "--line", line]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+            completion_request(&argv).unwrap()
+        };
+        // Every word after the command is a file, as in a bare shell. The command word is
+        // covered by `a_forwarded_command_word_completes_commands`. One request per test: each
+        // builds the whole completion spec, and nextest kills a unit test after a second, which
+        // a debug build on a slow runner reaches with three.
+        assert_eq!(ask("mise x node@22 -- ls -l src/"), "\u{1}files\n");
+    }
+
+    /// The command word is the one thing after `--` that is not a file. `PATH` holds a single
+    /// directory, so listing the commands stays cheap on a host with a large one.
+    #[cfg(unix)]
+    #[test]
+    fn a_forwarded_command_word_completes_commands() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("forwardedtool");
+        std::fs::write(&tool, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut environment = mise_util::testing::EnvVarGuard::new();
+        environment.set("PATH", dir.path());
+
+        let argv: Vec<OsString> = [
+            "__complete_word__",
+            "--shell",
+            "bash",
+            "--line",
+            "mise x -- forwarded",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(completion_request(&argv).unwrap(), "forwardedtool\n");
+    }
+
+    #[test]
+    fn a_candidate_cannot_forge_a_protocol_line() {
+        // The zsh script globs for what follows `\x01extensions`, and a glob qualifier there
+        // runs code. Neither a name opening with the marker nor one carrying it onto a line of
+        // its own may reach the answer, and a description cannot carry a control character to
+        // the terminal either.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.kdl");
+        std::fs::write(
+            &path,
+            concat!(
+                "name \"mise\"\n",
+                "cmd \"build\" help=\"esc \\u{1b}]0;title\\u{7}\"\n",
+                "cmd \"\\u{1}extensions\" help=\"*)(e:id:) x(\"\n",
+                "cmd \"b\\n\\u{1}extensions\\t*)(e:id:) x(\"\n",
+            ),
+        )
+        .unwrap();
+        let encoded = crate::packslip::completions::encode_spec_path(&path);
+        for shell in ["bash", "fish", "powershell", "zsh"] {
+            let argv: Vec<OsString> = [
+                "__usage_complete_word",
+                &encoded,
+                "--shell",
+                shell,
+                "--line",
+                "mise ",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+            let answer = usage_spec_request(&argv).unwrap().unwrap();
+            assert!(answer.contains("build"), "{answer:?}");
+            assert!(!answer.contains('\u{1}'), "{answer:?}");
+            assert!(!answer.contains('\u{1b}'), "{answer:?}");
+            assert!(!answer.contains("(e:id:)"), "{answer:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_run_completer_does_not_evaluate_the_words_it_is_given() {
+        // The words arrive with the shell's quoting already removed, and the `run=` they are
+        // rendered into goes to `sh -c`. A mounted task can offer such a word as a choice and
+        // then name its next argument after one of these completers. One line per completer
+        // that reads the words.
+        //
+        // The completers call `mise`, which here is a stub that records its arguments: the real
+        // one would load config and reach for the network on every line, and whichever `mise`
+        // happens to be on PATH is not what is under test. The record also shows the completer
+        // ran, so the test cannot pass by never reaching it.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("evaluated");
+        let calls = dir.path().join("calls");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let stub = bin.join("mise");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nprintf '[%s]' \"$@\" >>'{}'\necho >>'{}'\n",
+                calls.display(),
+                calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = mise_util::testing::EnvVarGuard::new();
+        env.set("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+
+        // Built once: the runtime spec is what `completion_request` answers these lines from,
+        // and building it costs far more than answering a line.
+        let spec = super::super::usage::completion_spec();
+        let literal = format!("$(touch {})", marker.display());
+        let word = format!("'{literal}'");
+        for (line, expected) in [
+            (
+                format!("mise tool-alias unset {word} "),
+                Some(format!("[alias][ls][--][{literal}]")),
+            ),
+            (
+                format!("mise ls-remote {word} "),
+                Some(format!("[ls-remote][--][{literal}]")),
+            ),
+            (
+                format!("mise lock {word}"),
+                Some(format!("[search][--complete][--][{literal}]")),
+            ),
+            (
+                format!("mise use {word}"),
+                Some(format!("[search][--complete-ids][{literal}]")),
+            ),
+            // `installed_tool@version` only passes the word on once it holds an `@`
+            (format!("mise uninstall {word}"), None),
+        ] {
+            let _ = std::fs::remove_file(&calls);
+            let argv: Vec<OsString> = ["__complete_word__", "--shell", "fish", "--line", &line]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+            let request = usage_rs::complete::CompletionRequest::parse(&argv).unwrap();
+            complete_spec(&spec, &request).unwrap();
+            assert!(!marker.exists(), "{line}");
+            let recorded = std::fs::read_to_string(&calls).unwrap_or_default();
+            assert!(
+                !recorded.is_empty(),
+                "the completer for {line:?} did not run"
+            );
+            if let Some(expected) = expected {
+                assert!(
+                    recorded.lines().any(|l| l == expected),
+                    "{line:?} passed {recorded:?}, not {expected:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completion_script_calls_back_into_mise() {
+        let script = Cli::completion_script(usage_rs::complete::Shell::Bash);
+        assert!(script.contains("mise' __complete_word__"), "{script}");
+        assert!(!script.contains("command usage"), "{script}");
+    }
+}

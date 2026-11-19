@@ -1,0 +1,351 @@
+use std::{path::PathBuf, sync::Arc};
+
+use crate::args::{BackendArg, ToolArg};
+use crate::cli::prune::prune_scoped;
+use crate::config::config_file::ConfigFile;
+use crate::config::{Config, config_file};
+use crate::file::display_path;
+use crate::toolset::{ToolRequest, ToolSource, ToolVersion};
+use crate::{config, env, shims};
+use eyre::Result;
+use itertools::Itertools;
+use path_absolutize::Absolutize;
+
+/// Remove tool requests from config files and prune unused installations
+///
+/// Without `--path`, `--global`, or `--env`, mise edits the first loaded config
+/// that declares one of the tools; in your home directory it edits the global
+/// config. A version argument matches the configured request literally: to
+/// remove `node = "20"`, use `mise unuse node@20`, not the installed version it
+/// resolved to. Omit the version to remove every request for that tool from the
+/// selected file.
+///
+/// The installed versions the arguments name are pruned only when no remaining
+/// tracked config or tool stub needs them; mise says which file keeps one. A tool
+/// named without a version has all of its unused versions pruned. Pass
+/// `--no-prune` to edit the config and keep the installations. To remove an
+/// installation without editing config, use `mise uninstall`.
+#[derive(Debug, usage_rs::Args)]
+#[usage(verbatim_doc_comment, visible_aliases = ["rm", "remove"],
+    example(r###"mise unuse node@22.0.0"###, help = r###"Remove node@22.0.0 from mise.toml and uninstall it if nothing else uses it"###),
+    example(r###"mise unuse -g node@22.0.0"###, help = r###"Remove it from the global config instead"###),
+    example(r###"mise unuse --env staging node@20"###, help = r###"Remove the node@20 request from mise.staging.toml"###))]
+pub(crate) struct Unuse {
+    /// Tools to remove from the config, with the version written as in the config
+    #[usage(value_name = "INSTALLED_TOOL@VERSION", required = true)]
+    installed_tool: Vec<ToolArg>,
+
+    /// Edit mise.<ENV>.toml in the current directory, or .mise.<ENV>.toml if that exists
+    ///
+    /// Not the same as the global -E, which only chooses which config files
+    /// are loaded.
+    #[usage(long, short, overrides = & ["global", "path"])]
+    env: Option<String>,
+
+    /// Use the global config file (`~/.config/mise/config.toml`) instead of the local one
+    #[usage(short, long, overrides = & ["path", "env"])]
+    global: bool,
+
+    /// Edit this config file, or the config file in this directory
+    #[usage(short, long, visible_alias = "file", overrides = & ["global", "env"], value_hint = usage_rs::ValueHint::FilePath)]
+    path: Option<PathBuf>,
+
+    /// Write to the global override file, `config.override.toml`
+    ///
+    /// The override file outranks all project config. With `--env`, writes
+    /// `config.<ENV>.override.toml` instead. See
+    /// https://mise.jdx.dev/configuration.html#override-file
+    #[usage(long = "override", conflicts = ["global", "path"])]
+    override_file: bool,
+
+    /// Do not also prune the installed version
+    #[usage(long)]
+    no_prune: bool,
+}
+
+impl Unuse {
+    pub(crate) async fn run(self) -> Result<()> {
+        let config = Config::get().await?;
+        let requests = config.get_tool_request_set().await?;
+        for ta in &self.installed_tool {
+            if requests
+                .sources
+                .get(&ta.ba)
+                .is_some_and(|s| s.is_mise_toml_daemon())
+            {
+                warn!(
+                    "{} is declared by [daemons]; edit that declaration to remove it",
+                    ta.ba
+                );
+            }
+        }
+        let cfs = self.get_config_files(&config).await?;
+        let system_config = cfs.iter().any(|cf| config::is_system_config(cf.get_path()));
+        let mut removed: Vec<&ToolArg> = vec![];
+        for cf in &cfs {
+            // Re-read under the lock, as `mise use` does, so a concurrent edit is kept.
+            let (_lock, cf) = config_file::lock_and_parse_or_init(cf.get_path()).await?;
+            let removed_here = self.remove_from(cf.as_ref())?;
+            if !removed_here.is_empty() {
+                cf.save()?;
+                let removals = removed_here.iter().join(", ");
+                info!("removed: {removals} from {}", display_path(cf.get_path()));
+            }
+            for ta in removed_here {
+                if !removed
+                    .iter()
+                    .any(|r| r.ba == ta.ba && r.version == ta.version)
+                {
+                    removed.push(ta);
+                }
+            }
+        }
+        if removed.is_empty() {
+            debug!("no tools to remove");
+            let files = cfs.iter().map(|cf| display_path(cf.get_path())).join(", ");
+            warn!("no matching tool request found in {files}; nothing was removed");
+        }
+
+        let (prune_tools, prune_versions) = if self.no_prune {
+            (vec![], vec![])
+        } else {
+            self.prune_scope(&config, requests).await?
+        };
+        if !prune_tools.is_empty() || !prune_versions.is_empty() {
+            prune_scoped(
+                &config,
+                prune_tools.iter().map(|ba| ba.as_ref()).collect(),
+                prune_versions,
+                false,
+            )
+            .await?;
+        }
+        if !removed.is_empty() || !self.no_prune {
+            let shim_scope = match (system_config, self.no_prune) {
+                (true, false) => shims::ShimScope::Both,
+                (true, true) => shims::ShimScope::System,
+                (false, _) => shims::ShimScope::User,
+            };
+            let config = Config::reset().await?;
+            let ts = config.get_toolset().await?;
+            config::rebuild_shims_and_runtime_symlinks_for_scope(&config, ts, shim_scope).await?;
+            // Only an edited config changes what the lockfile should contain;
+            // pruning installed versions does not. Under
+            // `lockfile_mode = "generate"` nothing else rebuilds the file here,
+            // so without this the removed tool's entry — and the dependency
+            // sidecar it points at — survive until the next install.
+            if !removed.is_empty() {
+                config::generate_lockfiles_after_changes(
+                    &config,
+                    &[],
+                    crate::lockfile::LockfileUpdateMode::Normal,
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Removes the requested tools from one config file, returning the
+    /// arguments that matched something in it. The caller saves the file.
+    fn remove_from(&self, cf: &dyn ConfigFile) -> Result<Vec<&ToolArg>> {
+        let tools = cf.to_tool_request_set()?.tools;
+        let mut removed: Vec<&ToolArg> = vec![];
+        for ta in &self.installed_tool {
+            let already_removed = removed.iter().any(|existing| {
+                existing.ba.as_ref() == ta.ba.as_ref() && existing.version == ta.version
+            });
+            if already_removed {
+                continue;
+            }
+            let Some(tool_requests) = tools.get(ta.ba.as_ref()) else {
+                continue;
+            };
+            let matches = match &ta.version {
+                Some(version) => tool_requests.iter().any(|tr| tr.version() == *version),
+                None => true,
+            };
+            if matches {
+                removed.push(ta);
+            }
+        }
+
+        for (ba, tool_requests) in &tools {
+            let matching_args = removed
+                .iter()
+                .copied()
+                .filter(|ta| ta.ba.as_ref() == ba.as_ref())
+                .collect_vec();
+            if matching_args.is_empty() {
+                continue;
+            }
+
+            if matching_args.iter().any(|ta| ta.version.is_none()) {
+                cf.remove_tool(ba)?;
+                continue;
+            }
+
+            let remaining = tool_requests
+                .iter()
+                .filter(|tr| {
+                    let version = tr.version();
+                    !matching_args
+                        .iter()
+                        .any(|ta| ta.version.as_deref() == Some(version.as_str()))
+                })
+                .cloned()
+                .collect_vec();
+            if remaining.len() == tool_requests.len() {
+                continue;
+            }
+            if remaining.is_empty() {
+                cf.remove_tool(ba)?;
+            } else {
+                cf.replace_versions(ba, remaining)?;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// What to prune afterwards: every unused version of a tool named without a
+    /// version, and only the installed versions that a named version stands for.
+    /// `mise unuse node@24.20.0` has no business deleting other unused node versions.
+    async fn prune_scope(
+        &self,
+        config: &Arc<Config>,
+        requests: &crate::toolset::ToolRequestSet,
+    ) -> Result<(Vec<Arc<BackendArg>>, Vec<ToolVersion>)> {
+        let mut tools = vec![];
+        let mut versions = vec![];
+        for ta in &self.installed_tool {
+            if requests
+                .sources
+                .get(&ta.ba)
+                .is_some_and(|s| s.is_mise_toml_daemon())
+            {
+                continue;
+            }
+            let (Some(version), Some(tvr)) = (&ta.version, &ta.tvr) else {
+                tools.push(ta.ba.clone());
+                continue;
+            };
+            // The config is already edited, so a backend that cannot be resolved
+            // (a removed plugin, say) leaves nothing to prune rather than failing.
+            let Ok(backend) = ta.ba.backend() else {
+                debug!("no backend for {}, nothing to prune", ta.ba);
+                continue;
+            };
+            let installed = backend.list_installed_versions();
+            // Same lookup as `mise uninstall`: an installed version of that exact
+            // name, else whatever the request resolves to. A ref installs into
+            // `ref-main` though it resolves as `ref:main`, so compare the
+            // directory name.
+            let name = if installed.contains(version) {
+                version.clone()
+            } else {
+                match tvr.resolve(config, &Default::default()).await {
+                    Ok(tv) if installed.contains(&tv.tv_pathname()) => tv.tv_pathname(),
+                    _ => {
+                        debug!("{backend} has no installed version matching {version}");
+                        continue;
+                    }
+                }
+            };
+            // Installations of one version that differ in install options share
+            // its name and each is needed or not on its own, so every one is a
+            // candidate; the version link only names one of them.
+            let mut dirs = crate::install_layout::resolver::installs_of(&ta.ba)
+                .into_iter()
+                .filter(|(n, _)| *n == name)
+                .map(|(_, dir)| dir)
+                .collect::<Vec<_>>();
+            dirs.extend(crate::install_layout::resolver::physical_dir(&ta.ba, &name));
+            dirs.sort();
+            dirs.dedup();
+            let tvr = ToolRequest::new(ta.ba.clone(), &name, ToolSource::Unknown)?;
+            let version = tvr.version();
+            let dirs = if dirs.is_empty() {
+                vec![None]
+            } else {
+                dirs.into_iter().map(Some).collect()
+            };
+            for dir in dirs {
+                let mut tv = ToolVersion::new(tvr.clone(), version.clone());
+                tv.install_path = dir;
+                versions.push(tv);
+            }
+        }
+        Ok((tools, versions))
+    }
+
+    async fn get_config_files(&self, config: &Config) -> Result<Vec<Arc<dyn ConfigFile>>> {
+        let cwd = env::current_dir()?;
+        let path = if self.override_file {
+            config::override_config_path(self.env.as_deref())?
+        } else if self.global {
+            return self.global_config_files(config).await;
+        } else if let Some(p) = &self.path {
+            let p = p.absolutize()?.to_path_buf();
+            if p.is_dir() {
+                config::config_file_in_dir(&p)
+            } else {
+                p
+            }
+        } else if let Some(env) = &self.env {
+            let p = cwd.join(format!(".mise.{env}.toml"));
+            if p.exists() {
+                p
+            } else {
+                cwd.join(format!("mise.{env}.toml"))
+            }
+        } else if env::in_home_dir() {
+            return self.global_config_files(config).await;
+        } else {
+            // The override file is never picked implicitly; `--override` names it.
+            for cf in config
+                .config_files
+                .values()
+                .filter(|cf| !config::is_override_config(cf.get_path()))
+            {
+                if cf
+                    .to_tool_request_set()?
+                    .tools
+                    .keys()
+                    .any(|ba| self.installed_tool.iter().any(|ta| &ta.ba == ba))
+                {
+                    return Ok(vec![config_file::parse(cf.get_path()).await?]);
+                }
+            }
+            config::local_toml_config_path()
+        };
+        Ok(vec![config_file::parse_or_init(&path).await?])
+    }
+
+    /// Every global config file that declares one of the tools, wherever
+    /// `mise use -g` put it (for example through `write_targets.tools`);
+    /// the default global config when none does.
+    async fn global_config_files(&self, config: &Config) -> Result<Vec<Arc<dyn ConfigFile>>> {
+        let mut files = vec![];
+        for (path, cf) in &config.config_files {
+            if !config::is_global_config(path)
+                || config::is_system_config(path)
+                || config::is_override_config(path)
+            {
+                continue;
+            }
+            if cf
+                .to_tool_request_set()?
+                .tools
+                .keys()
+                .any(|ba| self.installed_tool.iter().any(|ta| &ta.ba == ba))
+            {
+                files.push(config_file::parse(path).await?);
+            }
+        }
+        if files.is_empty() {
+            files.push(config_file::parse_or_init(&config::global_config_path()).await?);
+        }
+        Ok(files)
+    }
+}

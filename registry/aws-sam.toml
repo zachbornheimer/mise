@@ -1,0 +1,11 @@
+aliases = ["aws-sam-cli"]
+backends = [
+  { full = "aqua:aws/aws-sam-cli", platforms = [
+    "linux",
+    "macos",
+  ], options = { symlink_bins = "true" } },
+  "pipx:aws-sam-cli",
+]
+description = "CLI tool to build, test, debug, and deploy Serverless applications using AWS SAM"
+test = { cmd = "sam --version", expected = "SAM CLI, version {{version}}" }
+version_order = "semver"

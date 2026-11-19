@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# Test comprehensive error display
+# This test validates that error messages are properly formatted and structured
+
+# Try to disable colors
+export NO_COLOR=1
+
+# Local assert_fail function that doesn't force MISE_FRIENDLY_ERROR
+# Every source of GitHub credentials, unset for one command.
+NO_GITHUB_CREDENTIALS="env -u GITHUB_TOKEN -u GH_TOKEN -u MISE_GITHUB_TOKEN -u GITHUB_API_TOKEN MISE_GITHUB_GH_CLI_TOKENS=false MISE_GITHUB_USE_GIT_CREDENTIALS=false MISE_NETRC=false"
+
+local_assert_fail() {
+  local cmd="$1"
+  local expected="${2:-}"
+  local status=0
+  local actual
+
+  debug "$ $cmd"
+  actual=$(RUST_BACKTRACE=0 bash -c "$cmd 2>&1") || status=$?
+
+  if [[ $status -eq 0 ]]; then
+    fail "[$cmd] command succeeded but was expected to fail"
+  fi
+
+  if [[ -z $expected ]]; then
+    ok "[$cmd] expected failure"
+  elif [[ $actual == *"$expected"* ]]; then
+    ok "[$cmd] output contains expected text"
+  else
+    fail "[$cmd] expected '$expected' but got '$actual'"
+  fi
+}
+
+echo "Testing error message formatting..."
+
+# =============================================================================
+# PART 1: Testing with FRIENDLY errors (simplified output)
+# =============================================================================
+echo ""
+echo "PART 1: Testing FRIENDLY error format (MISE_FRIENDLY_ERROR=1)"
+echo "============================================================"
+export MISE_FRIENDLY_ERROR=1
+
+# Test 1: Invalid tool version error
+echo "Test 1: Invalid tool version"
+local_assert_fail "mise install core:node@invalid-version" \
+  "mise ERROR Failed to install core:node@invalid-version: HTTP status client error (404 Not Found) for url (https://nodejs.org/dist/vinvalid-version/node-vinvalid-version.tar.gz)"
+
+# Test 2: Backend error (cargo)
+echo "Test 2: Cargo backend error"
+local_assert_fail "MISE_CARGO_BINSTALL=0 mise install cargo:nonexistent-crate-12345@1.0.0" \
+  "mise ERROR Failed to install cargo:nonexistent-crate-12345@1.0.0: cargo exited with non-zero status: exit code 101"
+
+# Test 3: GitHub repository not found
+echo "Test 3: GitHub repository not found"
+# Without GitHub credentials, mise-versions' 404 is the answer: GitHub is asked
+# only for a repository that may be private, with credentials to read it.
+local_assert_fail "$NO_GITHUB_CREDENTIALS mise install github:nonexistent-org/nonexistent-repo@latest" \
+  "mise ERROR Failed to install github:nonexistent-org/nonexistent-repo@latest: GitHub repository nonexistent-org/nonexistent-repo not found (404 from mise-versions.jdx.dev"
+
+# Test 4: Plugin not found
+echo "Test 4: Plugin not found"
+local_assert_fail "mise install nonexistent-tool@1.0.0" \
+  "mise ERROR Failed to install nonexistent-tool@1.0.0: nonexistent-tool not found in mise tool registry"
+
+# Test 4b: Friendly errors include mise version
+echo "Test 4b: Friendly errors include mise version"
+local_assert_fail "mise install nonexistent-tool@1.0.0" \
+  "mise ERROR Version:"
+
+# Test 5: Multiple tool failures (could be single or multiple depending on timing)
+echo "Test 5: Multiple tool failures"
+local_assert_fail "mise install tiny@999.999.999 jq@999.999.999" \
+  "mise ERROR Failed to install aqua:jqlang/jq@999.999.999: GitHub release jqlang/jq@jq-999.999.999 not found (404 from mise-versions.jdx.dev)"
+
+# =============================================================================
+# PART 2: Testing with DETAILED errors (full error chains)
+# =============================================================================
+echo ""
+echo "PART 2: Testing DETAILED error format (MISE_FRIENDLY_ERROR=0)"
+echo "============================================================"
+export MISE_FRIENDLY_ERROR=0
+
+# Test 1: Invalid tool version error - check for the error format with full chain
+echo "Test 1: Invalid tool version"
+local_assert_fail "mise install core:node@invalid-version" \
+  "0: Failed to install core:node@invalid-version: HTTP status client error (404 Not Found) for url (https://nodejs.org/dist/vinvalid-version/node-vinvalid-version.tar.gz)"
+
+# Test 2: Backend error (cargo) - check for error format with full chain
+echo "Test 2: Cargo backend error"
+local_assert_fail "MISE_CARGO_BINSTALL=0 mise install cargo:nonexistent-crate-12345@1.0.0" \
+  "0: Failed to install cargo:nonexistent-crate-12345@1.0.0: cargo exited with non-zero status: exit code 101"
+
+# Test 3: GitHub repository not found - check for error format with full chain
+echo "Test 3: GitHub repository not found"
+# Without GitHub credentials (see Part 1, Test 3).
+local_assert_fail "$NO_GITHUB_CREDENTIALS mise install github:nonexistent-org/nonexistent-repo@latest" \
+  "0: Failed to install github:nonexistent-org/nonexistent-repo@latest: GitHub repository nonexistent-org/nonexistent-repo not found (404 from mise-versions.jdx.dev"
+
+# Test 4: Multiple tool failures - check for error format
+echo "Test 4: Multiple tool failures"
+local_assert_fail "mise install tiny@999.999.999 jq@999.999.999" \
+  "0: Failed to install aqua:jqlang/jq@999.999.999: GitHub release jqlang/jq@jq-999.999.999 not found (404 from mise-versions.jdx.dev)"
+
+# Test 5: Error with backtrace enabled - check for proper backtrace format
+echo "Test 5: Error with backtrace"
+local_assert_fail "RUST_BACKTRACE=1 mise install core:node@invalid-version" \
+  "0: Failed to install core:node@invalid-version: HTTP status client error (404 Not Found) for url (https://nodejs.org/dist/vinvalid-version/node-vinvalid-version.tar.gz)"
+
+# Test 6: Invalid configuration (treated as version strings)
+echo "Test 6: Invalid configuration"
+cat >test_invalid_config.toml <<EOF
+[tools]
+node = "this is not valid"
+python = ["also", "not", "valid"]
+EOF
+
+local_assert_fail "MISE_CONFIG_FILE=test_invalid_config.toml mise install" \
+  "0: Failed to install tools: core:node@this is not valid, core:python@also, core:python@not, core:python@valid"
+rm -f test_invalid_config.toml
+
+echo ""
+echo "All error display tests passed!"

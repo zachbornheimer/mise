@@ -1,0 +1,251 @@
+use std::sync::Arc;
+
+use eyre::{Result, bail};
+use itertools::Itertools;
+use serde_json::json;
+
+use crate::config::Config;
+use crate::file::display_path;
+use crate::task::Task;
+use crate::task::TaskOutputsExt;
+use crate::task::task_fetcher::TaskFetcher;
+use crate::task::task_history::TaskHistory;
+use crate::task::task_source_checker::task_cwd;
+use crate::ui::info;
+
+/// Show a task's definition
+///
+/// Prints the task's description, source file, dependencies, sources, outputs,
+/// run commands, environment, and usage spec. `--json` prints the full
+/// definition.
+#[derive(Debug, usage_rs::Args)]
+#[usage(
+    example(
+        r###"mise tasks info test"###,
+        help = r###"Show the test task and the file that defines it"###
+    ),
+    example(
+        r###"mise tasks info test --json"###,
+        help = r###"Get the full structured task definition"###
+    )
+)]
+pub(super) struct TasksInfo {
+    /// Name of the task to get information about
+    #[usage(verbatim_doc_comment)]
+    pub task: String,
+    /// Output in JSON format
+    #[usage(short = 'J', long, verbatim_doc_comment)]
+    pub json: bool,
+}
+
+impl TasksInfo {
+    pub(super) async fn run(self) -> Result<()> {
+        let config = Config::get().await?;
+
+        let task = find_task(&config, &self.task).await?;
+
+        if let Some(task) = task {
+            // Resolve remote task files before displaying task info
+            let mut tasks = vec![task.clone()];
+            // always pass no_cache=false as the command doesn't take no-cache argument
+            // MISE_TASK_REMOTE_NO_CACHE env var is still respected if set
+            TaskFetcher::for_inspection(false)
+                .fetch_tasks(&config, &mut tasks)
+                .await?;
+            let task = &tasks[0];
+
+            if self.json {
+                self.display_json(&config, task).await?;
+            } else {
+                self.display(&config, task).await?;
+            }
+        } else {
+            bail!(
+                "Task not found: {}, use `mise tasks ls --all --hidden` to list all tasks",
+                self.task
+            );
+        }
+
+        Ok(())
+    }
+
+    async fn display(&self, config: &Arc<Config>, task: &Task) -> Result<()> {
+        info::inline_section("Task", &task.display_name)?;
+        if !task.aliases.is_empty() {
+            info::inline_section("Aliases", task.aliases.join(", "))?;
+        }
+        if !task.tags.is_empty() {
+            info::inline_section("Tags", task.tags.join(", "))?;
+        }
+        info::inline_section("Description", &task.description)?;
+        info::inline_section(
+            "Source",
+            task.config_sources().iter().map(display_path).join(", "),
+        )?;
+        let mut properties = vec![];
+        if task.hide {
+            properties.push("hide");
+        }
+        if task.raw {
+            properties.push("raw");
+        }
+        if task.interactive {
+            properties.push("interactive");
+        }
+        if !properties.is_empty() {
+            info::inline_section("Properties", properties.join(", "))?;
+        }
+        if !task.depends.is_empty() {
+            info::inline_section("Depends on", task.depends.iter().join(", "))?;
+        }
+        if !task.depends_post.is_empty() {
+            info::inline_section("Depends post", task.depends_post.iter().join(", "))?;
+        }
+        match &task.daemons {
+            Some(crate::task::TaskDaemons::All(true)) => {
+                info::inline_section("Daemons", "all")?;
+            }
+            Some(crate::task::TaskDaemons::One(name)) => {
+                info::inline_section("Daemons", name)?;
+            }
+            Some(crate::task::TaskDaemons::Names(names)) if !names.is_empty() => {
+                info::inline_section("Daemons", names.join(", "))?;
+            }
+            _ => {}
+        }
+        let secrets = task.secret_names();
+        if !secrets.is_empty() {
+            info::inline_section("Secrets", secrets.join(", "))?;
+        }
+        if let Some(dir) = &task.dir {
+            info::inline_section("Directory", display_path(dir))?;
+        }
+        if let Some(skip_if) = &task.skip_if {
+            info::inline_section("Skip if", skip_if)?;
+        }
+        if let Some(lock) = crate::task::task_lock::describe(task) {
+            info::inline_section("Lock", lock)?;
+        }
+        if !task.sources.is_empty() {
+            info::inline_section("Sources", task.sources.join(", "))?;
+        }
+        let root = task_cwd(task, config).await?;
+        let outputs = task.outputs.paths(task, &root);
+        if !outputs.is_empty() {
+            info::inline_section("Outputs", outputs.join(", "))?;
+        }
+        if task.cache.as_ref().is_some_and(|cache| cache.enabled) {
+            info::inline_section("Cache", "enabled")?;
+        }
+        if let Some(file) = &task.file {
+            info::inline_section("File", display_path(file))?;
+        }
+        let run = task.run();
+        if !run.is_empty() {
+            info::section("Run", run.iter().map(|e| e.to_string()).join("\n"))?;
+        }
+        if !task.env.is_empty() || !task.overlay_env.is_empty() {
+            let env_display = task
+                .env
+                .0
+                .iter()
+                .chain(task.overlay_env.iter().map(|(d, _)| d))
+                .map(|directive| directive.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            info::section("Environment Variables", env_display)?;
+        }
+        let spec = usage_spec(config, task).await?;
+        if !spec.is_empty() {
+            info::section("Usage Spec", &spec)?;
+        }
+        Ok(())
+    }
+
+    async fn display_json(&self, config: &Arc<Config>, task: &Task) -> Result<()> {
+        let spec = usage_spec(config, task).await?;
+        let resolved_dir = task
+            .dir(config)
+            .await?
+            .map(|p| p.to_string_lossy().to_string());
+        // Reading history is best effort: a missing or unreadable record is no history.
+        let history = TaskHistory::for_config(config)
+            .summaries(Some(&task.name))
+            .ok()
+            .and_then(|summaries| summaries.into_iter().next());
+        let o = json!({
+            "name": task.display_name,
+            "aliases": task.aliases,
+            "tags": task.tags,
+            "description": task.description,
+            "source": task.config_source.to_string_lossy(),
+            "config_sources": task
+                .config_sources()
+                .iter()
+                .map(|source| source.to_string_lossy())
+                .collect::<Vec<_>>(),
+            "depends": task.depends,
+            "depends_post": task.depends_post,
+            "daemons": task.daemons,
+            "secrets": task.secret_names(),
+            "wait_for": task.wait_for,
+            "env": task
+                .env
+                .0
+                .iter()
+                .chain(task.overlay_env.iter().map(|(d, _)| d))
+                .map(|d| d.to_string())
+                .collect::<Vec<_>>(),
+            "dir": resolved_dir,
+            "hide": task.hide,
+            "raw": task.raw,
+            "interactive": task.interactive,
+            "sources": task.sources,
+            "outputs": task.outputs,
+            "cache": task.cache.clone().unwrap_or_default(),
+            "shell": task.shell,
+            "skip_if": task.skip_if,
+            "lock": task.lock,
+            "quiet": task.quiet,
+            "silent": task.silent,
+            "tools": task.tools,
+            "run": task.run(),
+            "file": task.file.as_ref().map(|p| p.to_string_lossy()),
+            "usage_spec": spec,
+            "history": history,
+        });
+        miseprintln!("{}", serde_json::to_string_pretty(&o)?);
+        Ok(())
+    }
+}
+
+/// A `git::` file left unfetched (experimental is off) can't be read, so its usage comes from
+/// the task's TOML metadata alone.
+async fn usage_spec(config: &Arc<Config>, task: &Task) -> Result<usage::Spec> {
+    match TaskFetcher::toml_only(task) {
+        Some(toml_only) => toml_only.parse_usage_spec_for_display(config).await,
+        None => task.parse_usage_spec_for_display(config).await,
+    }
+}
+
+/// Looks a task up the way `mise tasks info <name>` does, including colon
+/// expansion and monorepo patterns.
+pub(super) async fn find_task(config: &Arc<Config>, name: &str) -> Result<Option<Task>> {
+    let task_name = crate::task::expand_colon_task_syntax(name, config)?;
+
+    let tasks = if task_name.starts_with("//") {
+        let ctx = crate::task::TaskLoadContext::from_pattern(&task_name);
+        config.tasks_with_context(Some(&ctx)).await?
+    } else if crate::task::is_workspace_project_task(&task_name) {
+        let ctx = crate::task::TaskLoadContext::all();
+        config.tasks_with_context(Some(&ctx)).await?
+    } else {
+        config.tasks().await?
+    };
+
+    let tasks_with_aliases = crate::task::build_task_ref_map(tasks.iter());
+
+    use crate::task::GetMatchingExt;
+    let matching = tasks_with_aliases.get_matching(&task_name).ok();
+    Ok(matching.and_then(|m| m.first().cloned().cloned()).cloned())
+}

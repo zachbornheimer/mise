@@ -1,0 +1,1615 @@
+//! Portable, wheel-only Python tool environments. uv owns dependency resolution;
+//! mise owns lock persistence, interpreter selection, and executable exposure.
+use super::*;
+use crate::lockfile::{GraphRef, NativeGraph, UvLock};
+use eyre::WrapErr;
+use std::path::PathBuf;
+
+const MIN_UV_VERSION: &str = "0.12.10";
+const PROJECT_NAME: &str = "mise-pypi-tool-environment";
+
+/// How `uv lock` and the `uv sync` replay are told which interpreter to use.
+#[derive(Clone)]
+enum LockPython {
+    /// An interpreter that is already installed.
+    Installed(OsString),
+    /// A selected version that is not installed; uv fetches it when `download` is set.
+    Version { request: OsString, download: bool },
+    /// Nothing mise knows about: uv searches on its own and never downloads.
+    Unspecified,
+}
+
+impl LockPython {
+    fn apply(&self, cmd: CmdLineRunner<'static>) -> CmdLineRunner<'static> {
+        match self {
+            Self::Installed(python) => cmd.arg("--python").arg(python).arg("--no-python-downloads"),
+            Self::Version { request, download } => {
+                let cmd = cmd.arg("--python").arg(request);
+                if *download {
+                    cmd
+                } else {
+                    cmd.arg("--no-python-downloads")
+                }
+            }
+            Self::Unspecified => cmd.arg("--no-python-downloads"),
+        }
+    }
+}
+/// Whether a Python version is a release number uv can be asked for, as opposed to
+/// `system`, a path or a ref.
+fn is_plain_python_release(version: &str) -> bool {
+    let mut parts = version.split('.');
+    parts.clone().count() <= 3
+        && parts.all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+const DISCOVER_SCRIPTS: &str = r#"
+import importlib.metadata
+import json
+import os
+from pathlib import Path
+import sys
+
+packages = json.loads(sys.argv[1])
+scripts = Path(sys.argv[2]).resolve()
+# Tests preset IS_WINDOWS to exercise the Windows branch anywhere.
+windows = globals().get("IS_WINDOWS", os.name == "nt")
+names = set()
+for package in packages:
+    try:
+        distribution = importlib.metadata.distribution(package)
+    except importlib.metadata.PackageNotFoundError:
+        # Requirements with inactive environment markers are part of the
+        # portable lock but are intentionally absent from this environment.
+        continue
+    for entry in distribution.entry_points:
+        if entry.group not in ("console_scripts", "gui_scripts"):
+            continue
+        if not windows:
+            names.add(entry.name)
+            continue
+        # uv drops a trailing ".py" from the entry point name before adding
+        # the executable suffix; pip keeps it. Take whichever launcher exists.
+        candidates = [f"{entry.name}.exe"]
+        if entry.name.endswith(".py"):
+            candidates.append(f"{entry.name[:-3]}.exe")
+        names.add(next((c for c in candidates if (scripts / c).is_file()), candidates[0]))
+    names.update(
+        path.name
+        for file in distribution.files or []
+        if (path := Path(distribution.locate_file(file)).resolve()).parent == scripts
+        and path.is_file()
+    )
+print(json.dumps(sorted(names)))
+"#;
+
+impl PIPXBackend {
+    pub(crate) fn uv_lock_allowed(&self, tv: &ToolVersion) -> bool {
+        Settings::get().pypi.uvx != Some(false)
+            && !PipxOptions::new(&tv.request.options()).uvx_disabled()
+            && matches!(
+                self.tool_name().parse::<PipxRequest>(),
+                Ok(PipxRequest::Pypi(_))
+            )
+    }
+
+    /// The lockfile revision a request's uv graph requirement comes from.
+    ///
+    /// A version resolved from the lockfile answers to its entry, graph or
+    /// not. An upgrade resolves outside the lockfile, so it only inherits the
+    /// requirement from a recorded graph: version-only entries (which an
+    /// upgrade of a graphless global tool writes) must stay version-only. A
+    /// bump or a hand-edited pin rewrites the selector itself, which needs
+    /// `replaced_entry_lockfile_version`.
+    pub(crate) fn uv_lockfile_version(
+        &self,
+        config: &Config,
+        tv: &ToolVersion,
+    ) -> Result<Option<u32>> {
+        if tv.resolved_from_lockfile() {
+            return crate::lockfile::version_for_request(config, &tv.request);
+        }
+        match Self::graph_lockfile_version(config, &tv.request)? {
+            Some(revision) => Ok(Some(revision)),
+            None => Self::replaced_entry_lockfile_version(config, &tv.request),
+        }
+    }
+
+    /// The lockfile revision of the entry matching `request`, if that entry
+    /// records a dependency graph.
+    fn graph_lockfile_version(config: &Config, request: &ToolRequest) -> Result<Option<u32>> {
+        if !Settings::get().lockfile_enabled() {
+            return Ok(None);
+        }
+        match request.lockfile_resolve(config)? {
+            Some(entry) if entry.uv.is_some() => {
+                crate::lockfile::version_for_request(config, request)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The lockfile revision of the global entry this request replaces.
+    ///
+    /// An install that resolves outside the lockfile — an `upgrade --bump`
+    /// or a hand-edited pin — replaces the owning global config's entry for
+    /// the backend, whatever version that entry records. The replacement
+    /// inherits the entry's requirement only when the backend has exactly
+    /// one entry and that entry carries a uv graph; with several entries a
+    /// graph-bearing sibling must never lend its graph to a version-only
+    /// request, so ambiguity stays version-only, and graph creation for
+    /// global tools is never implicit.
+    fn replaced_entry_lockfile_version(
+        config: &Config,
+        request: &ToolRequest,
+    ) -> Result<Option<u32>> {
+        if !Settings::get().lockfile_enabled() {
+            return Ok(None);
+        }
+        let Some(owner) = request.lockfile_source() else {
+            return Ok(None);
+        };
+        if !owner.path().is_some_and(crate::config::is_global_config) {
+            return Ok(None);
+        }
+        let lockfile = request.read_lockfile(config)?;
+        let mut entries = lockfile
+            .tools_for(&request.ba().short)
+            .into_iter()
+            .flatten();
+        let (Some(entry), None) = (entries.next(), entries.next()) else {
+            // Zero or several predecessors: stay version-only rather than guess.
+            return Ok(None);
+        };
+        if entry.uv.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(
+            lockfile.entry_lockfile_version(&request.ba().short, entry),
+        ))
+    }
+
+    pub(crate) fn uv_lock_options_supported(&self, tv: &ToolVersion) -> bool {
+        let raw = tv.request.options();
+        let opts = PipxOptions::new(&raw);
+        [opts.uvx_args(), opts.pipx_args()]
+            .into_iter()
+            .flatten()
+            .all(|s| s.trim().is_empty())
+    }
+
+    pub(crate) fn validate_lock_options(&self, tv: &ToolVersion) -> Result<()> {
+        if !self.uv_lock_options_supported(tv) {
+            bail!(
+                "{} dependency locking does not support uvx_args or pipx_args",
+                self.ba.short
+            );
+        }
+        if !self.uv_lock_allowed(tv) {
+            bail!(
+                "{} has a uv dependency graph; use uv with a PyPI package to replay it",
+                self.ba.short
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether installing `tv` needs a uv dependency graph: its lockfile
+    /// revision records one, or a new resolution would create one.
+    pub(crate) fn uv_graph_required(&self, config: &Config, tv: &ToolVersion) -> Result<bool> {
+        // Index sources reach uv only through the graph's project file, so a tool
+        // that sets them has no version-only install.
+        if PipxOptions::new(&tv.request.options()).has_index_options() {
+            return Ok(true);
+        }
+        let revision = self.uv_lockfile_version(config, tv)?;
+        Ok(revision.is_some_and(|v| v >= 2)
+            || (!tv.resolved_from_lockfile() && Settings::get().lockfile_creation_enabled()))
+    }
+
+    /// Why `--locked` refuses a version whose required uv graph is missing.
+    pub(crate) fn missing_uv_graph_error(&self, tv: &ToolVersion) -> eyre::Report {
+        self.validate_lock_options(tv).err().unwrap_or_else(|| {
+            eyre::eyre!(
+                "{} has no uv dependency graph; run `mise lock`",
+                self.ba.short
+            )
+        })
+    }
+
+    async fn lock_uv_program(&self, config: &Arc<Config>) -> Result<PathBuf> {
+        let uv = self.spawnable_dependency(config, None, "uv").await
+            .ok_or_else(|| eyre!("Python dependency locks require uv >= {MIN_UV_VERSION}; install it with `mise use uv`"))?;
+        let output = CmdLineRunner::new(&uv).arg("--version").read().await?;
+        let version = output
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| eyre!("cannot determine uv version"))?;
+        if semver_is_older_than(version, MIN_UV_VERSION).unwrap_or(true) {
+            bail!("Python dependency locks require uv >= {MIN_UV_VERSION}");
+        }
+        Ok(uv)
+    }
+
+    /// The version of the project's own `python` as uv can request it, when the
+    /// configuration names one that is a plain release number (`3.12`, `3.12.4`).
+    async fn configured_python_request(&self, config: &Arc<Config>) -> Option<String> {
+        let ts = self
+            .dependency_toolset_of(config, Some("python"))
+            .await
+            .ok()?;
+        let (_, python) = ts
+            .list_current_versions()
+            .into_iter()
+            .find(|(_, tv)| tv.ba().short == "python")?;
+        is_plain_python_release(&python.version).then_some(python.version)
+    }
+
+    async fn configured_python_identity(&self, config: &Arc<Config>) -> Option<String> {
+        // Resolving a version that has a uv graph ends up here, and `pipx` and `uv` can be
+        // such versions too: resolving them as well would never end once they depend on
+        // each other. Only python is needed.
+        let ts = self
+            .dependency_toolset_of(config, Some("python"))
+            .await
+            .ok()?;
+        let (_, python) = ts
+            .list_current_versions()
+            .into_iter()
+            .find(|(_, tv)| tv.ba().short == "python")?;
+        Some(format!(
+            "{}:{}:{}",
+            python.ba().full(),
+            python.version,
+            Self::python_installation_identity(&python)
+        ))
+    }
+
+    /// Which installation of Python an environment was built with. An installation of the
+    /// identity layout is named by what it answers (its identity digest): the directory it
+    /// sits in is only a hash of that, and its absolute path moves with the data directory.
+    /// A legacy installation is identified by its path, as it always was.
+    fn python_installation_identity(python: &ToolVersion) -> String {
+        let install_path = python.install_path();
+        if crate::install_layout::resolver::dir_name_of(&install_path).is_some()
+            && let Some(identity) = crate::install_layout::resolver::identity_of(python)
+        {
+            return identity.digest().to_base32();
+        }
+        install_path.display().to_string()
+    }
+
+    pub(crate) async fn restore_uv_python(&self, config: &Arc<Config>, tv: &mut ToolVersion) {
+        // A selected interpreter is part of this environment's identity, not a
+        // preference for whatever Python is active in the configuration. The
+        // provenance file is the only safe way to recover that identity before
+        // installation. In particular, do not let a later default-Python
+        // upgrade silently rebind a selected tool.
+        if PipxOptions::new(&tv.request.options())
+            .selected_python()
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            // Resolve the current selected-runtime request in its owner scope.
+            // A receipt describes the environment that exists on disk, but must
+            // not make a later lockfile pin silently keep that old runtime.
+            let dependency = super::selected_python_dependency(&tv.request)
+                .ok()
+                .flatten();
+            if let Some(dependency) = dependency
+                && let Ok(python) =
+                    ToolVersion::resolve(config, dependency, &Default::default()).await
+                && let Ok(backend) = python.backend()
+                && let Ok(Some(path)) = backend.which(config, &python, "python").await
+            {
+                tv.uv_python = Some((
+                    path,
+                    format!(
+                        "{}:{}:{}",
+                        python.ba().full(),
+                        python.version,
+                        Self::python_installation_identity(&python)
+                    ),
+                ));
+            }
+            return;
+        }
+        if let Some(identity) = self.configured_python_identity(config).await {
+            tv.uv_python = Some((PathBuf::new(), identity));
+            return;
+        }
+        Self::restore_system_uv_python(tv);
+    }
+
+    fn restore_system_uv_python(tv: &mut ToolVersion) {
+        // Installed environments remain usable without rediscovering a system Python.
+        let prefix = format!("{}~uv~", tv.version);
+        let roots = std::iter::once(tv.ba().installs_path().to_path_buf()).chain(
+            crate::env::shared_install_dirs()
+                .into_iter()
+                .map(|root| root.join(tv.ba().tool_dir_name())),
+        );
+        let mut paths: Vec<PathBuf> = vec![];
+        for entry in roots
+            .filter_map(|root| std::fs::read_dir(root).ok())
+            .flatten()
+            .flatten()
+        {
+            if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+                continue;
+            }
+            // Under the identity layout the entry is a version link, and the environment
+            // is in the installation that link names.
+            let path = entry.path();
+            paths.push(crate::install_layout::resolver::link_target(&path).unwrap_or(path));
+        }
+        // An installation whose version link is missing is still an installation.
+        paths.extend(
+            crate::install_layout::resolver::installs_of(tv.ba())
+                .into_iter()
+                .filter(|(name, _)| name.starts_with(&prefix))
+                .map(|(_, dir)| dir),
+        );
+        for (i, path) in paths.iter().enumerate() {
+            if paths[..i].iter().any(|seen| same_directory(seen, path)) {
+                continue;
+            }
+            let Ok(contents) = crate::file::read_to_string(path.join(".mise-uv/python.json"))
+            else {
+                continue;
+            };
+            let Ok(python) = serde_json::from_str::<(PathBuf, String)>(&contents) else {
+                continue;
+            };
+            let mut candidate = tv.clone();
+            candidate.uv_python = Some(python);
+            if same_directory(&candidate.install_path(), path) {
+                trace!(
+                    "restored the interpreter of {} from {}",
+                    tv.style(),
+                    path.display()
+                );
+                tv.uv_python = candidate.uv_python;
+                return;
+            }
+        }
+    }
+
+    pub(crate) async fn bind_uv_python(
+        &self,
+        ctx: &InstallContext,
+        tv: &mut ToolVersion,
+    ) -> Result<()> {
+        let raw = tv.request.options();
+        let selected = PipxOptions::new(&raw).selected_python()?;
+        let (python, identity) = if selected.is_some() {
+            let dependencies = ctx.dependency_context(&tv.request).await?;
+            let (_, selected) = dependencies
+                .toolset
+                .list_current_versions()
+                .into_iter()
+                .find(|(_, candidate)| candidate.ba().short == "python")
+                .ok_or_else(|| eyre!("missing selected Python dependency"))?;
+            let python = dependencies
+                .toolset
+                .which_bin_spawnable(&ctx.config, "python")
+                .await
+                .ok_or_else(|| eyre!("selected Python dependency is not executable"))?;
+            (
+                python,
+                format!(
+                    "{}:{}:{}",
+                    selected.ba().full(),
+                    selected.version,
+                    Self::python_installation_identity(&selected)
+                ),
+            )
+        } else {
+            let python = self.spawnable_dependency(&ctx.config, None, "python").await
+                .ok_or_else(|| eyre!("Python graph installs require an installed interpreter; add python to your config (`mise use python`) and run `mise install`"))?;
+            let identity = if let Some(identity) =
+                self.configured_python_identity(&ctx.config).await
+            {
+                identity
+            } else {
+                CmdLineRunner::new(&python).args(["-I", "-c", "import sys, sysconfig; print((sys.implementation.name, sys.version_info[:2], sysconfig.get_config_var('SOABI'), sysconfig.get_platform()))"]).read().await?.trim().to_owned()
+            };
+            (python, identity)
+        };
+        tv.uv_python = Some((python, identity));
+        Ok(())
+    }
+
+    fn lock_requirement(&self, tv: &ToolVersion) -> Result<String> {
+        let PipxRequest::Pypi(package) = self.tool_name().parse()? else {
+            bail!("uv graph locking requires a PyPI package");
+        };
+        let raw = tv.request.options();
+        let opts = PipxOptions::new(&raw);
+        Ok(format!(
+            "{package}{}=={}",
+            opts.extras().map(|v| format!("[{v}]")).unwrap_or_default(),
+            tv.version
+        ))
+    }
+
+    fn lock_requirements(&self, tv: &ToolVersion) -> Result<Vec<String>> {
+        let raw = tv.request.options();
+        let opts = PipxOptions::new(&raw);
+        let mut requirements = vec![self.lock_requirement(tv)?];
+        requirements.extend(opts.with()?);
+        requirements.extend(opts.expose()?);
+        // uv applies a source to direct dependencies only, and rejects one for
+        // anything else, so name the mistake before uv does.
+        let direct = requirements
+            .iter()
+            .filter_map(|requirement| PipxOptions::requirement_package_name(requirement))
+            .map(super::normalize_package_name)
+            .collect::<Vec<_>>();
+        for (normalized, (package, _)) in opts.sources()? {
+            if !direct.contains(&normalized) {
+                bail!(
+                    "source {package} is not the tool or one of its `with` or `expose` requirements"
+                );
+            }
+        }
+        Ok(requirements)
+    }
+
+    async fn uv_lock_command(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+        uv: &Path,
+        project: &Path,
+    ) -> Result<CmdLineRunner<'static>> {
+        let registry = self.get_registry_url(config).await?;
+        let index = uv_index_url(&registry)?;
+        let mut cmd = CmdLineRunner::new(uv)
+            .current_dir(project)
+            .envs(config.env().await?)
+            .env_values(tv.install_env())
+            .env_remove("UV_PROJECT")
+            .env_remove("UV_WORKING_DIR")
+            .env_remove("UV_PROJECT_ENVIRONMENT")
+            .env_remove("VIRTUAL_ENV");
+        let raw = tv.request.options();
+        let default_index = uv_index_url(&global_registry_url())?;
+        cmd = if PipxOptions::new(&raw).registry_index_priority()? && index != default_index {
+            // The registry is searched first and the global index (PyPI unless
+            // `pypi.registry_url` says otherwise) only for projects the registry does
+            // not host. `first-index` takes each project from the first index that has
+            // it, so a project on the registry never comes from anywhere else, and it
+            // is pinned because `install_env` could otherwise pick `unsafe-best-match`.
+            // Extra indexes would be searched before the default index, so they and the
+            // deprecated spelling of the default index are dropped to keep that order.
+            cmd.env("UV_INDEX", index)
+                .env("UV_DEFAULT_INDEX", default_index)
+                .env("UV_INDEX_STRATEGY", "first-index")
+                .env_remove("UV_EXTRA_INDEX_URL")
+                .env_remove("UV_INDEX_URL")
+        } else {
+            // The registry replaces the default index, so every dependency has to
+            // come from it.
+            cmd.env("UV_DEFAULT_INDEX", index)
+        };
+        // The lock runs with `--no-config`, which also skips a `keyring-provider` in
+        // the user's uv.toml, so the setting that authenticates mise's own index
+        // requests has to reach uv here too.
+        if Settings::get().pypi.keyring_provider.as_deref() == Some("subprocess") {
+            cmd = cmd.env("UV_KEYRING_PROVIDER", "subprocess");
+        }
+        Ok(cmd)
+    }
+
+    /// The Python range a published release declares, or an empty string when it
+    /// declares none.
+    async fn release_python_requirement(
+        &self,
+        registry: &str,
+        package: &str,
+        version: &str,
+    ) -> Result<String> {
+        // JSON release metadata supplies the Python constraint without running a
+        // build backend. Simple-only indexes expose it on wheel links.
+        if registry.ends_with("/json") {
+            let url = registry.replace("{}", &format!("{package}/{version}"));
+            let (url, headers) = keyring::index_request(registry, &url).await?;
+            let metadata: Value = HTTP_FETCH.json_with_headers(url, &headers).await?;
+            Ok(metadata
+                .pointer("/info/requires_python")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_owned())
+        } else {
+            let (url, headers) =
+                keyring::index_request(registry, &registry.replace("{}", package)).await?;
+            let html = HTTP_FETCH.get_html_with_headers(url, &headers).await?;
+            simple_index_python_requirement(package, version, &html)
+        }
+    }
+
+    /// Keeps the release-age cutoff from rejecting the locked tool's own release
+    /// when its index does not date it.
+    ///
+    /// PEP 700 upload times are optional, and mise's version selection allows a
+    /// release it cannot date (`VersionInfo::filter_by_date`), while uv treats a
+    /// file without one as newer than any `--exclude-newer`. The two have to agree
+    /// for the version mise picked, or `mise lock` would choose a release its own
+    /// graph lock then rejects. Only that package is exempt: a dated release, or
+    /// a dependency, keeps the cutoff, and an undated dependency stays held back.
+    async fn uv_exempt_undated_release(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+    ) -> Vec<OsString> {
+        if tv.before_date.is_none() {
+            return vec![];
+        }
+        let Ok(PipxRequest::Pypi(package)) = self.tool_name().parse() else {
+            return vec![];
+        };
+        // A pinned prerelease is a valid selection whatever `prerelease` says, so
+        // list with prereleases included to find it.
+        let mut opts = tv.request.options();
+        opts.opts
+            .insert("prerelease".into(), toml::Value::String("true".into()));
+        let versions = match self
+            .list_remote_versions_with_info_with_selection_options(config, &opts, false)
+            .await
+        {
+            Ok(versions) => versions,
+            Err(err) => {
+                debug!(
+                    "cannot check whether {package} {} is dated: {err:#}",
+                    tv.version
+                );
+                return vec![];
+            }
+        };
+        let undated = versions
+            .iter()
+            .find(|v| v.version == tv.version)
+            .is_some_and(|v| v.created_at_timestamp().is_none());
+        if !undated {
+            return vec![];
+        }
+        debug!(
+            "{package} {} has no upload time; exempting it from the release-age cutoff",
+            tv.version
+        );
+        vec![
+            "--exclude-newer-package".into(),
+            format!("{package}=false").into(),
+        ]
+    }
+
+    /// The installed interpreter a tool's `python` option selects when none was bound
+    /// to the version: the lockfile may pin a patch release that is not installed
+    /// while another one matching the selector is, so look at the installed ones too.
+    async fn installed_selected_python(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+    ) -> Option<PathBuf> {
+        let dependency = super::selected_python_dependency(&tv.request)
+            .ok()
+            .flatten()?;
+        let unlocked = crate::toolset::ResolveOptions {
+            use_locked_version: false,
+            ..Default::default()
+        };
+        for opts in [Default::default(), unlocked] {
+            if let Ok(python) = ToolVersion::resolve(config, dependency.clone(), &opts).await
+                && let Ok(backend) = python.backend()
+                && let Ok(Some(path)) = backend.which(config, &python, "python").await
+            {
+                return Some(path);
+            }
+        }
+        None
+    }
+
+    /// The interpreter uv resolves and replays a graph against. An installed
+    /// interpreter is passed by path and never replaced. A selected Python that
+    /// is not installed yet is passed as its version, which uv may download for
+    /// the resolution alone: `mise lock` does not install tools, and a
+    /// download-free uv would otherwise skip the graph on a fresh checkout.
+    async fn lock_python(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+    ) -> Result<(LockPython, LockPython)> {
+        let bound = match &tv.uv_python {
+            Some((python, _)) if !python.as_os_str().is_empty() => Some(python.clone()),
+            _ => None,
+        };
+        if let Some(selector) = PipxOptions::new(&tv.request.options()).selected_python()? {
+            let bound = match bound {
+                Some(path) => Some(path),
+                None => self.installed_selected_python(config, tv).await,
+            };
+            let python = match bound {
+                Some(path) => LockPython::Installed(path.into()),
+                None => LockPython::Version {
+                    request: selector.request_version().into(),
+                    download: !Settings::get().offline(),
+                },
+            };
+            return Ok((python.clone(), python));
+        }
+        // Only mise's own Python is handed to `uv lock`, so a Python on PATH or a
+        // `UV_PYTHON` the user set still decides when mise has none. The replay
+        // always uses one, as install does.
+        let configured = match bound {
+            Some(path) => Some(path),
+            None => match self.dependency_toolset(config).await {
+                Ok(toolset) => toolset.which_bin_spawnable(config, "python").await,
+                Err(_) => None,
+            },
+        };
+        let replay = match &configured {
+            Some(path) => Some(path.clone()),
+            None => self.spawnable_dependency(config, None, "python").await,
+        };
+        let installed = |path: Option<PathBuf>| match path {
+            Some(path) => LockPython::Installed(path.into()),
+            None => LockPython::Unspecified,
+        };
+        // `replay` may be a Python found on PATH, which is the very thing to avoid here.
+        if configured.is_none()
+            && let Some(request) = self.configured_python_request(config).await
+        {
+            // The project asks for a Python that is not installed. Guessing from PATH
+            // would lock a graph for an unrelated interpreter, so let uv fetch the
+            // requested one for the resolution, as it does for a per-tool selector.
+            let python = LockPython::Version {
+                request: request.into(),
+                download: !Settings::get().offline(),
+            };
+            return Ok((python.clone(), python));
+        }
+        Ok((installed(configured), installed(replay)))
+    }
+
+    pub(crate) async fn resolve_uv_lock(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+    ) -> Result<GraphRef<UvLock>> {
+        self.validate_lock_options(tv)?;
+        let uv = self.lock_uv_program(config).await?;
+        let registry = self.get_registry_url(config).await?;
+        let requirements = self.lock_requirements(tv)?;
+        let sources = PipxOptions::new(&tv.request.options()).sources()?;
+        // A tool pinned to its own index is looked up there: its name must never
+        // reach the registry, which may not host it at all.
+        let root_registry = match sources.get(&super::normalize_package_name(&self.tool_name())) {
+            Some((_, index)) => {
+                let tool_options = tv.request.options();
+                let url = PipxOptions::new(&tool_options)
+                    .indexes()?
+                    .iter()
+                    .find(|table| table.get("name").and_then(toml::Value::as_str) == Some(index))
+                    .and_then(|table| table.get("url").and_then(toml::Value::as_str))
+                    .ok_or_else(|| eyre!("index {index} is not defined"))?
+                    .to_string();
+                format!("{}/{{}}/", url.trim_end_matches('/'))
+            }
+            None => registry.clone(),
+        };
+        let root_pinned = root_registry != registry;
+        let root_package = if root_pinned {
+            super::normalize_package_name(&self.tool_name())
+        } else {
+            self.tool_name()
+        };
+        let root = match self
+            .release_python_requirement(&root_registry, &root_package, &tv.version)
+            .await
+        {
+            Ok(root) => root,
+            // The index may need credentials that only uv reads (UV_INDEX_*), so the
+            // range is best-effort there; the `python` option narrows it by hand.
+            Err(err) if root_pinned => {
+                debug!("no requires-python from the pinned index: {err:#}");
+                String::new()
+            }
+            Err(err) => {
+                return Err(err).wrap_err_with(|| format!("failed to lock {}", self.ba.short));
+            }
+        };
+        let mut constraints = vec![">=3.8".to_string()];
+        if let Some(selector) = PipxOptions::new(&tv.request.options()).selected_python()? {
+            constraints.push(selector.requires_python());
+        }
+        constraints.extend(python_constraint(&root));
+        // In `priority` mode a pinned injection the registry does not host comes from
+        // the global index, so its release is looked up there too.
+        let fallback = (PipxOptions::new(&tv.request.options()).registry_index_priority()?
+            && uv_index_url(&registry)? != uv_index_url(&global_registry_url())?)
+        .then(global_registry_url);
+        // Everything in `with` and `expose` shares the sidecar's interpreter, so a
+        // pinned injection with a narrower floor narrows the whole project. uv
+        // spreads an unpinned requirement across the range by itself, and a marker
+        // can switch a requirement off for part of it, so neither one applies here.
+        for requirement in requirements.iter().skip(1) {
+            let Some((package, version)) = pinned_requirement(requirement) else {
+                continue;
+            };
+            // A package pinned to its own index is not looked up on the registry:
+            // that would send its name to an index that must never serve it.
+            if sources.contains_key(&super::normalize_package_name(package)) {
+                continue;
+            }
+            let mut release = self
+                .release_python_requirement(&registry, package, version)
+                .await;
+            // Only a registry that does not host the project falls through; one that
+            // hosts it with unreadable metadata is the index uv will take it from.
+            if let Err(err) = &release
+                && err.downcast_ref::<InconsistentPythonMetadata>().is_none()
+                && let Some(fallback) = &fallback
+            {
+                release = self
+                    .release_python_requirement(fallback, package, version)
+                    .await;
+            }
+            match release {
+                Ok(value) => constraints.extend(python_constraint(&value)),
+                // uv reports an unusable requirement far better than a partial
+                // lookup can, so an unreadable release just leaves the range alone.
+                Err(err) => debug!("no Python metadata for {requirement}: {err:#}"),
+            }
+        }
+        constraints.dedup();
+        let requires_python = constraints.join(",");
+        let mut project = toml::Table::new();
+        project.insert(
+            "project".into(),
+            toml::toml! {
+                name = PROJECT_NAME
+                version = "0.0.0"
+                requires-python = requires_python
+                dependencies = requirements
+            }
+            .into(),
+        );
+        if let Some(tool) = PipxOptions::new(&tv.request.options()).uv_project_tool()? {
+            project.insert("tool".into(), tool.into());
+        }
+        let temp = tempfile::tempdir()?;
+        crate::file::write(
+            temp.path().join("pyproject.toml"),
+            toml::to_string(&project)?,
+        )?;
+        // Resolve and replay against the interpreter the install will bind, not
+        // whichever Python uv happens to find on PATH.
+        let (lock_python, replay_python) = self.lock_python(config, tv).await?;
+        let mut cmd = self
+            .uv_lock_command(config, tv, &uv, temp.path())
+            .await?
+            .args(["lock", "--no-build", "--no-config"])
+            .args(Self::uv_exclude_newer_args(tv.before_date))
+            .args(self.uv_exempt_undated_release(config, tv).await);
+        cmd = lock_python.apply(cmd);
+        let raw = tv.request.options();
+        if let Some(value) = PipxOptions::new(&raw).dependency_prereleases()? {
+            cmd = cmd.args(["--prerelease", value]);
+        }
+        cmd.execute()?;
+        // `uv lock` resolves for every platform and interpreter, but the install
+        // replays the graph with `--no-build` on this one, so a graph that cannot
+        // be installed here must fail now instead of at the next `mise install`.
+        let replay = self
+            .uv_lock_command(config, tv, &uv, temp.path())
+            .await?
+            .args([
+                "sync",
+                "--frozen",
+                "--no-build",
+                "--no-config",
+                "--no-install-project",
+                "--dry-run",
+            ])
+            .env("UV_PROJECT_ENVIRONMENT", temp.path().join(".venv"))
+            .env_remove("UV_EXCLUDE_NEWER");
+        replay_python
+            .apply(replay)
+            .execute()
+            .wrap_err("the dependency graph cannot be installed without building distributions")?;
+        let graph_text = crate::file::read_to_string(temp.path().join("uv.lock"))?;
+        let graph: toml::Table = graph_text.parse()?;
+        if let Some(requires_python) = graph.get("requires-python") {
+            project
+                .get_mut("project")
+                .unwrap()
+                .as_table_mut()
+                .unwrap()
+                .insert("requires-python".into(), requires_python.clone());
+        }
+        let lock = UvLock {
+            project,
+            graph,
+            graph_text,
+        };
+        self.validate_uv_lock(tv, &lock)?;
+        Ok(lock.into())
+    }
+
+    pub(crate) fn validate_uv_lock(&self, tv: &ToolVersion, lock: &UvLock) -> Result<()> {
+        self.validate_lock_options(tv)?;
+        let project = lock
+            .project
+            .get("project")
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| eyre!("missing uv project"))?;
+        let expected = self
+            .lock_requirements(tv)?
+            .into_iter()
+            .map(toml::Value::String)
+            .collect::<Vec<_>>();
+        if project.get("dependencies").and_then(toml::Value::as_array) != Some(&expected)
+            || project.get("name").and_then(toml::Value::as_str) != Some(PROJECT_NAME)
+            || project.get("requires-python") != lock.graph.get("requires-python")
+            || lock.project.get("tool")
+                != PipxOptions::new(&tv.request.options())
+                    .uv_project_tool()?
+                    .map(toml::Value::Table)
+                    .as_ref()
+        {
+            bail!(
+                "Python lock does not match the requested tool; run `mise lock --bump {}`",
+                self.ba.short
+            );
+        }
+        let packages = lock
+            .graph
+            .get("package")
+            .and_then(toml::Value::as_array)
+            .ok_or_else(|| eyre!("missing uv packages"))?;
+        let mut root = false;
+        let mut virtual_root = false;
+        for package in packages {
+            let package = package
+                .as_table()
+                .ok_or_else(|| eyre!("invalid uv package"))?;
+            let name = package
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| eyre!("missing uv package name"))?;
+            let source = package
+                .get("source")
+                .and_then(toml::Value::as_table)
+                .ok_or_else(|| eyre!("missing uv package source"))?;
+            if name == PROJECT_NAME
+                && source.get("virtual").and_then(toml::Value::as_str) == Some(".")
+            {
+                let requirements = package
+                    .get("metadata")
+                    .and_then(|m| m.get("requires-dist"))
+                    .and_then(toml::Value::as_array)
+                    .ok_or_else(|| eyre!("missing uv root requirements"))?;
+                let raw = tv.request.options();
+                let extras = PipxOptions::new(&raw)
+                    .extras()
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(Self::normalize_package_name)
+                    .collect::<std::collections::BTreeSet<_>>();
+                let root_name = Self::normalize_package_name(&self.tool_name());
+                let root_specifier = format!("=={}", tv.version);
+                let root_requirement = requirements.iter().find(|requirement| {
+                    requirement.get("name").and_then(toml::Value::as_str)
+                        == Some(root_name.as_str())
+                        && requirement.get("specifier").and_then(toml::Value::as_str)
+                            == Some(root_specifier.as_str())
+                });
+                let locked_extras = root_requirement
+                    .and_then(|requirement| requirement.get("extras"))
+                    .and_then(toml::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(toml::Value::as_str)
+                    .map(|extra| Self::normalize_package_name(extra.trim()))
+                    .collect::<std::collections::BTreeSet<_>>();
+                if requirements.len() != expected.len()
+                    || root_requirement.is_none()
+                    || extras != locked_extras
+                {
+                    bail!(
+                        "uv graph root requirements do not match the requested package and extras"
+                    );
+                }
+                virtual_root = true;
+                continue;
+            }
+            if source.len() != 1 || !source.contains_key("registry") {
+                bail!("Python locks support registry wheels only");
+            }
+            if name == Self::normalize_package_name(&self.tool_name())
+                && package.get("version").and_then(toml::Value::as_str) == Some(&tv.version)
+            {
+                root = true;
+            }
+            let wheels = package
+                .get("wheels")
+                .and_then(toml::Value::as_array)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    eyre!("{name} has no published wheels; Python graph locks require wheels")
+                })?;
+            for wheel in wheels {
+                let hash = wheel
+                    .get("hash")
+                    .and_then(toml::Value::as_str)
+                    .and_then(|h| h.strip_prefix("sha256:"));
+                if !hash.is_some_and(|h| h.len() == 64 && h.bytes().all(|c| c.is_ascii_hexdigit()))
+                {
+                    bail!("{name} has a wheel without a SHA256 hash");
+                }
+            }
+        }
+        if !root || !virtual_root {
+            bail!("Python lock is missing the requested root package");
+        }
+        validate_portable_urls(&toml::Value::Table(lock.graph.clone()))?;
+        // No arbitrary project settings or build systems are accepted from a lockfile.
+        // The only other table is the `tool` one the tool's options generate, which
+        // was already compared with them above.
+        if lock.project.len() != 1 + usize::from(lock.project.contains_key("tool"))
+            || project.len() != 4
+        {
+            bail!("unsupported Python lock project settings");
+        }
+        Ok(())
+    }
+
+    pub(super) async fn install_uv_lock(
+        &self,
+        ctx: &InstallContext,
+        tv: &ToolVersion,
+    ) -> Result<()> {
+        let lock = tv
+            .uv_lock
+            .as_ref()
+            .ok_or_else(|| eyre!("missing uv lock"))?
+            .load()?;
+        self.validate_uv_lock(tv, lock)?;
+        let uv = self.lock_uv_program(&ctx.config).await?;
+        let (python, _) = tv.uv_python.as_ref().ok_or_else(|| {
+            eyre!(
+                "Python graph installs require an installed interpreter; add python to your config (`mise use python`) and run `mise install`"
+            )
+        })?;
+        let project = tv.install_path().join(".mise-uv");
+        crate::file::create_dir_all(&project)?;
+        crate::file::write(
+            project.join("python.json"),
+            serde_json::to_string(&tv.uv_python.as_ref().unwrap())?,
+        )?;
+        crate::file::write(
+            project.join("pyproject.toml"),
+            toml::to_string(&lock.project)?,
+        )?;
+        crate::file::write(project.join("uv.lock"), lock.graph_text()?)?;
+        ctx.pr
+            .set_message("installing frozen Python dependencies".to_owned());
+        self.uv_lock_command(&ctx.config, tv, &uv, &project)
+            .await?
+            .args([
+                "sync",
+                "--frozen",
+                "--no-build",
+                "--no-config",
+                "--no-python-downloads",
+                "--no-install-project",
+                "--python",
+            ])
+            .arg(python)
+            .env("UV_PROJECT_ENVIRONMENT", project.join(".venv"))
+            .env_remove("UV_EXCLUDE_NEWER")
+            .with_pr(ctx.pr.as_ref())
+            .execute()?;
+        let scripts = project
+            .join(".venv")
+            .join(if cfg!(windows) { "Scripts" } else { "bin" });
+        let python = scripts.join(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        });
+        let packages = self.locked_entry_point_packages(tv, lock)?;
+        let packages = serde_json::to_string(&packages)?;
+        let names = CmdLineRunner::new(python)
+            .args(["-I", "-c", DISCOVER_SCRIPTS, &packages])
+            .arg(&scripts)
+            .read()
+            .await?;
+        let names: Vec<String> = serde_json::from_str(names.trim())?;
+        if names.is_empty() {
+            bail!("{} exposes no executable scripts", self.ba.short);
+        }
+        let bin = tv.install_path().join("bin");
+        crate::file::create_dir_all(&bin)?;
+        for name in names {
+            if !crate::file::is_plain_file_name(&name) {
+                bail!("invalid Python entry point name");
+            }
+            crate::file::make_symlink_or_copy(&scripts.join(&name), &bin.join(&name))?;
+        }
+        Ok(())
+    }
+
+    fn locked_entry_point_packages(&self, tv: &ToolVersion, lock: &UvLock) -> Result<Vec<String>> {
+        let root_requirement = lock
+            .project
+            .get("project")
+            .and_then(toml::Value::as_table)
+            .and_then(|project| project.get("dependencies"))
+            .and_then(toml::Value::as_array)
+            .and_then(|dependencies| dependencies.first())
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| eyre!("missing locked Python root requirement"))?;
+        let root = PipxOptions::requirement_package_name(root_requirement)
+            .ok_or_else(|| eyre!("invalid locked Python root requirement"))?;
+        let raw = tv.request.options();
+        let mut packages = vec![root.to_string()];
+        packages.extend(PipxOptions::new(&raw).exposed_package_names()?);
+        Ok(packages)
+    }
+}
+
+/// The package and exact version of a requirement that pins one release across the
+/// whole interpreter range, or `None` when the requirement cannot narrow it.
+fn pinned_requirement(requirement: &str) -> Option<(&str, &str)> {
+    let requirement = requirement.trim();
+    // A direct URL reference has no index entry to read metadata from.
+    if requirement.contains('@') {
+        return None;
+    }
+    let (specifier, marker) = requirement.split_once(';').unwrap_or((requirement, ""));
+    // A marker that tests the interpreter drops the requirement below its own
+    // floor, so the release cannot constrain the project. Every other marker
+    // leaves the requirement in place across the whole range.
+    if [
+        "python_version",
+        "python_full_version",
+        "implementation_version",
+    ]
+    .iter()
+    .any(|variable| marker.contains(variable))
+    {
+        return None;
+    }
+    let specifier = specifier.trim();
+    let package = PipxOptions::requirement_package_name(specifier)?;
+    let mut rest = specifier[package.len()..].trim_start();
+    if let Some(extras) = rest.strip_prefix('[') {
+        rest = extras.split_once(']')?.1.trim_start();
+    }
+    // One `==` clause pins the release whatever the surrounding clauses allow.
+    rest.split(',')
+        .filter_map(|clause| clause.trim().strip_prefix("=="))
+        .map(str::trim)
+        // `===` is arbitrary equality and a wildcard spans releases.
+        .find(|version| {
+            !version.is_empty()
+                && !version.starts_with('=')
+                && !version.contains('*')
+                && !version.contains(char::is_whitespace)
+        })
+        .map(|version| (package, version))
+}
+
+fn python_constraint(requires_python: &str) -> Option<String> {
+    let requires_python = requires_python.trim();
+    (!requires_python.is_empty()).then(|| requires_python.to_string())
+}
+
+fn simple_index_python_requirement(package: &str, version: &str, html: &str) -> Result<String> {
+    let links = regex!(r#"(?is)<a\s+(?:[^"'<>]|"[^"]*"|'[^']*')*>"#);
+    let href = regex!(r#"(?i)href\s*=\s*["']([^"']+)["']"#);
+    let python = regex!(r#"(?i)data-requires-python\s*=\s*["']([^"']*)["']"#);
+    let mut constraints = std::collections::BTreeSet::new();
+    for link in links.find_iter(html) {
+        let Some(url) = href.captures(link.as_str()).and_then(|c| c.get(1)) else {
+            continue;
+        };
+        let Some(filename) = PIPXBackend::distribution_filename_from_url(url.as_str()) else {
+            continue;
+        };
+        if PIPXBackend::version_from_distribution_filename(package, &filename).as_deref()
+            == Some(version)
+            && filename.ends_with(".whl")
+        {
+            let value = python
+                .captures(link.as_str())
+                .and_then(|c| c.get(1))
+                .map(|v| v.as_str())
+                .unwrap_or("");
+            constraints.insert(
+                value
+                    .replace("&gt;", ">")
+                    .replace("&lt;", "<")
+                    .replace("&amp;", "&"),
+            );
+        }
+    }
+    if constraints.len() != 1 {
+        return Err(InconsistentPythonMetadata(package.to_string()).into());
+    }
+    Ok(constraints.into_iter().next().unwrap())
+}
+
+/// An index hosts the project, but its wheels of the release do not agree on (or do not
+/// include) a Python requirement. Distinct from a project the index does not host.
+#[derive(Debug)]
+struct InconsistentPythonMetadata(String);
+
+impl std::fmt::Display for InconsistentPythonMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "package {} requires consistent Python metadata on published wheels to generate a portable lock",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for InconsistentPythonMetadata {}
+
+/// The `pypi.registry_url` setting, PyPI unless set: the index every tool without its own
+/// `registry_url` uses.
+fn global_registry_url() -> String {
+    Settings::get()
+        .pypi
+        .registry_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_REGISTRY_URL.to_string())
+}
+
+pub(super) fn uv_index_url(registry: &str) -> Result<String> {
+    let base = registry.split("{}").next().unwrap_or(registry);
+    let mut url = url::Url::parse(base)?;
+    if url
+        .host_str()
+        .is_some_and(|host| host == "pypi.org" || host.ends_with(".pypi.org"))
+    {
+        url.set_path("/simple/");
+    } else {
+        let path = url.path().trim_end_matches('/');
+        // A JSON API at `<root>/pypi/{}/json` serves its simple index at `<root>/simple/`.
+        let path = if registry.ends_with("/json") {
+            path.strip_suffix("/pypi").unwrap_or(path)
+        } else {
+            path
+        };
+        let path = path.trim_end_matches("/simple");
+        url.set_path(&format!("{path}/simple/"));
+    }
+    Ok(url.into())
+}
+
+/// Whether two paths name one directory: the same path, or the same place once links
+/// (a version link, a symlinked home) are followed.
+fn same_directory(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a == b
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+fn validate_portable_urls(value: &toml::Value) -> Result<()> {
+    match value {
+        toml::Value::String(s) if s.contains("://") => {
+            let url = url::Url::parse(s)?;
+            if !matches!(url.scheme(), "https" | "http")
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+            {
+                bail!(
+                    "Python locks require credential-free HTTP artifact URLs; configure authentication outside the lockfile"
+                );
+            }
+        }
+        toml::Value::Table(t) => {
+            for value in t.values() {
+                validate_portable_urls(value)?;
+            }
+        }
+        toml::Value::Array(a) => {
+            for value in a {
+                validate_portable_urls(value)?;
+            }
+        }
+        _ => (),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::toolset::ToolSource;
+
+    /// Runs `DISCOVER_SCRIPTS` as if on Windows against a fake distribution
+    /// whose entry points are `entry_points` and whose `Scripts` directory holds
+    /// `launchers`. Returns `None` when no system Python is available.
+    fn windows_discovery(entry_points: &[&str], launchers: &[&str]) -> Option<Vec<String>> {
+        let python = which::which(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python3"
+        })
+        .ok()?;
+        let temp = tempfile::tempdir().unwrap();
+        let site = temp.path().join("site");
+        let scripts = temp.path().join("Scripts");
+        let dist_info = site.join("demo-1.0.dist-info");
+        crate::file::create_dir_all(&dist_info).unwrap();
+        crate::file::create_dir_all(&scripts).unwrap();
+        crate::file::write(
+            dist_info.join("METADATA"),
+            "Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n",
+        )
+        .unwrap();
+        let entries: String = entry_points
+            .iter()
+            .map(|name| format!("{name} = demo:main\n"))
+            .collect();
+        crate::file::write(
+            dist_info.join("entry_points.txt"),
+            format!("[console_scripts]\n{entries}"),
+        )
+        .unwrap();
+        for launcher in launchers {
+            crate::file::write(scripts.join(launcher), "").unwrap();
+        }
+        let wrapper = format!(
+            "import sys\nsys.path.insert(0, sys.argv[3])\nsys.argv = sys.argv[:3]\nexec({DISCOVER_SCRIPTS:?}, {{'IS_WINDOWS': True}})\n"
+        );
+        let output = std::process::Command::new(python)
+            .args(["-c", &wrapper, "[\"demo\"]"])
+            .arg(&scripts)
+            .arg(&site)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        Some(serde_json::from_slice(&output.stdout).unwrap())
+    }
+
+    #[test]
+    fn windows_discovery_finds_the_launcher_that_exists() {
+        for (launchers, expected) in [
+            (&["demo-diff.exe"][..], "demo-diff.exe"),
+            (&["demo-diff.py.exe"][..], "demo-diff.py.exe"),
+        ] {
+            let Some(names) = windows_discovery(&["demo-diff.py"], launchers) else {
+                return;
+            };
+            assert_eq!(names, [expected]);
+        }
+        let Some(names) = windows_discovery(&["demo"], &["demo.exe"]) else {
+            return;
+        };
+        assert_eq!(names, ["demo.exe"]);
+    }
+
+    #[test]
+    fn system_environment_discovery_needs_no_interpreter_and_matches_graph() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut ba = BackendArg::from("pypi:demo");
+        ba.set_installs_path(temp.path().to_path_buf());
+        let request = ToolRequest::new(Arc::new(ba), "1.0.0", ToolSource::Argument).unwrap();
+        let mut installed = ToolVersion::new(request, "1.0.0".into());
+        installed.uv_lock = Some(fixture().2.into());
+        installed.uv_python = Some((
+            PathBuf::from("/missing/python"),
+            "cpython-3.12-platform".into(),
+        ));
+        let project = installed.install_path().join(".mise-uv");
+        crate::file::create_dir_all(&project).unwrap();
+        crate::file::write(
+            project.join("python.json"),
+            serde_json::to_string(installed.uv_python.as_ref().unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut resolved = installed.clone();
+        resolved.uv_python = None;
+        PIPXBackend::restore_system_uv_python(&mut resolved);
+        assert_eq!(resolved.uv_python, installed.uv_python);
+        assert_eq!(resolved.install_path(), installed.install_path());
+        resolved.uv_python = None;
+        let mut changed = resolved.uv_lock.as_ref().unwrap().load().unwrap().clone();
+        changed.graph.insert("revision".into(), 99.into());
+        resolved.uv_lock = Some(changed.into());
+        PIPXBackend::restore_system_uv_python(&mut resolved);
+        assert!(resolved.uv_python.is_none());
+    }
+
+    fn fixture() -> (PIPXBackend, ToolVersion, UvLock) {
+        let request = ToolRequest::new(
+            Arc::new(BackendArg::from("pypi:demo")),
+            "1.0.0",
+            ToolSource::Argument,
+        )
+        .unwrap();
+        let tv = ToolVersion::new(request, "1.0.0".into());
+        let backend = PIPXBackend::from_arg(tv.ba().clone());
+        let project = toml::toml! {
+            [project]
+            name = "mise-pypi-tool-environment"
+            version = "0.0.0"
+            requires-python = ">=3.10"
+            dependencies = ["demo==1.0.0"]
+        };
+        let graph: toml::Table = format!(
+            r#"
+version = 1
+revision = 3
+requires-python = ">=3.10"
+[[package]]
+name = "demo"
+version = "1.0.0"
+source = {{ registry = "https://pypi.org/simple/" }}
+wheels = [{{ url = "https://example.org/demo.whl", hash = "sha256:{}" }}]
+[[package]]
+name = "mise-pypi-tool-environment"
+version = "0.0.0"
+source = {{ virtual = "." }}
+dependencies = [{{ name = "demo" }}]
+[package.metadata]
+requires-dist = [{{ name = "demo", specifier = "==1.0.0" }}]
+"#,
+            "a".repeat(64)
+        )
+        .parse()
+        .unwrap();
+        (
+            backend,
+            tv,
+            UvLock {
+                project,
+                graph,
+                graph_text: String::new(),
+            },
+        )
+    }
+
+    #[test]
+    fn extras_validation_trims_and_normalizes_names() {
+        let (backend, mut tv, mut lock) = fixture();
+        let mut options = tv.request.options();
+        options.opts.insert("extras".into(), "postgres, S_3".into());
+        tv.request.set_options(options);
+        lock.project
+            .get_mut("project")
+            .unwrap()
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "dependencies".into(),
+                vec![toml::Value::String(backend.lock_requirement(&tv).unwrap())].into(),
+            );
+        let packages = lock
+            .graph
+            .get_mut("package")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        let requirement = packages[1]
+            .get_mut("metadata")
+            .unwrap()
+            .get_mut("requires-dist")
+            .unwrap()
+            .as_array_mut()
+            .unwrap();
+        requirement[0].as_table_mut().unwrap().insert(
+            "extras".into(),
+            vec![
+                toml::Value::String("postgres".into()),
+                toml::Value::String("s-3".into()),
+            ]
+            .into(),
+        );
+        backend.validate_uv_lock(&tv, &lock).unwrap();
+    }
+
+    #[test]
+    fn only_exact_pins_outside_interpreter_markers_narrow_the_range() {
+        for (requirement, pinned) in [
+            ("demo==1.0.0", Some(("demo", "1.0.0"))),
+            ("demo == 1.0.0", Some(("demo", "1.0.0"))),
+            ("demo[extra,other]==1.0.0", Some(("demo", "1.0.0"))),
+            ("  demo==1.0+local  ", Some(("demo", "1.0+local"))),
+            // A surrounding clause cannot widen what `==` already pinned.
+            ("demo==1.0.0,!=1.0.1", Some(("demo", "1.0.0"))),
+            ("demo>=1.0.0,==1.0.0", Some(("demo", "1.0.0"))),
+            // A marker on anything but the interpreter keeps the requirement
+            // active across the whole range.
+            (
+                "demo==1.0.0; sys_platform == 'linux'",
+                Some(("demo", "1.0.0")),
+            ),
+            // uv resolves these across the range on its own.
+            ("demo", None),
+            ("demo>=1.0.0", None),
+            ("demo==1.0.*", None),
+            ("demo===1.0.0", None),
+            // The interpreter marker drops this below its own floor, so the
+            // release's requirement is not the project's.
+            ("demo==1.0.0; python_version < '3.10'", None),
+            ("demo==1.0.0; python_full_version >= '3.12.1'", None),
+            // There is no index entry to read metadata from.
+            (
+                "demo @ https://example.org/demo-1.0.0-py3-none-any.whl",
+                None,
+            ),
+        ] {
+            assert_eq!(pinned_requirement(requirement), pinned, "{requirement}");
+        }
+    }
+
+    #[test]
+    fn simple_index_python_requirement_preserves_quoted_angle_brackets() {
+        for requirement in [">=3.10", "&gt;=3.10"] {
+            for quote in ['"', '\''] {
+                let html = format!(
+                    "<a href=\"demo-1.0%2Blocal-py3-none-any.whl\" data-requires-python={quote}{requirement}{quote}>wheel</a>"
+                );
+                assert_eq!(
+                    simple_index_python_requirement("demo", "1.0+local", &html).unwrap(),
+                    ">=3.10"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_release_metadata_is_not_a_missing_project() {
+        let html = "<a href=\"demo-1.0-py3-none-any.whl\" data-requires-python=\">=3.10\">a</a>\
+                    <a href=\"demo-1.0-py2-none-any.whl\" data-requires-python=\">=3.11\">b</a>";
+        let err = simple_index_python_requirement("demo", "1.0", html).unwrap_err();
+        assert!(err.downcast_ref::<InconsistentPythonMetadata>().is_some());
+    }
+
+    #[test]
+    fn uv_indexes_preserve_private_registry_paths() {
+        for (registry, index) in [
+            ("https://pypi.org/pypi/{}/json", "https://pypi.org/simple/"),
+            (
+                "https://test.pypi.org/pypi/{}/json",
+                "https://test.pypi.org/simple/",
+            ),
+            (
+                "https://notpypi.org/mirror/pypi/{}/json",
+                "https://notpypi.org/mirror/simple/",
+            ),
+            (
+                "https://packages.example.com/pypi/{}/json",
+                "https://packages.example.com/simple/",
+            ),
+            (
+                "https://artifactory.example.com/artifactory/api/pypi/pypi-remote/pypi/{}/json",
+                "https://artifactory.example.com/artifactory/api/pypi/pypi-remote/simple/",
+            ),
+            (
+                "https://packages.example.com/api/{}/json",
+                "https://packages.example.com/api/simple/",
+            ),
+            (
+                "https://packages.example.com/pypi/simple/{}/",
+                "https://packages.example.com/pypi/simple/",
+            ),
+        ] {
+            assert_eq!(uv_index_url(registry).unwrap(), index);
+        }
+        let filename = PIPXBackend::distribution_filename_from_url(
+            "https://example.com/demo-1.0%2Blocal-py3-none-any.whl#sha256=abc",
+        )
+        .unwrap();
+        assert_eq!(
+            PIPXBackend::version_from_distribution_filename("demo", &filename).as_deref(),
+            Some("1.0+local")
+        );
+    }
+
+    #[test]
+    fn uv_lock_rejects_changed_root_and_unhashed_wheels() {
+        let (backend, tv, lock) = fixture();
+        backend.validate_uv_lock(&tv, &lock).unwrap();
+        let mut wrong = lock.clone();
+        wrong.project["project"]["dependencies"] =
+            toml::Value::Array(vec!["another==1.0.0".into()]);
+        assert!(backend.validate_uv_lock(&tv, &wrong).is_err());
+        let mut unhashed = lock.clone();
+        unhashed.graph["package"].as_array_mut().unwrap()[0]["wheels"]
+            .as_array_mut()
+            .unwrap()[0]
+            .as_table_mut()
+            .unwrap()
+            .remove("hash");
+        assert!(backend.validate_uv_lock(&tv, &unhashed).is_err());
+        let mut source_only = lock;
+        source_only.graph["package"].as_array_mut().unwrap()[0]
+            .as_table_mut()
+            .unwrap()
+            .remove("wheels");
+        assert!(backend.validate_uv_lock(&tv, &source_only).is_err());
+    }
+
+    #[test]
+    fn locked_entry_points_use_the_distribution_name() {
+        let (backend, tv, mut lock) = fixture();
+        lock.project["project"]["dependencies"] =
+            toml::Value::Array(vec!["azure-cli==1.0.0".into()]);
+        assert_eq!(
+            backend.locked_entry_point_packages(&tv, &lock).unwrap(),
+            ["azure-cli"]
+        );
+    }
+
+    #[test]
+    fn uv_lock_identity_preserves_native_markers_and_ignores_key_order() {
+        let (_, _, mut lock) = fixture();
+        lock.graph.insert(
+            "resolution-markers".into(),
+            vec![
+                "python_full_version < '3.12'",
+                "python_full_version >= '3.12'",
+            ]
+            .into(),
+        );
+        let serialized = toml::to_string(&lock).unwrap();
+        let reloaded: UvLock = toml::from_str(&serialized).unwrap();
+        assert_eq!(lock, reloaded);
+        assert_eq!(
+            GraphRef::from(lock.clone()).identity(),
+            GraphRef::from(reloaded).identity()
+        );
+        let mut changed = lock.clone();
+        changed.graph.insert(
+            "resolution-markers".into(),
+            vec!["python_full_version < '3.13'"].into(),
+        );
+        assert_ne!(
+            GraphRef::from(lock).identity(),
+            GraphRef::from(changed).identity()
+        );
+    }
+
+    #[test]
+    fn plain_python_releases() {
+        for version in ["3", "3.12", "3.12.4"] {
+            assert!(is_plain_python_release(version), "{version}");
+        }
+        for version in [
+            "",
+            "system",
+            "3.12.4.1",
+            "3.13t",
+            "3..2",
+            "ref:main",
+            "/usr/bin/python",
+        ] {
+            assert!(!is_plain_python_release(version), "{version}");
+        }
+    }
+
+    #[test]
+    fn uv_lock_rejects_credentials_and_local_sources() {
+        for url in [
+            "https://user:password@example.org/file.whl",
+            "https://example.org/file.whl?token=secret",
+            "file:///tmp/tool.whl",
+        ] {
+            assert!(validate_portable_urls(&url.into()).is_err());
+        }
+    }
+}

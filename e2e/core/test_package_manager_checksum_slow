@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+
+mise settings set idiomatic_version_file_enable_tools "bun,pnpm,yarn"
+
+cat >mise.toml <<'EOF'
+[tools]
+node = "24"
+
+[tool_alias]
+yarn = "aqua:yarnpkg/berry"
+EOF
+
+cat >package.json <<'EOF'
+{
+  "packageManager": "pnpm@10.15.0+sha224.00000000000000000000000000000000000000000000000000000000"
+}
+EOF
+
+assert_fail mise install
+
+cat >package.json <<'EOF'
+{
+  "packageManager": "pnpm@10.15.0+sha224.88208eb7c2e7de6ed534fa298248dee656723116995eda4b508fd0c9"
+}
+EOF
+
+assert "mise x -- pnpm --version" "10.15.0"
+
+# The checksum forces npm:pnpm for its own request only. The install manifest
+# must not record that as the tool's backend, or every later pnpm request
+# (even a newer pnpm without a checksum) would install from npm too.
+assert_not_contains "cat $MISE_DATA_DIR/installs/pnpm/.mise.backend.toml" "explicit_backend = true"
+cat >package.json <<'EOF'
+{
+  "packageManager": "pnpm@10.15.0"
+}
+EOF
+assert "mise tool pnpm --backend" "aqua:pnpm/pnpm"
+
+# A manifest an earlier mise wrote for a checksum install still pinned the
+# backend as explicit. It is read as the registry's choice again.
+cat >"$MISE_DATA_DIR/installs/pnpm/.mise.backend.toml" <<'EOF'
+short = "pnpm"
+full = "npm:pnpm"
+explicit_backend = true
+EOF
+assert "mise tool pnpm --backend" "aqua:pnpm/pnpm"
+
+cat >mise.lock <<EOF
+$LOCKFILE_HEADER
+
+[[tools.yarn]]
+version = "4.14.1"
+backend = "aqua:yarnpkg/berry"
+EOF
+
+cat >package.json <<'EOF'
+{
+  "packageManager": "yarn@4.14.1+sha224.00000000000000000000000000000000000000000000000000000000"
+}
+EOF
+
+assert_fail mise install
+
+cat >package.json <<'EOF'
+{
+  "packageManager": "yarn@4.14.1+sha224.88b7a7244bbd9040380c417f7eb556d85c67640b651f113cb4c72113"
+}
+EOF
+
+assert "mise x -- yarn --version" "4.14.1"
+
+cat >package.json <<'EOF'
+{
+  "devEngines": {
+    "runtime": {
+      "name": "bun",
+      "version": "1.3.14"
+    }
+  },
+  "packageManager": "bun@1.3.14+sha224.00000000000000000000000000000000000000000000000000000000"
+}
+EOF
+
+assert_fail mise install
+
+cat >package.json <<'EOF'
+{
+  "devEngines": {
+    "runtime": {
+      "name": "bun",
+      "version": "1.3.14"
+    }
+  },
+  "packageManager": "bun@1.3.14+sha224.f9bc5e43d5833c794213050a0e428787c253a62a8be1ba47d0a03bf0"
+}
+EOF
+
+assert "mise x -- bun --version" "1.3.14"

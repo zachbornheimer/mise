@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Test that unconfigured Aqua SLSA provenance is skipped
+
+set -euo pipefail
+
+export MISE_EXPERIMENTAL=1
+export MISE_AQUA_SLSA=true
+export MISE_AQUA_COSIGN=false
+
+echo "=== Testing Aqua SLSA Without Signer Metadata ==="
+
+# Sops has an SLSA provenance source, but no expected signer metadata.
+echo "Installing sops without an SLSA signer identity..."
+
+# Capture installation output to verify SLSA is skipped.
+output=$(mise install --verbose aqua:getsops/sops@3.9.0 2>&1)
+echo "$output"
+
+if echo "$output" | grep -q "verify slsa"; then
+  echo "SLSA verification ran without a configured signer identity"
+  exit 1
+fi
+
+# Verify the tool works
+assert_contains "mise x aqua:getsops/sops@3.9.0 -- sops --version" "3.9.0"
+echo "✓ sops installed and working correctly"
+
+# Cleanup
+mise uninstall aqua:getsops/sops@3.9.0 || true
+
+echo ""
+echo "=== Unconfigured Aqua SLSA Was Skipped ✓ ==="
+
+echo "=== Testing Aqua SLSA With A Signer ==="
+
+# slsa-github-generator signs every release with one identity, so only the
+# certificate's source ref says which release the provenance was built from.
+# mise checks it against the version's tag (v3.9.0 here).
+cat <<'EOF_CONFIG' >mise.toml
+[tools."aqua:getsops/sops"]
+version = "3.9.0"
+slsa_signer_identity = "https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@refs/tags/v2.0.0"
+slsa_signer_issuer = "https://token.actions.githubusercontent.com"
+EOF_CONFIG
+assert_contains "mise install --verbose 2>&1" "SLSA provenance verified"
+assert_contains "mise x -- sops --version" "3.9.0"
+
+# An install from the lockfile takes the tag from the locked URL instead.
+export MISE_LOCKFILE=1
+detect_platform
+mise lock --platform "$MISE_PLATFORM"
+assert_contains "cat mise.lock" "provenance.slsa"
+mise uninstall aqua:getsops/sops@3.9.0
+MISE_LOCKED_VERIFY_PROVENANCE=1 mise install --locked --verbose >install.log 2>&1
+assert_contains "cat install.log" "SLSA provenance verified"
+assert_not_contains "cat install.log" "not checking the SLSA provenance"

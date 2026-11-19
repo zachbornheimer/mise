@@ -1,0 +1,1875 @@
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::args::{BackendArg, ToolArg};
+use crate::backend::pipx::PIPXBackend;
+use crate::config::{Config, Settings, SettingsExt, config_file};
+use crate::errors::split_install_result;
+use crate::file::display_path;
+use crate::install_before::{
+    effective_minimum_release_age_for_tool, format_hidden_release_details,
+    resolve_cli_minimum_release_age,
+};
+use crate::install_context::install_dependency_declarations;
+use crate::semver::split_version_prefix;
+use crate::toolset::is_outdated_version;
+use crate::toolset::outdated_info::OutdatedInfo;
+use crate::toolset::outdated_info::prefixed_latest_query;
+use crate::toolset::{
+    ConfigScope, InstallOptions, NeededVersions, ResolveOptions, ToolRequest, ToolSource,
+    ToolVersion, Toolset, ToolsetBuilder, get_versions_needed_by_tracked_configs_excluding_locks,
+    get_versions_needed_by_tracked_stubs,
+};
+use crate::toolset::{OutdatedSelection, OutdatedVersions};
+use crate::ui::install_progress::removal_progress;
+use crate::ui::multi_progress_report::MultiProgressReport;
+use crate::ui::progress_report::{ProgressIcon, SingleReport};
+use crate::{config, env, exit, runtime_symlinks, ui};
+use console::Term;
+use demand::DemandOption;
+use eyre::{Context, Result, eyre};
+use indexmap::IndexMap;
+use jiff::Timestamp;
+
+const MAX_OUT_OF_RANGE_UPDATES: usize = 5;
+
+#[derive(Debug, Clone)]
+struct ExplicitConfigBump {
+    path: PathBuf,
+    // Keep the original selector for matching successful resolutions even when pinning.
+    request: ToolRequest,
+    persisted_request: ToolRequest,
+}
+
+/// Upgrade outdated tools
+///
+/// By default, keeps the range in mise.toml: with `node = "20"`, it installs the
+/// newest 20.x release. Use `--bump` to upgrade to the newest release overall
+/// and update the version in mise.toml. Also updates mise.lock when lockfiles
+/// are enabled; see https://mise.jdx.dev/dev-tools/mise-lock.html
+///
+/// The version you upgraded from is removed after the `upgrade.prune_after`
+/// setting's grace period unless a tracked config or tool stub still uses it.
+/// Pass `--prune` to remove it now or `--no-prune` to keep it.
+#[derive(Debug, Default, usage_rs::Args)]
+#[usage(visible_alias = "up", verbatim_doc_comment, after_long_help = AFTER_LONG_HELP,
+    example(r###"mise upgrade"###, help = r###"Upgrade every configured tool within its range"###),
+    example(r###"mise upgrade node"###, help = r###"Upgrade only node"###),
+    example(r###"mise upgrade --bump"###, help = r###"Upgrade every tool to its newest release and update mise.toml"###),
+    example(r###"mise upgrade --dry-run"###, help = r###"Show what would be upgraded"###),
+    example(r###"mise upgrade --exclude go"###, help = r###"Upgrade everything except go"###),
+    example(r###"mise upgrade --interactive"###, help = r###"Choose tools from a menu"###),
+    example(r###"mise upgrade --global claude"###, help = r###"Upgrade claude within the global config's request, leaving project config alone"###))]
+pub(crate) struct Upgrade {
+    /// Tools to upgrade, such as node@20 python@3.10
+    ///
+    /// Upgrades every configured tool when omitted.
+    #[usage(value_name = "INSTALLED_TOOL@VERSION")]
+    tool: Vec<ToolArg>,
+
+    /// Upgrade past the configured range to the newest release, and update the config to match
+    ///
+    /// The config keeps its precision: `node = "20"` becomes `node = "22"`, and
+    /// `node = "20.0.0"` becomes `node = "22.1.0"`. If you name a version on the
+    /// command line (`node@latest`, `node@3`, or `node@prefix:3`), that request is
+    /// written instead; `mise upgrade node@latest --bump` writes `latest`. With
+    /// the `pin` setting on, a version request such as `node@3` is written as the
+    /// version it resolved to, and a bare `mise upgrade --bump` writes the
+    /// resolved version for every request that is not exact, such as `latest`
+    /// or `20`. Requests that do not come from a config file mise
+    /// can write, such as `MISE_NODE_VERSION`, are upgraded but not written.
+    #[usage(long, short = 'b')]
+    bump: bool,
+
+    /// With --bump, write the resolved version instead of keeping the request's precision
+    ///
+    /// `node = "latest"` and `node = "20"` become `node = "24.14.0"`. A named
+    /// request such as `node@3` is written as the version it resolved to. Make
+    /// this the default with the `pin` setting (`MISE_PIN=1`).
+    #[usage(long, requires = "bump")]
+    pin: bool,
+
+    /// Choose which tools to upgrade from a multiselect menu
+    #[usage(long, short, verbatim_doc_comment, conflicts = "tool")]
+    interactive: bool,
+
+    /// Number of jobs to run in parallel (default: the `jobs` setting)
+    #[usage(long, short, env = "MISE_JOBS", verbatim_doc_comment)]
+    jobs: Option<usize>,
+
+    /// Deprecated shorthand for --bump
+    #[usage(short = 'l', hide = true)]
+    legacy_bump: bool,
+
+    /// Show what would change without changing anything
+    #[usage(long, short = 'n', verbatim_doc_comment)]
+    dry_run: bool,
+
+    /// Tools to exclude from upgrading, such as go python
+    #[usage(long, short = 'x', value_name = "INSTALLED_TOOL", verbatim_doc_comment)]
+    exclude: Vec<ToolArg>,
+
+    /// Like --dry-run, but exit with code 1 if there are outdated tools
+    ///
+    /// Use it in scripts that check whether tools need upgrading.
+    #[usage(long)]
+    dry_run_code: bool,
+
+    /// Skip confirmation when installing missing plugin system dependencies.
+    /// Set internally by `mise bootstrap --yes`; not a user-facing flag.
+    #[usage(skip)]
+    yes: bool,
+
+    /// Only upgrade installed tools; leave missing ones to `mise install`.
+    /// Set internally by `mise bootstrap --upgrade`, which installs first, so a
+    /// dry run would otherwise preview each missing tool twice.
+    #[usage(skip)]
+    installed_only: bool,
+
+    /// Also upgrade installed tools that the current config does not request
+    #[usage(long, verbatim_doc_comment, conflicts = ["local", "no_global"])]
+    inactive: bool,
+
+    /// Only upgrade tools defined in the global config
+    ///
+    /// Upgrades the requests in the global and system config
+    /// (~/.config/mise/config.toml, /etc/mise/config.toml), even where a project
+    /// config or a `MISE_<TOOL>_VERSION` environment variable sets its own
+    /// version of the tool. It runs as if from outside any project, so project
+    /// config, lockfiles, and `[env]` are neither read nor changed. Tools that
+    /// update themselves, such as coding agents, run this instead of their own
+    /// updater; see https://mise.jdx.dev/dev-tools/self-updating-tools.html
+    #[usage(long, conflicts = ["local", "no_global", "inactive"])]
+    global: bool,
+
+    /// Deprecated alias for --no-global
+    ///
+    /// Removed in mise 2027.7.0.
+    #[usage(long, conflicts = ["global", "no_global"])]
+    local: bool,
+
+    /// Only upgrade tools defined in project config files
+    ///
+    /// Skips tools defined in the global config (~/.config/mise/config.toml) and
+    /// tools set through `MISE_<TOOL>_VERSION` environment variables.
+    #[usage(long, conflicts = ["global", "local"])]
+    no_global: bool,
+
+    /// Only upgrade to versions released before this date or older than this duration
+    ///
+    /// Supports absolute dates such as "2024-06-01" and relative durations such as
+    /// "90d" or "1y".
+    ///
+    /// Applies only to requests that can match several versions, such as "20" or
+    /// "latest". Exact versions such as "22.5.0" are not filtered.
+    #[usage(long, alias = "before")]
+    minimum_release_age: Option<String>,
+
+    /// Placeholder for future monorepo upgrades; `mise upgrade --monorepo` is not implemented yet.
+    #[usage(long, hide = true, verbatim_doc_comment)]
+    monorepo: bool,
+
+    /// Do not uninstall the versions that were upgraded away from
+    ///
+    /// The old version is left in place and is not scheduled for removal. Use this when
+    /// something outside mise points at the install directory.
+    ///
+    /// Set `upgrade.auto_prune = false` to make this the default.
+    #[usage(long, overrides = "prune")]
+    no_prune: bool,
+
+    /// Immediately uninstall the versions that were upgraded away from
+    ///
+    /// Use this to bypass `upgrade.prune_after`, or to override
+    /// `upgrade.auto_prune = false` for a single run.
+    #[usage(long, overrides = "no_prune")]
+    prune: bool,
+
+    /// Connect the install commands' stdin, stdout, and stderr to the terminal
+    ///
+    /// Implies `--jobs=1`.
+    #[usage(long, overrides = "jobs")]
+    raw: bool,
+
+    /// Upgrading a global tool for `auto_update` as it launches: read only
+    /// global config, and keep stdout, which belongs to the launched tool, clean.
+    #[usage(skip)]
+    for_auto_update: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PruneMode {
+    None,
+    Immediate,
+    Deferred(Duration),
+}
+
+impl Upgrade {
+    /// a bare `mise upgrade` (every configured tool within its range, no
+    /// `--bump`), as run by `mise bootstrap --upgrade`
+    pub(crate) fn new_bare(dry_run: bool, yes: bool) -> Self {
+        Self {
+            dry_run,
+            yes,
+            installed_only: true,
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn is_dry_run(&self) -> bool {
+        self.dry_run || self.dry_run_code
+    }
+
+    /// An `auto_update` launch shows only the install itself, not the lookups.
+    fn show_resolution_progress(&self) -> bool {
+        !self.is_dry_run() && !self.raw && !self.for_auto_update
+    }
+
+    /// How versions upgraded away from should be handled. Either flag wins over
+    /// the settings, and `overrides_with` makes the later flag win.
+    fn prune_mode(&self) -> Result<PruneMode> {
+        if self.prune {
+            return Ok(PruneMode::Immediate);
+        }
+        if self.no_prune || !Settings::get().upgrade.auto_prune {
+            return Ok(PruneMode::None);
+        }
+        Ok(PruneMode::Deferred(
+            Settings::get().upgrade_prune_after_duration()?,
+        ))
+    }
+
+    /// Toolsets in this upgrade's scope. An `auto_update` or `--global` upgrade
+    /// works on the global config's requests, so a `MISE_*_VERSION` in the
+    /// environment doesn't replace the request it was asked to upgrade.
+    /// Whether resolution leaves a lazy tool with nothing installed unresolved:
+    /// `auto_update` always does, and a bare upgrade does because it leaves that
+    /// tool alone. Naming a tool resolves it in full.
+    fn defers_missing_lazy(&self) -> bool {
+        self.for_auto_update || self.tool.is_empty()
+    }
+
+    fn toolset_builder(&self) -> ToolsetBuilder {
+        let builder = ToolsetBuilder::new().with_scope(self.scope());
+        let builder = if self.for_auto_update {
+            builder
+                .without_runtime_env()
+                .with_deferred_lazy_resolution_online()
+        } else if self.global {
+            builder.without_runtime_env()
+        } else {
+            builder
+        };
+        // A bare upgrade leaves a lazy tool with nothing installed alone, so it does
+        // not wait on that tool's remote version list either. Naming a tool resolves
+        // it in full.
+        if self.defers_missing_lazy() && !self.for_auto_update {
+            builder.with_deferred_lazy_resolution_online()
+        } else {
+            builder
+        }
+    }
+
+    /// A lazy tool with no version installed is waiting for its first run, so a
+    /// bare upgrade leaves it alone, as a bare `mise install` does, unless a tool
+    /// it upgrades depends on it. Naming the tool installs it, as `mise install
+    /// node` does. A tool left alone is not looked up at all, so a slow or
+    /// failing backend cannot hold up the upgrade. Returns the outdated tools
+    /// and the requests left alone, as configured, since `tool_request` may
+    /// already name the version it would move to.
+    async fn list_outdated_leaving_missing_lazy(
+        &self,
+        ts: &Toolset,
+        config: &Arc<Config>,
+        opts: &ResolveOptions,
+        filter_tools: Option<&[ToolArg]>,
+        exclude_tools: Option<&[ToolArg]>,
+    ) -> (OutdatedVersions, Vec<ToolRequest>) {
+        let mut unrun = if self.tool.is_empty() {
+            ts.list_current_versions()
+                .into_iter()
+                .map(|(_, tv)| tv)
+                .filter(ToolVersion::is_unrun_lazy)
+                .map(|tv| tv.request)
+                .collect::<Vec<_>>()
+        } else {
+            vec![]
+        };
+        let mut checked = ts
+            .list_outdated_versions_selecting(
+                config,
+                self.bump,
+                opts,
+                OutdatedSelection {
+                    filter_tools,
+                    exclude_tools,
+                    show_progress: self.show_resolution_progress(),
+                    select: &|tv| !unrun.contains(&tv.request),
+                },
+            )
+            .await;
+        // Put back what an upgraded tool depends on, and what that depends on.
+        let mut scanned = 0;
+        while scanned < checked.outdated.len() && !unrun.is_empty() {
+            let declarations =
+                install_dependency_declarations(&checked.outdated[scanned].tool_version.request);
+            scanned += 1;
+            let needed = unrun
+                .iter()
+                .filter(|request| declarations.matches(request.ba()))
+                .cloned()
+                .collect::<Vec<_>>();
+            if needed.is_empty() {
+                continue;
+            }
+            unrun.retain(|request| !needed.contains(request));
+            checked.extend(
+                ts.list_outdated_versions_selecting(
+                    config,
+                    self.bump,
+                    opts,
+                    OutdatedSelection {
+                        filter_tools,
+                        exclude_tools,
+                        show_progress: false,
+                        select: &|tv| needed.contains(&tv.request),
+                    },
+                )
+                .await,
+            );
+        }
+        (checked, unrun)
+    }
+
+    fn scope(&self) -> ConfigScope {
+        if self.for_auto_update || self.global {
+            ConfigScope::GlobalOnly
+        } else if self.local || self.no_global {
+            ConfigScope::LocalOnly
+        } else {
+            ConfigScope::All
+        }
+    }
+
+    pub(crate) async fn run(mut self) -> Result<()> {
+        if self.local {
+            deprecated_at!(
+                "2027.1.0",
+                "2027.7.0",
+                "cli.upgrade.local",
+                "`mise upgrade --local` is deprecated. Use `mise upgrade --no-global` instead."
+            );
+        }
+        if self.legacy_bump {
+            deprecated_at!(
+                "2026.8.5",
+                "2027.8.5",
+                "cli.upgrade.bump-l",
+                "`mise upgrade -l` is deprecated. Use `mise upgrade -b` or `mise upgrade --bump` instead."
+            );
+            self.bump = true;
+        }
+        if self.monorepo {
+            eyre::bail!("--monorepo is not supported by mise upgrade yet");
+        }
+        if self.global && super::tool_update::needs_global_scope() {
+            // Its own update would wait for the lock that update holds.
+            if !self.is_dry_run() && super::tool_update::inside_update() {
+                warn!("skipping `mise upgrade --global`: it runs inside another mise update");
+                return Ok(());
+            }
+            return super::tool_update::rerun_in_global_scope();
+        }
+        // Like an `auto_update` upgrade, a global one rewrites the global config
+        // and lockfile, so it waits for any other update and reads config after.
+        let _update_lock = (self.global && !self.is_dry_run())
+            .then(crate::tool_update::lock_for_update)
+            .transpose()?;
+        let mut config = if _update_lock.is_some() {
+            Config::reset().await?
+        } else {
+            Config::get().await?
+        };
+        let mut explicit_config_bumps = Vec::new();
+        if self.bump && !self.tool.is_empty() {
+            let effective = self.toolset_builder().build_unresolved(&config)?;
+            for tool in &self.tool {
+                let Some(request) = tool.tvr.as_ref() else {
+                    continue;
+                };
+                let Some((configured_ba, configured_request)) =
+                    effective_persistable_request(&effective, &tool.ba)
+                else {
+                    if let Some((_, versions)) = effective
+                        .versions
+                        .iter()
+                        .find(|(ba, _)| backend_args_match(ba, &tool.ba))
+                        && versions
+                            .requests
+                            .iter()
+                            .filter(|request| request.is_os_supported())
+                            .count()
+                            > 1
+                    {
+                        warn!("upgrading multiple versions with --bump is not yet supported");
+                    }
+                    let source = effective
+                        .versions
+                        .iter()
+                        .find(|(ba, _)| backend_args_match(ba, &tool.ba))
+                        .and_then(|(_, versions)| {
+                            versions
+                                .requests
+                                .iter()
+                                .find(|request| request.is_os_supported())
+                        })
+                        .map(|request| request.source().to_string())
+                        .unwrap_or_else(|| "no matching writable config source".to_string());
+                    warn!(
+                        "cannot persist explicit bump for {} from {}",
+                        tool.ba, source
+                    );
+                    continue;
+                };
+
+                let path = configured_request
+                    .source()
+                    .path()
+                    .expect("persistable request must have a path")
+                    .to_path_buf();
+                if let ToolRequest::Path { path, .. } = request
+                    && !path.exists()
+                {
+                    warn!(
+                        "cannot persist explicit bump for {} from nonexistent {}",
+                        tool.ba,
+                        display_path(path)
+                    );
+                    continue;
+                }
+                let request = ToolRequest::new_with_options(
+                    configured_ba.clone(),
+                    &request.version(),
+                    configured_request.without_registry_options().options(),
+                    configured_request.source().clone(),
+                )?;
+                explicit_config_bumps.push(ExplicitConfigBump {
+                    path,
+                    persisted_request: request.clone(),
+                    request,
+                });
+            }
+            explicit_config_bumps.retain(|bump| {
+                !self
+                    .exclude
+                    .iter()
+                    .any(|tool| backend_args_match(tool.ba.as_ref(), bump.request.ba()))
+            });
+        }
+        if !self.is_dry_run() && !self.for_auto_update && !Settings::get().generate_lockfiles() {
+            crate::lockfile::migrate_monorepo_lockfiles(&config, false)?;
+        }
+        let ts = self
+            .toolset_builder()
+            .with_resolution_progress(self.show_resolution_progress())
+            .with_args(&self.tool)
+            .build(&config)
+            .await?;
+        // Compute before_date once to ensure consistency when using relative durations
+        let before_date = self.get_before_date()?;
+        let opts = ResolveOptions {
+            use_locked_version: false,
+            latest_versions: true,
+            latest_versions_for_all_requests: false,
+            latest_versions_for_arguments_only: false,
+            resolve_rolling_channels: false,
+            prefer_exact_version: false,
+            before_date,
+            before_date_from_default: false,
+            filter_installed_versions_by_release_date: false,
+            offline: false,
+            refresh_remote_versions: false,
+            inactive: self.inactive,
+            outdated_release_urls: false,
+            warn_not_in_lockfile: true,
+            defer_missing_lazy_tools: false,
+            defer_missing_lazy_online: false,
+            keep_moved_alias_pins: false,
+            locked: false,
+        };
+        // Filter tools to check before doing expensive version lookups
+        let filter_tools = if !self.interactive && !self.tool.is_empty() {
+            Some(self.tool.as_slice())
+        } else {
+            None
+        };
+        let exclude_tools = if !self.exclude.is_empty() {
+            Some(self.exclude.as_slice())
+        } else {
+            None
+        };
+        // An explicit CLI selector is the target to persist, not merely a
+        // hint for the usual backend-latest bump. Resolve those requests
+        // against their own selector while retaining backend-latest bumping
+        // for bare tool arguments.
+        let explicit_filter_tools = self
+            .bump
+            .then(|| {
+                self.tool
+                    .iter()
+                    .filter(|tool| tool.tvr.is_some())
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .filter(|tools| !tools.is_empty())
+            .unwrap_or_default();
+        let (mut checked, left_alone) = if !explicit_filter_tools.is_empty() {
+            let mut explicit = ts
+                .list_outdated_versions_with_progress(
+                    &config,
+                    false,
+                    &opts,
+                    Some(&explicit_filter_tools),
+                    exclude_tools,
+                    self.show_resolution_progress(),
+                )
+                .await;
+            let bare_filter_tools = self
+                .tool
+                .iter()
+                .filter(|tool| tool.tvr.is_none())
+                .cloned()
+                .collect::<Vec<_>>();
+            if !bare_filter_tools.is_empty() {
+                explicit.extend(
+                    ts.list_outdated_versions_with_progress(
+                        &config,
+                        true,
+                        &opts,
+                        Some(&bare_filter_tools),
+                        exclude_tools,
+                        self.show_resolution_progress(),
+                    )
+                    .await,
+                );
+            }
+            (explicit, vec![])
+        } else {
+            self.list_outdated_leaving_missing_lazy(
+                &ts,
+                &config,
+                &opts,
+                filter_tools,
+                exclude_tools,
+            )
+            .await
+        };
+        let mut outdated = std::mem::take(&mut checked.outdated);
+        let pin = self.pin || Settings::get().pin;
+        // Naming a tool without a version (`mise upgrade node --bump --pin`) pins
+        // just that tool; a named version is handled as an explicit bump.
+        let pin_all = pin && self.bump && self.tool.iter().all(|tool| tool.tvr.is_none());
+        if pin {
+            if pin_all {
+                // With `pin` on, a bare `--bump` also records exact versions for
+                // requests that are not exact, such as `latest` or `20`.
+                for (_, tv) in ts.list_current_versions() {
+                    let ToolRequest::Version { version, .. } = &tv.request else {
+                        continue;
+                    };
+                    // A request with no version in it (`java = "zulu"`, `nightly`)
+                    // names a moving target, and the backend-wide latest need not
+                    // belong to it. Only `latest` is resolved without a version.
+                    if version != "latest" && !version.chars().any(|c| c.is_ascii_digit()) {
+                        continue;
+                    }
+                    if self
+                        .exclude
+                        .iter()
+                        .any(|tool| backend_args_match(tool.ba.as_ref(), tv.ba()))
+                        || !(self.tool.is_empty()
+                            || self
+                                .tool
+                                .iter()
+                                .any(|tool| backend_args_match(tool.ba.as_ref(), tv.ba())))
+                    {
+                        continue;
+                    }
+                    // Replacing a multi-entry tool would drop the entries for
+                    // other platforms, as the ordinary bump path also avoids.
+                    if ts
+                        .versions
+                        .iter()
+                        .any(|(ba, tvl)| backend_args_match(ba, tv.ba()) && tvl.requests.len() > 1)
+                    {
+                        continue;
+                    }
+                    let Some((_, configured)) = effective_persistable_request(&ts, tv.ba()) else {
+                        continue;
+                    };
+                    let Some(path) = configured.source().path() else {
+                        continue;
+                    };
+                    explicit_config_bumps.push(ExplicitConfigBump {
+                        path: path.to_path_buf(),
+                        persisted_request: configured.clone(),
+                        request: configured.clone(),
+                    });
+                }
+            }
+            for bump in &mut explicit_config_bumps {
+                let resolved = outdated
+                    .iter()
+                    .find(|o| {
+                        backend_args_match(o.tool_version.ba(), bump.request.ba())
+                            && o.tool_version.request.version() == bump.request.version()
+                    })
+                    .map(|o| o.latest.clone())
+                    .or_else(|| {
+                        ts.list_current_versions().into_iter().find_map(|(_, tv)| {
+                            (backend_args_match(tv.ba(), bump.request.ba())
+                                && tv.request.version() == bump.request.version())
+                            .then_some(tv.version)
+                        })
+                    });
+                if let Some(resolved) = resolved
+                    && let ToolRequest::Version { version, .. } = &mut bump.persisted_request
+                {
+                    *version = resolved;
+                }
+            }
+        }
+        if pin_all {
+            explicit_config_bumps
+                .retain(|bump| bump.persisted_request.version() != bump.request.version());
+            // The exact version is what gets written, so the precision-keeping
+            // bump must not also be applied or previewed.
+            for o in &mut outdated {
+                if explicit_config_bumps.iter().any(|bump| {
+                    backend_args_match(o.tool_version.ba(), bump.request.ba())
+                        && o.tool_version.request.version() == bump.request.version()
+                }) {
+                    o.bump = None;
+                }
+            }
+        }
+        if self.installed_only {
+            outdated.retain(|o| o.current.is_some());
+        }
+        if self.for_auto_update {
+            // Another version of the same tool can opt out: `auto_update` upgrades
+            // only the requests that enable it. It also only moves an installed
+            // version forward: a request with nothing installed is missing, not
+            // outdated, and installing it is for `mise install` or a lazy tool's
+            // first run, whichever updater (prompt, service, launch) asked.
+            outdated.retain(|o| {
+                o.current.is_some() && crate::tool_update::enabled(&o.tool_version.request)
+            });
+            if outdated.is_empty() {
+                // Nothing outdated can also mean a lookup failed and was only
+                // warned about. Check again so a failure isn't taken as "up to
+                // date" (which would clear the failure `mise doctor` reports).
+                for (_, tv) in ts.list_current_versions() {
+                    let requested = self
+                        .tool
+                        .iter()
+                        .any(|tool| backend_args_match(tool.ba.as_ref(), tv.ba()));
+                    if requested && crate::tool_update::enabled(&tv.request) {
+                        self.latest_for_upgrade(&config, &tv, &opts)
+                            .await
+                            .wrap_err_with(|| format!("checking {} for updates", tv.ba()))?;
+                    }
+                }
+                return Ok(());
+            }
+        }
+        if !self.for_auto_update {
+            self.warn_if_newer_versions_hidden_by_minimum_release_age(
+                &config,
+                &ts,
+                &opts,
+                filter_tools,
+                exclude_tools,
+                &left_alone,
+            )
+            .await;
+        }
+        if self.interactive && !outdated.is_empty() {
+            let offered = outdated
+                .iter()
+                .map(|o| o.tool_version.ba().clone())
+                .collect::<Vec<_>>();
+            outdated = self.get_interactive_tool_set(&outdated)?;
+            if pin_all {
+                // A tool that was not selected is not upgraded, so its config
+                // must not move to a version that is not installed.
+                explicit_config_bumps.retain(|bump| {
+                    let deselected = offered
+                        .iter()
+                        .any(|ba| backend_args_match(ba, bump.request.ba()))
+                        && !outdated
+                            .iter()
+                            .any(|o| backend_args_match(o.tool_version.ba(), bump.request.ba()));
+                    !deselected
+                });
+            }
+            // Pins for requests that were not offered still apply when nothing
+            // was selected, as they do when something was.
+            if outdated.is_empty() && (!pin_all || explicit_config_bumps.is_empty()) {
+                return Ok(());
+            }
+        }
+        if outdated.is_empty() {
+            let installed_explicit_config_bumps = explicit_config_bumps
+                .iter()
+                .filter(|bump| explicit_bump_is_installed(&ts, &config, bump))
+                .cloned()
+                .collect::<Vec<_>>();
+            let has_explicit_config_bumps = !installed_explicit_config_bumps.is_empty();
+            if has_explicit_config_bumps {
+                if self.is_dry_run() {
+                    print_explicit_config_bumps(&installed_explicit_config_bumps)?;
+                } else {
+                    apply_explicit_config_bumps(&installed_explicit_config_bumps).await?;
+                    config = Config::reset().await?;
+                    // Re-resolve without the old lockfile pin so a config-only
+                    // selector change updates the lockfile to the installed
+                    // version instead of preserving the stale entry.
+                    let ts = self
+                        .toolset_builder()
+                        .with_resolve_options(opts.clone())
+                        .build(&config)
+                        .await?;
+                    config::rebuild_shims_and_runtime_symlinks(
+                        &config,
+                        &ts,
+                        &[],
+                        crate::lockfile::LockfileUpdateMode::AllowLocked,
+                    )
+                    .await?;
+                    // The bump moved the active version without an install,
+                    // so nothing else relinks the skills.
+                    crate::packslip::auto_sync_skills(&config).await;
+                }
+            }
+            let bump_outdated = if self.bump {
+                Vec::new()
+            } else {
+                // The note only reports, and installs nothing, so a missing lazy tool
+                // is left out even when a reported tool depends on it.
+                let bumps = ts
+                    .list_outdated_versions_selecting(
+                        &config,
+                        true,
+                        &opts,
+                        OutdatedSelection {
+                            filter_tools,
+                            exclude_tools,
+                            show_progress: false,
+                            select: &|tv| !(self.tool.is_empty() && tv.is_unrun_lazy()),
+                        },
+                    )
+                    .await;
+                // A tool whose backend-wide lookup failed may be out of date too.
+                checked.unchecked.extend(bumps.unchecked);
+                // With `python = ["3.15", "3.14"]`, 3.15.2 is not news for the
+                // 3.14 entry: another entry of the same tool already uses it.
+                let current = ts.list_current_versions();
+                bumps
+                    .outdated
+                    .into_iter()
+                    .filter(|o| o.bump.is_some() && (!self.installed_only || o.current.is_some()))
+                    .filter(|o| {
+                        // Entries that differ in install-affecting options can
+                        // install into separate directories, so the newer
+                        // version must be the same installation.
+                        // Built fresh so no checksum or dependency graph of the
+                        // old release leaks into the identity of the new one.
+                        let latest =
+                            ToolVersion::new(o.tool_version.request.clone(), o.latest.clone());
+                        let latest_path = latest.install_path();
+                        !current.iter().any(|(_, tv)| {
+                            backend_args_match(tv.ba(), o.tool_version.ba())
+                                && tv.version == o.latest
+                                && tv.install_path() == latest_path
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if bump_outdated.is_empty() && !has_explicit_config_bumps {
+                // A tool whose check failed may still be out of date.
+                if checked.unchecked.is_empty() {
+                    info!("All tools are up to date");
+                }
+            } else if !bump_outdated.is_empty() {
+                let hidden = bump_outdated.len().saturating_sub(MAX_OUT_OF_RANGE_UPDATES);
+                let mut updates = bump_outdated
+                    .iter()
+                    .take(MAX_OUT_OF_RANGE_UPDATES)
+                    .map(|o| {
+                        let current = o.current.as_deref().unwrap_or("MISSING");
+                        format!("  {} {} → {} ({})", o.name, current, o.latest, o.source)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if hidden > 0 {
+                    updates.push_str(&format!("\n  … and {hidden} more"));
+                }
+                info!(
+                    "Newer versions are available but do not match the configured version ranges:\n{updates}\nRun `mise outdated --bump` to view all, or `mise upgrade --bump` to update the configuration and upgrade."
+                );
+            }
+        } else {
+            self.upgrade(&mut config, outdated, before_date, &explicit_config_bumps)
+                .await?;
+        }
+        checked.warn_unchecked();
+
+        Ok(())
+    }
+
+    async fn upgrade(
+        &self,
+        config: &mut Arc<Config>,
+        outdated: Vec<OutdatedInfo>,
+        before_date: Option<Timestamp>,
+        explicit_config_bumps: &[ExplicitConfigBump],
+    ) -> Result<()> {
+        let mpr = MultiProgressReport::get();
+        let prune_mode = self.prune_mode()?;
+        let mut ts = self
+            .toolset_builder()
+            .with_args(&self.tool)
+            .build(config)
+            .await?;
+
+        let mut parsed_config_files: IndexMap<PathBuf, Arc<dyn config_file::ConfigFile>> =
+            IndexMap::new();
+        let mut failed_config_files = HashSet::new();
+        let mut outdated_with_config_files = vec![];
+        for o in outdated.iter() {
+            if let (Some(path), Some(_bump)) = (o.source.path(), &o.bump)
+                && !o.source.is_mise_toml_daemon()
+            {
+                let cf = if let Some(cf) = parsed_config_files.get(path) {
+                    Some(Arc::clone(cf))
+                } else if failed_config_files.contains(path) {
+                    None
+                } else {
+                    match config_file::parse(path).await {
+                        Ok(cf) => {
+                            parsed_config_files.insert(path.to_path_buf(), Arc::clone(&cf));
+                            Some(cf)
+                        }
+                        Err(e) => {
+                            warn!("failed to parse {}: {e}", display_path(path));
+                            failed_config_files.insert(path.to_path_buf());
+                            None
+                        }
+                    }
+                };
+                if let Some(cf) = cf {
+                    outdated_with_config_files.push((o, cf));
+                }
+            }
+        }
+        let config_file_updates = outdated_with_config_files
+            .iter()
+            .filter_map(|(o, cf)| {
+                if let Ok(trs) = cf.to_tool_request_set()
+                    && let Some(versions) = trs.tools.get(o.tool_request.ba())
+                    && versions.len() != 1
+                {
+                    warn!("upgrading multiple versions with --bump is not yet supported");
+                    return None;
+                }
+                Some((*o, Arc::clone(cf)))
+            })
+            .collect::<Vec<_>>();
+
+        // Determine which old versions should be uninstalled after upgrade
+        // Skip uninstall when current == latest (channel-based versions that update in-place)
+        let to_remove: Vec<_> = if prune_mode == PruneMode::None {
+            vec![]
+        } else {
+            outdated
+                .iter()
+                // A tool excluded from pruning keeps its old versions, whichever
+                // way the upgrade would have removed them.
+                .filter(|o| !crate::toolset::is_excluded_from_pruning(o.tool_version.ba()))
+                .filter_map(|o| {
+                    o.current.as_ref().and_then(|current| {
+                        // Skip if current and latest version strings are identical
+                        // This handles channels like "nightly", "stable", "beta" that update in-place
+                        if &o.latest == current {
+                            return None;
+                        }
+                        Some((o, current.clone()))
+                    })
+                })
+                .collect()
+        };
+
+        if self.is_dry_run() {
+            for (o, current) in &to_remove {
+                match prune_mode {
+                    PruneMode::Immediate => {
+                        miseprintln!("Would uninstall {}@{}", o.name, current);
+                    }
+                    PruneMode::Deferred(_) => miseprintln!(
+                        "Would schedule {}@{} for pruning after {}",
+                        o.name,
+                        current,
+                        Settings::get().upgrade.prune_after
+                    ),
+                    PruneMode::None => unreachable!(),
+                }
+            }
+            for o in &outdated {
+                miseprintln!("Would install {}@{}", o.name, o.latest);
+            }
+            for (o, cf) in &config_file_updates {
+                miseprintln!(
+                    "Would bump {}@{} in {}",
+                    o.name,
+                    o.tool_request.version(),
+                    display_path(cf.get_path())
+                );
+            }
+            let mut planned_explicit_config_bumps = Vec::new();
+            for bump in explicit_config_bumps {
+                let pending = find_explicit_bump_outdated(&outdated, bump);
+                let eligible = explicit_bump_is_eligible(pending, bump, None, &ts, config);
+                if eligible {
+                    planned_explicit_config_bumps.push(bump.clone());
+                }
+            }
+            print_explicit_config_bumps(&planned_explicit_config_bumps)?;
+            if !self.bump {
+                use crate::toolset::outdated_info::compute_config_bumps;
+                let tool_versions: Vec<(String, String)> = self
+                    .tool
+                    .iter()
+                    .filter_map(|t| {
+                        t.tvr
+                            .as_ref()
+                            .map(|tvr| (t.ba.short.clone(), tvr.version()))
+                    })
+                    .collect();
+                let refs: Vec<(&str, &str)> = tool_versions
+                    .iter()
+                    .map(|(n, v)| (n.as_str(), v.as_str()))
+                    .collect();
+                let bumps = compute_config_bumps(config, &refs);
+                for bump in &bumps {
+                    miseprintln!(
+                        "Would update {} from {} to {} in {}",
+                        bump.tool_name,
+                        bump.old_version,
+                        bump.new_version,
+                        display_path(&bump.config_path)
+                    );
+                }
+            }
+            if self.dry_run_code {
+                return Err(exit::request(1));
+            }
+            return Ok(());
+        }
+
+        let opts = InstallOptions {
+            reason: "upgrade".to_string(),
+            hide_success_summary: true,
+            force: false,
+            jobs: self.jobs,
+            raw: self.raw,
+            resolve_options: ResolveOptions {
+                use_locked_version: false,
+                latest_versions: true,
+                latest_versions_for_all_requests: false,
+                latest_versions_for_arguments_only: false,
+                resolve_rolling_channels: false,
+                prefer_exact_version: false,
+                before_date,
+                before_date_from_default: false,
+                filter_installed_versions_by_release_date: false,
+                offline: false,
+                refresh_remote_versions: false,
+                inactive: self.inactive,
+                outdated_release_urls: false,
+                warn_not_in_lockfile: true,
+                defer_missing_lazy_tools: false,
+                defer_missing_lazy_online: false,
+                keep_moved_alias_pins: false,
+                locked: false,
+            },
+            // What resolves after the install leaves missing lazy tools alone, as the
+            // toolset builder did before it.
+            after_install_resolve: ResolveOptions {
+                defer_missing_lazy_tools: self.defers_missing_lazy(),
+                defer_missing_lazy_online: self.defers_missing_lazy(),
+                ..Default::default()
+            },
+            locked: false,
+            yes: self.yes || Settings::get().yes,
+            explicit_yes: self.yes || Settings::cli_yes(),
+            ..Default::default()
+        };
+
+        // Preserve the storage scope of an existing system install while upgrading it.
+        // Equal user/system roots classify as local, so they intentionally take the
+        // ordinary path and are never scanned or installed twice.
+        let (system_outdated, user_outdated): (Vec<_>, Vec<_>) =
+            outdated.iter().partition(|outdated| {
+                env::install_path_category(&outdated.tool_version.install_path())
+                    == env::InstallPathCategory::System
+            });
+        let user_requests = user_outdated
+            .into_iter()
+            .map(|outdated| outdated.tool_request.clone())
+            .collect::<Vec<_>>();
+        let system_requests = system_outdated
+            .into_iter()
+            .map(|outdated| outdated.tool_request.clone())
+            .collect::<Vec<_>>();
+
+        let mut successful_versions = vec![];
+        let mut install_errors = vec![];
+        if !user_requests.is_empty() {
+            let (installed, result) =
+                split_install_result(ts.install_all_versions(config, user_requests, &opts).await);
+            successful_versions.extend(installed);
+            if let Err(err) = result {
+                install_errors.push(err);
+            }
+        }
+        if !system_requests.is_empty() {
+            let system_opts = InstallOptions {
+                install_dir: Some(Settings::get().system_installs_dir().to_path_buf()),
+                ..opts.clone()
+            };
+            let (installed, result) = split_install_result(
+                ts.install_all_versions(config, system_requests, &system_opts)
+                    .await,
+            );
+            successful_versions.extend(installed);
+            if let Err(err) = result {
+                install_errors.push(err);
+            }
+        }
+        let install_error = if install_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(eyre!(
+                "{}",
+                install_errors
+                    .into_iter()
+                    .map(|err| format!("{err:#}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ))
+        };
+
+        // Installation has already changed disk state. Always report those results,
+        // even if updating config, pruning, or rebuilding links subsequently fails.
+        let post_install_result: Result<()> = async {
+            // Only update config files for tools that were successfully installed
+            let mut config_file_updates_by_path = IndexMap::new();
+            for (o, cf) in config_file_updates {
+                if successful_versions
+                    .iter()
+                    .any(|v| v.ba() == o.tool_version.ba())
+                {
+                    config_file_updates_by_path
+                        .entry(cf.get_path().to_path_buf())
+                        .or_insert_with(|| (cf, vec![]))
+                        .1
+                        .push(o);
+                }
+            }
+            let mut config_file_errors = vec![];
+            for (path, (cf, updates)) in config_file_updates_by_path {
+                let mut update_failed = false;
+                for o in updates {
+                    if let Err(e) =
+                        cf.replace_versions(o.tool_request.ba(), vec![o.tool_request.clone()])
+                    {
+                        config_file_errors.push(eyre!("Failed to update config for {}: {}", o.name, e));
+                        update_failed = true;
+                        break;
+                    }
+                }
+                if update_failed {
+                    continue;
+                }
+                if let Err(e) = cf.save() {
+                    config_file_errors.push(eyre!(
+                        "Failed to save config {}: {}",
+                        display_path(&path),
+                        e
+                    ));
+                }
+            }
+            let mut eligible_explicit_config_bumps = Vec::new();
+            for bump in explicit_config_bumps {
+                let pending = find_explicit_bump_outdated(&outdated, bump);
+                if explicit_bump_is_eligible(
+                    pending,
+                    bump,
+                    Some(&successful_versions),
+                    &ts,
+                    config,
+                )
+                {
+                    eligible_explicit_config_bumps.push(bump.clone());
+                }
+            }
+            if let Err(e) = apply_explicit_config_bumps(&eligible_explicit_config_bumps).await {
+                config_file_errors.push(e.wrap_err("failed to apply explicit configuration bumps"));
+            }
+            if config_file_errors.len() == 1 {
+                return Err(config_file_errors.pop().unwrap());
+            }
+            if !config_file_errors.is_empty() {
+                let errors = config_file_errors
+                    .into_iter()
+                    .map(|e| format!("{e:#}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Err(eyre!("Failed to update config files:\n{errors}"));
+            }
+
+            // When a specific version is provided via CLI (e.g., `mise upgrade tiny@3.0.1`),
+            // update the config file prefix if the new version doesn't match the current specifier.
+            // Skip if --bump was used since it already handles config updates.
+            if !self.bump {
+                use crate::toolset::outdated_info::{apply_config_bumps, compute_config_bumps};
+                let tool_versions: Vec<(String, String)> = self
+                    .tool
+                    .iter()
+                    .filter_map(|t| {
+                        t.tvr.as_ref().and_then(|tvr| {
+                            let name = t.ba.short.clone();
+                            // Only process tools that were successfully installed
+                            if successful_versions.iter().any(|v| v.ba().short == name) {
+                                Some((name, tvr.version()))
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect();
+                let refs: Vec<(&str, &str)> = tool_versions
+                    .iter()
+                    .map(|(n, v)| (n.as_str(), v.as_str()))
+                    .collect();
+                let bumps = compute_config_bumps(config, &refs);
+                apply_config_bumps(config, &bumps)?;
+            }
+
+            // Reset config after upgrades so tracked configs resolve with new versions
+            *config = Config::reset().await?;
+
+            // Rebuild symlinks BEFORE getting versions needed by tracked configs
+            // This ensures "latest" symlinks point to the new versions, not the old ones
+            let ts = config
+                .get_toolset_with_opts(&ResolveOptions {
+                    defer_missing_lazy_tools: self.defers_missing_lazy(),
+                    defer_missing_lazy_online: self.defers_missing_lazy(),
+                    ..Default::default()
+                })
+                .await?;
+            runtime_symlinks::rebuild_for_toolset(config, ts)
+                .await
+                .wrap_err("failed to rebuild runtime symlinks")?;
+
+            // Get versions needed by tracked configs AFTER upgrade. Preserve lockfile pins
+            // from other projects, but ignore stale pre-upgrade locks for configs we just
+            // upgraded so their old versions can still be removed.
+            let successful_backends: HashSet<_> = successful_versions
+                .iter()
+                .flat_map(|v| {
+                    [
+                        v.ba().short.clone(),
+                        v.ba().tool_name.clone(),
+                        v.ba().full(),
+                        v.ba().full_without_opts(),
+                    ]
+                })
+                .collect();
+            let mut upgraded_config_paths: HashSet<_> = outdated
+                .iter()
+                .filter(|o| backend_matches(&successful_backends, o.tool_version.ba()))
+                .filter_map(|o| o.source.path().map(|path| path.to_path_buf()))
+                .collect();
+            for tvl in ts.versions.values() {
+                if backend_matches(&successful_backends, &tvl.backend)
+                    && let Some(path) = tvl.source.path()
+                {
+                    upgraded_config_paths.insert(path.to_path_buf());
+                }
+            }
+            for (path, cf) in config.config_files.iter() {
+                let Ok(trs) = cf.to_tool_request_set() else {
+                    continue;
+                };
+                if trs
+                    .tools
+                    .keys()
+                    .any(|ba| backend_matches(&successful_backends, ba))
+                {
+                    upgraded_config_paths.insert(path.clone());
+                }
+            }
+            // Resolving every tracked config and stub is only worth doing when something is
+            // actually up for removal — with --no-prune, or when every upgrade was in-place,
+            // the answer would be discarded.
+            let versions_needed_by_tracked = if to_remove.is_empty() {
+                NeededVersions::new()
+            } else {
+                // This resolves every config tracked on the machine, which can take a
+                // while, so show progress rather than appearing to hang.
+                let scan_pr = self
+                    .show_resolution_progress()
+                    .then(|| mpr.add("checking tracked configs"));
+                // Text-mode reports print nothing until the first message.
+                if let Some(pr) = &scan_pr {
+                    pr.set_message("resolving tracked configs".into());
+                }
+                let result: Result<_> = async {
+                    let mut needed = get_versions_needed_by_tracked_configs_excluding_locks(
+                        config,
+                        true,
+                        false,
+                        &upgraded_config_paths,
+                        self.defers_missing_lazy(),
+                    )
+                    .await?;
+                    needed.extend(get_versions_needed_by_tracked_stubs(config).await?);
+                    Ok(needed)
+                }
+                .await;
+                if let Some(pr) = &scan_pr {
+                    match &result {
+                        Ok(_) => pr.finish(),
+                        Err(_) => pr.finish_with_icon(String::new(), ProgressIcon::Error),
+                    }
+                }
+                result?
+            };
+
+            // Only uninstall old versions of tools that were successfully upgraded
+            // and are not needed by any tracked config. Immediate removals are
+            // collected and run as one session below, with a summary of removed versions.
+            let mut immediate: Vec<ToolVersion> = Vec::new();
+            let mut scheduled_pruning = false;
+            for (o, old_version) in to_remove {
+                if successful_versions
+                    .iter()
+                    .any(|v| v.ba() == o.tool_version.ba())
+                {
+                    // Build a ToolVersion that targets the actual installed old version
+                    // (e.g., "1.0.0"), not the resolved latest (e.g., "2.0.0").
+                    // When minimum_release_age forces a remote lookup for "latest",
+                    // the toolset resolves to the remote version, and tv_pathname()
+                    // on the toolset version would give the wrong key.
+                    let old_tv = ToolVersion::new(o.tool_version.request.clone(), old_version.clone());
+                    let version_key = crate::toolset::needed_key(&old_tv);
+                    if versions_needed_by_tracked.contains_key(&version_key) {
+                        debug!(
+                            "Keeping {}@{} because it's still needed by a tracked config or tool stub",
+                            o.name, old_version
+                        );
+                        continue;
+                    }
+
+                    match prune_mode {
+                        PruneMode::Immediate => immediate.push(old_tv),
+                        PruneMode::Deferred(after) => {
+                            if let Err(err) = crate::tool_purgatory::schedule(&old_tv, after) {
+                                warn!(
+                                    "failed to schedule {}@{} for pruning: {err:#}",
+                                    o.name, old_version
+                                );
+                            } else {
+                                scheduled_pruning = true;
+                                debug!(
+                                    "{}@{} will be pruned after {}",
+                                    o.name,
+                                    old_version,
+                                    Settings::get().upgrade.prune_after
+                                );
+                            }
+                        }
+                        PruneMode::None => unreachable!(),
+                    }
+                }
+            }
+
+            if scheduled_pruning && !self.for_auto_update {
+                let prune_after = &Settings::get().upgrade.prune_after;
+                hint!(
+                    "upgrade_auto_prune",
+                    "old tool versions are kept for {prune_after} before automatic pruning. Disable this for future upgrades with",
+                    "mise settings upgrade.auto_prune=false"
+                );
+            }
+
+            if !immediate.is_empty() {
+                let mut progress = removal_progress(
+                    &mpr,
+                    immediate
+                        .iter()
+                        .map(|tv| (format!("{}@{}", tv.ba().short, tv.version), tv.style())),
+                );
+                for old_tv in immediate {
+                    let key = format!("{}@{}", old_tv.ba().short, old_tv.version);
+                    let tool = progress
+                        .as_ref()
+                        .and_then(|progress| progress.start_tool(&key));
+                    let pr = match &tool {
+                        Some(tool) => tool.reporter(),
+                        None => mpr.add(&format!("uninstall {}", old_tv.style())),
+                    };
+                    let result = self
+                        .uninstall_old_version(config, &old_tv, pr.as_ref())
+                        .await;
+                    if let Some(tool) = &tool {
+                        tool.complete(result.as_ref().err().map(|e| e.to_string()).as_deref());
+                    }
+                    match result {
+                        Err(e) => warn!(
+                            "Failed to uninstall old version of {}: {}",
+                            old_tv.ba().short,
+                            e
+                        ),
+                    Ok(()) => {
+                        if let Err(err) = crate::tool_purgatory::forget_path(&old_tv.install_path())
+                        {
+                            warn!("failed to clear tool purgatory entry: {err:#}");
+                        }
+                    }
+                }
+            }
+            if let Some(progress) = progress.as_mut() {
+                progress.finish(vec![]);
+            }
+        }
+
+        mpr.finish_progress();
+
+        // Fix up sources and requests for lockfile update - CLI args produce
+        // ToolSource::Argument but lockfile update only processes ToolSource::MiseToml.
+        // Also copy the config's request version (e.g., "latest") so the lockfile update
+        // correctly replaces the old entry instead of adding a duplicate.
+        for tv in &mut successful_versions {
+            if matches!(tv.request.source(), ToolSource::Argument)
+                && let Some(tvl) = ts.versions.get(tv.ba())
+                && matches!(&tvl.source, ToolSource::MiseToml(_))
+            {
+                // Use the config's request (preserves version specifier like "latest")
+                // but keep the resolved version from the upgrade
+                if let Some(config_tv) = tvl.versions.first() {
+                    tv.request = config_tv.request.clone();
+                } else {
+                    tv.request.set_source(tvl.source.clone());
+                }
+            }
+        }
+
+        config::rebuild_shims_and_runtime_symlinks(
+            config,
+            ts,
+            &successful_versions,
+            crate::lockfile::LockfileUpdateMode::AllowLocked,
+        )
+        .await?;
+        // The sync inside install ran before the `latest` links moved, and this
+        // config memoized its toolset from then, so both resolved `latest` to
+        // the version just replaced.
+        if Settings::get().skills.auto_sync {
+            *config = Config::reset().await?;
+            crate::packslip::auto_sync_skills(config).await;
+        }
+
+        if successful_versions.iter().any(|v| v.short() == "python") {
+            PIPXBackend::reinstall_all(
+                config,
+                opts.locked,
+                opts.resolve_options.use_locked_version,
+            )
+                .await
+                .unwrap_or_else(|err| {
+                    warn!("failed to reinstall pipx tools: {err}");
+                });
+        }
+
+            Ok(())
+        }
+        .await;
+
+        mpr.finish_progress();
+        if !self.for_auto_update {
+            Self::print_summary(&outdated, &successful_versions)?;
+        }
+
+        match (install_error, post_install_result) {
+            (Err(install), Err(post)) => Err(eyre!("{install:#}\n{post:#}")),
+            (Err(install), Ok(())) => Err(install),
+            (Ok(()), post) => post,
+        }
+    }
+
+    async fn uninstall_old_version(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+        pr: &dyn SingleReport,
+    ) -> Result<()> {
+        tv.backend()?
+            .uninstall_version(config, tv, pr, self.dry_run)
+            .await
+            .wrap_err_with(|| format!("failed to uninstall {tv}"))?;
+        pr.finish();
+        Ok(())
+    }
+
+    fn print_summary(outdated: &[OutdatedInfo], successful_versions: &[ToolVersion]) -> Result<()> {
+        let upgraded: Vec<_> = outdated
+            .iter()
+            .filter(|o| {
+                successful_versions
+                    .iter()
+                    .any(|v| v.ba() == o.tool_version.ba() && v.version == o.latest)
+            })
+            .collect();
+        if !upgraded.is_empty() {
+            let s = if upgraded.len() == 1 { "" } else { "s" };
+            miseprintln!("\nUpgraded {} tool{}:", upgraded.len(), s);
+            for o in &upgraded {
+                let from = o.current.as_deref().unwrap_or("(none)");
+                miseprintln!("  {} {} → {}", o.name, from, o.latest);
+            }
+        }
+        Ok(())
+    }
+
+    fn get_interactive_tool_set(&self, outdated: &Vec<OutdatedInfo>) -> Result<Vec<OutdatedInfo>> {
+        if !console::user_attended_stderr() || !std::io::IsTerminal::is_terminal(&std::io::stdin())
+        {
+            eyre::bail!("--interactive requires an interactive terminal");
+        }
+        ui::ctrlc::show_cursor_after_ctrl_c();
+        let theme = crate::ui::theme::get_theme();
+        let mut ms = demand::MultiSelect::new("mise upgrade")
+            .description("Select tools to upgrade")
+            .filterable(true)
+            .theme(&theme);
+        for out in outdated {
+            ms = ms.option(DemandOption::new(out.clone()));
+        }
+        match ms.run() {
+            Ok(selected) => Ok(selected.into_iter().collect()),
+            Err(e) => {
+                Term::stderr().show_cursor()?;
+                Err(eyre!(e))
+            }
+        }
+    }
+
+    /// Get the minimum_release_age cutoff from the CLI --minimum-release-age flag only.
+    /// Per-tool and global setting fallbacks are handled in ToolRequest::resolve.
+    fn get_before_date(&self) -> Result<Option<Timestamp>> {
+        resolve_cli_minimum_release_age(self.minimum_release_age.as_deref())
+    }
+
+    async fn warn_if_newer_versions_hidden_by_minimum_release_age(
+        &self,
+        config: &Arc<Config>,
+        ts: &crate::toolset::Toolset,
+        opts: &ResolveOptions,
+        filter_tools: Option<&[ToolArg]>,
+        exclude_tools: Option<&[ToolArg]>,
+        left_alone: &[ToolRequest],
+    ) {
+        let list_versions = if opts.inactive {
+            match ts.list_all_versions(config).await {
+                Ok(v) => v,
+                Err(err) => {
+                    warn!("Failed to list all versions: {err:#}");
+                    vec![]
+                }
+            }
+        } else {
+            ts.list_current_versions()
+        };
+        let mut warned = HashSet::new();
+        for (_, tv) in list_versions {
+            if let Some(exclude) = exclude_tools
+                && exclude.iter().any(|t| t.ba.as_ref() == tv.ba())
+            {
+                continue;
+            }
+            if left_alone.contains(&tv.request) {
+                continue;
+            }
+            if let Some(tools) = filter_tools
+                && !tools.iter().any(|t| t.ba.as_ref() == tv.ba())
+            {
+                continue;
+            }
+            let warning_key = format!("{}@{}", tv.ba().short, tv.request.version());
+            if !warned.insert(warning_key) {
+                continue;
+            }
+            let mut opts_with_effective_before_date = opts.clone();
+            if let Err(err) = opts_with_effective_before_date
+                .apply_before_date_for_tool(tv.ba(), tv.request.options().minimum_release_age())
+            {
+                warn!(
+                    "Error resolving minimum_release_age for {}: {err:#}",
+                    tv.ba()
+                );
+                continue;
+            }
+            if opts_with_effective_before_date.before_date.is_none() {
+                continue;
+            }
+            // The raw age value for display: a cutoff already present in
+            // `opts` came from the CLI flag; otherwise it resolved from the
+            // per-tool option, the global setting, or the built-in default.
+            let age = if opts.before_date.is_some() {
+                self.minimum_release_age.clone()
+            } else {
+                effective_minimum_release_age_for_tool(
+                    tv.ba(),
+                    tv.request.options().minimum_release_age(),
+                )
+            };
+            let eligible_latest = self
+                .latest_for_upgrade(config, &tv, &opts_with_effective_before_date)
+                .await;
+            let eligible_latest = match eligible_latest {
+                Ok(latest) => latest,
+                Err(err) => {
+                    warn!("Error getting latest version for {}: {err:#}", tv.ba());
+                    continue;
+                }
+            };
+            let baseline_latest = match self.baseline_latest_for_upgrade(config, &tv, opts).await {
+                Ok(latest) => latest,
+                Err(err) => {
+                    warn!("Error getting latest version for {}: {err:#}", tv.ba());
+                    continue;
+                }
+            };
+            match (eligible_latest, baseline_latest) {
+                (Some(eligible), Some(baseline)) if is_outdated_version(&eligible, &baseline) => {
+                    if current_satisfies_hidden_release(config, &tv, &baseline) {
+                        continue;
+                    }
+                    let suffix = format!("latest eligible release is {eligible}");
+                    warn_hidden_release_ignored_by_minimum_release_age(
+                        config,
+                        &tv,
+                        &baseline,
+                        age.as_deref(),
+                        &suffix,
+                    )
+                    .await;
+                }
+                (None, Some(baseline)) => {
+                    if current_satisfies_hidden_release(config, &tv, &baseline) {
+                        continue;
+                    }
+                    warn_hidden_release_ignored_by_minimum_release_age(
+                        config,
+                        &tv,
+                        &baseline,
+                        age.as_deref(),
+                        "no eligible release found",
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn latest_for_upgrade(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+        opts: &ResolveOptions,
+    ) -> Result<Option<String>> {
+        let backend = tv.backend()?;
+        if self.bump || (opts.inactive && tv.request.source() == &ToolSource::Unknown) {
+            let (prefix, prefix_version) = split_version_prefix(&tv.request.version());
+            backend
+                .latest_version(
+                    config,
+                    prefixed_latest_query(&prefix, &prefix_version),
+                    opts.before_date,
+                )
+                .await
+        } else {
+            tv.latest_version_with_opts(config, opts).await.map(Some)
+        }
+    }
+
+    async fn baseline_latest_for_upgrade(
+        &self,
+        config: &Arc<Config>,
+        tv: &ToolVersion,
+        opts: &ResolveOptions,
+    ) -> Result<Option<String>> {
+        let backend = tv.backend()?;
+        let query = if self.bump || (opts.inactive && tv.request.source() == &ToolSource::Unknown) {
+            let (prefix, prefix_version) = split_version_prefix(&tv.request.version());
+            prefixed_latest_query(&prefix, &prefix_version)
+        } else {
+            Some(tv.request.version())
+        };
+        backend.latest_version_unfiltered(config, query).await
+    }
+}
+
+/// Upgrade one tool within its global config request, for `auto_update`. Only
+/// global config is read, so a project's config and lockfile never change.
+pub(crate) async fn upgrade_global_tool(tool: ToolArg) -> Result<()> {
+    Upgrade {
+        tool: vec![tool],
+        for_auto_update: true,
+        ..Default::default()
+    }
+    .run()
+    .await
+}
+
+fn current_satisfies_hidden_release(
+    config: &Arc<Config>,
+    tv: &ToolVersion,
+    hidden_version: &str,
+) -> bool {
+    OutdatedInfo::new(config, tv.clone(), hidden_version.to_string())
+        .ok()
+        .and_then(|info| info.current)
+        .as_deref()
+        .is_some_and(|current| current_version_satisfies_hidden_release(current, hidden_version))
+}
+
+fn current_version_satisfies_hidden_release(current: &str, hidden_version: &str) -> bool {
+    !is_outdated_version(current, hidden_version)
+}
+
+fn backend_matches(backends: &HashSet<String>, ba: &BackendArg) -> bool {
+    backends.contains(&ba.short)
+        || backends.contains(&ba.tool_name)
+        || backends.contains(&ba.full())
+        || backends.contains(&ba.full_without_opts())
+}
+
+fn backend_args_match(left: &BackendArg, right: &BackendArg) -> bool {
+    let left = left.all_fulls();
+    let right = right.all_fulls();
+    left.iter().any(|identity| right.contains(identity))
+}
+
+fn explicit_bump_is_installed(
+    toolset: &Toolset,
+    config: &Arc<Config>,
+    bump: &ExplicitConfigBump,
+) -> bool {
+    toolset
+        .list_current_versions()
+        .into_iter()
+        .any(|(backend, version)| {
+            backend_args_match(version.ba(), bump.request.ba())
+                && version.request.version() == bump.request.version()
+                && backend.is_version_installed(config, &version, true)
+        })
+}
+
+fn find_explicit_bump_outdated<'a>(
+    outdated: &'a [OutdatedInfo],
+    bump: &ExplicitConfigBump,
+) -> Option<&'a OutdatedInfo> {
+    outdated.iter().find(|outdated| {
+        backend_args_match(outdated.tool_version.ba(), bump.request.ba())
+            && outdated.tool_version.request.version() == bump.request.version()
+    })
+}
+
+fn explicit_bump_is_eligible(
+    pending: Option<&OutdatedInfo>,
+    bump: &ExplicitConfigBump,
+    successful_versions: Option<&[ToolVersion]>,
+    toolset: &Toolset,
+    config: &Arc<Config>,
+) -> bool {
+    if let Some(pending) = pending {
+        return successful_versions
+            .is_none_or(|versions| explicit_bump_matches_successful(pending, versions));
+    }
+    explicit_bump_is_installed(toolset, config, bump)
+}
+
+fn explicit_bump_matches_successful(
+    outdated: &OutdatedInfo,
+    successful_versions: &[ToolVersion],
+) -> bool {
+    successful_versions.iter().any(|version| {
+        backend_args_match(version.ba(), outdated.tool_request.ba())
+            && version.request.version() == outdated.tool_request.version()
+    })
+}
+
+fn effective_persistable_request<'a>(
+    toolset: &'a Toolset,
+    requested: &BackendArg,
+) -> Option<(&'a Arc<BackendArg>, &'a ToolRequest)> {
+    let (ba, versions) = toolset
+        .versions
+        .iter()
+        .find(|(ba, _)| backend_args_match(ba, requested))?;
+    let mut supported = versions
+        .requests
+        .iter()
+        .filter(|request| request.is_os_supported());
+    let request = supported.next()?;
+    if supported.next().is_some()
+        || request.source().path().is_none()
+        || request.source().is_mise_toml_daemon()
+    {
+        return None;
+    }
+    Some((ba, request))
+}
+
+fn print_explicit_config_bumps(bumps: &[ExplicitConfigBump]) -> Result<()> {
+    for bump in bumps {
+        miseprintln!(
+            "Would bump {}@{} in {}",
+            bump.request.ba().short,
+            bump.persisted_request.version(),
+            display_path(&bump.path)
+        );
+    }
+    Ok(())
+}
+
+async fn apply_explicit_config_bumps(bumps: &[ExplicitConfigBump]) -> Result<()> {
+    for bump in bumps {
+        let cf = config_file::parse(&bump.path).await?;
+        cf.replace_versions(bump.request.ba(), vec![bump.persisted_request.clone()])?;
+        cf.save()?;
+    }
+    Ok(())
+}
+
+async fn warn_hidden_release_ignored_by_minimum_release_age(
+    config: &Arc<Config>,
+    tv: &ToolVersion,
+    hidden_version: &str,
+    age: Option<&str>,
+    suffix: &str,
+) {
+    let (released, age) = hidden_release_details(config, tv, hidden_version, age).await;
+    warn!(
+        "newer {} release {hidden_version}{released} ignored by minimum_release_age{age}; {suffix}",
+        tv.ba().short
+    );
+}
+
+/// Fragments for the minimum_release_age warning: when the hidden release came
+/// out and when it becomes eligible, plus the configured age value. The remote
+/// version list is already cached in memory by the resolution that found the
+/// hidden release, so this does not trigger another fetch.
+async fn hidden_release_details(
+    config: &Arc<Config>,
+    tv: &ToolVersion,
+    hidden_version: &str,
+    age: Option<&str>,
+) -> (String, String) {
+    let created_at = match tv.backend() {
+        Ok(backend) => backend
+            .list_remote_versions_with_info(config)
+            .await
+            .ok()
+            .and_then(|versions| {
+                versions
+                    .iter()
+                    .find(|v| v.version == hidden_version)
+                    .and_then(|v| v.created_at_timestamp())
+            }),
+        Err(_) => None,
+    };
+    format_hidden_release_details(created_at, age, jiff::tz::TimeZone::system())
+}
+
+static AFTER_LONG_HELP: &str = color_print::cstr!(
+    r###"<bold><underline>Deprecation:</underline></bold>
+
+The `-l` shorthand for `--bump` is deprecated and will be removed in mise 2027.8.5.
+Use `-b` or `--bump` instead.
+
+The `--local` flag is deprecated in favor of `--no-global`. mise warns about it from
+2027.1.0 and removes it in 2027.7.0."###
+);
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        backend_args_match, current_version_satisfies_hidden_release,
+        explicit_bump_matches_successful,
+    };
+    use crate::args::BackendArg;
+    use crate::toolset::outdated_info::OutdatedInfo;
+    use crate::toolset::{ToolRequest, ToolSource, ToolVersion};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_current_version_satisfies_hidden_release() {
+        assert!(!current_version_satisfies_hidden_release("1.0.0", "1.1.0"));
+        assert!(current_version_satisfies_hidden_release("1.1.0", "1.1.0"));
+        assert!(current_version_satisfies_hidden_release("1.2.0", "1.1.0"));
+    }
+    #[test]
+    fn test_backend_args_match_registry_shorthand_and_explicit_backend() {
+        let shorthand = BackendArg::from("tflint");
+        let explicit = BackendArg::from("aqua:terraform-linters/tflint");
+
+        assert!(backend_args_match(&shorthand, &explicit));
+    }
+
+    #[test]
+    fn test_explicit_bump_matches_its_successful_selector() {
+        let backend = Arc::new(BackendArg::from("dummy"));
+        let original = ToolRequest::new(backend.clone(), "3", ToolSource::Argument).unwrap();
+        let bumped = ToolRequest::new(backend.clone(), "3.1.0", ToolSource::Argument).unwrap();
+        let outdated = OutdatedInfo {
+            name: "dummy".to_string(),
+            tool_request: bumped,
+            tool_version: ToolVersion::new(original, "1.0.0".to_string()),
+            requested: "3".to_string(),
+            current: Some("1.0.0".to_string()),
+            bump: Some("3.1.0".to_string()),
+            latest: "3.1.0".to_string(),
+            release_url: None,
+            source: ToolSource::Argument,
+        };
+        let other = ToolRequest::new(backend.clone(), "4.0.0", ToolSource::Argument).unwrap();
+        let own = ToolRequest::new(backend, "3.1.0", ToolSource::Argument).unwrap();
+
+        assert!(!explicit_bump_matches_successful(
+            &outdated,
+            &[ToolVersion::new(other, "4.0.0".to_string())],
+        ));
+        assert!(explicit_bump_matches_successful(
+            &outdated,
+            &[ToolVersion::new(own, "3.1.0".to_string())],
+        ));
+    }
+}

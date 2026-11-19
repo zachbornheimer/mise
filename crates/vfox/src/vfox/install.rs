@@ -1,0 +1,833 @@
+use super::*;
+
+impl Vfox {
+    pub async fn install<ID: AsRef<Path>>(
+        &self,
+        sdk: &str,
+        version: &str,
+        install_dir: ID,
+    ) -> Result<InstallResult> {
+        self.install_with_download_dir(sdk, version, install_dir, &self.download_dir)
+            .await
+    }
+
+    pub async fn install_with_download_dir<ID: AsRef<Path>, DD: AsRef<Path>>(
+        &self,
+        sdk: &str,
+        version: &str,
+        install_dir: ID,
+        download_dir: DD,
+    ) -> Result<InstallResult> {
+        self.install_with_download_dir_and_options(
+            sdk,
+            version,
+            install_dir,
+            download_dir,
+            Default::default(),
+        )
+        .await
+    }
+
+    pub async fn install_with_download_dir_and_options<ID: AsRef<Path>, DD: AsRef<Path>>(
+        &self,
+        sdk: &str,
+        version: &str,
+        install_dir: ID,
+        download_dir: DD,
+        options: IndexMap<String, toml::Value>,
+    ) -> Result<InstallResult> {
+        self.install_plugin(sdk)?;
+        let sdk = self.get_sdk_with_env(sdk)?;
+        let pre_install = sdk
+            .pre_install_with_options(version, options.clone())
+            .await?;
+        let install_dir = install_dir.as_ref();
+        let download_dir = download_dir.as_ref();
+        trace!("{pre_install:?}");
+        let mut verified_attestation = None;
+        let mut checksum_verified = false;
+        if pre_install.url.is_some() {
+            let metadata = sdk.get_metadata()?;
+            if !metadata.downloads {
+                return Err(crate::VfoxError::Error(format!(
+                    "plugin {} declares `downloads = false` in metadata.lua but PreInstall returned a url",
+                    metadata.name
+                )));
+            }
+        }
+        if let Some(url) = pre_install.url.as_ref().map(|s| Url::from_str(s)) {
+            let file = self
+                .download(
+                    &url?,
+                    &sdk,
+                    version,
+                    download_dir,
+                    pre_install.headers.as_ref(),
+                )
+                .await?;
+            verified_attestation = self.verify(&pre_install, &file).await?;
+            self.extract(&file, install_dir)?;
+            // Note: sha1/md5 are verified in `verify`, but intentionally excluded here.
+            // mise stands this flag in for attestation when restoring lockfile provenance,
+            // so it guards against downgrades; a collision-broken hash must not satisfy it.
+            checksum_verified = pre_install.sha256.is_some() || pre_install.sha512.is_some();
+        }
+
+        Self::run_post_install(&sdk, version, install_dir, options).await?;
+        Ok(InstallResult {
+            sha256: pre_install.sha256,
+            verified_attestation,
+            checksum_verified,
+        })
+    }
+
+    pub async fn pre_uninstall<ID: AsRef<Path>>(
+        &self,
+        sdk: &str,
+        version: &str,
+        install_dir: ID,
+    ) -> Result<()> {
+        let sdk = self.get_sdk_with_env(sdk)?;
+        if sdk.get_metadata()?.hooks.contains("pre_uninstall") {
+            let sdk_info = sdk.sdk_info(version.to_string(), install_dir.as_ref().to_path_buf())?;
+            sdk.pre_uninstall(PreUninstallContext {
+                main: sdk_info.clone(),
+                sdk_info: BTreeMap::from([(sdk_info.name.clone(), sdk_info)]),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn run_post_install(
+        sdk: &Plugin,
+        version: &str,
+        install_dir: &Path,
+        options: IndexMap<String, toml::Value>,
+    ) -> Result<()> {
+        if sdk.get_metadata()?.hooks.contains("post_install") {
+            let sdk_info = sdk.sdk_info(version.to_string(), install_dir.to_path_buf())?;
+            sdk.post_install(PostInstallContext {
+                root_path: install_dir.to_path_buf(),
+                runtime_version: version.to_string(),
+                sdk_info: BTreeMap::from([(sdk_info.name.clone(), sdk_info)]),
+                options,
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Run `PostInstall` again on an existing install, without downloading or
+    /// extracting, to bring it back in line with the current tool options.
+    pub async fn repair_install<ID: AsRef<Path>>(
+        &self,
+        sdk: &str,
+        version: &str,
+        install_dir: ID,
+        options: IndexMap<String, toml::Value>,
+    ) -> Result<()> {
+        let sdk = self.get_sdk_with_env(sdk)?;
+        Self::run_post_install(&sdk, version, install_dir.as_ref(), options).await
+    }
+
+    /// Ask the plugin whether an installed version still satisfies the request.
+    /// Returns `None` when the plugin has no `MiseInstallSatisfied` hook.
+    pub async fn mise_install_satisfied<ID: AsRef<Path>, T: serde::Serialize>(
+        &self,
+        sdk: &str,
+        version: &str,
+        install_dir: ID,
+        options: T,
+    ) -> Result<Option<MiseInstallSatisfiedResult>> {
+        let sdk = self.get_sdk_with_env(sdk)?;
+        if !sdk.get_metadata()?.hooks.contains("mise_install_satisfied") {
+            return Ok(None);
+        }
+        let ctx = MiseInstallSatisfiedContext {
+            version: version.to_string(),
+            path: install_dir.as_ref().to_path_buf(),
+            options,
+        };
+        Ok(Some(sdk.mise_install_satisfied(ctx).await?))
+    }
+
+    pub fn uninstall(&self, sdk: &str, version: &str) -> Result<()> {
+        let path = self.install_dir.join(sdk).join(version);
+        file::remove_dir_all(&path)?;
+        Ok(())
+    }
+
+    pub(super) async fn download(
+        &self,
+        url: &Url,
+        sdk: &Plugin,
+        version: &str,
+        download_dir: &Path,
+        plugin_headers: Option<&HeaderMap>,
+    ) -> Result<PathBuf> {
+        let path = Self::download_path_for(download_dir, &sdk.name, version, url)?;
+        self.download_to(url, &path, plugin_headers).await?;
+        Ok(path)
+    }
+
+    /// Download `url` to `path` the way an install does: the plugin's headers
+    /// go only to the origin of `url`, never to a rewritten mirror or a
+    /// redirect to another origin.
+    pub async fn download_to(
+        &self,
+        url: &Url,
+        path: &Path,
+        plugin_headers: Option<&HeaderMap>,
+    ) -> Result<()> {
+        let mut request_url = url.clone();
+        self.rewrite_url(&mut request_url);
+        self.log_emit(format!("Downloading {request_url}"));
+        let url_str = request_url.to_string();
+        let client = client()?;
+        let no_redirect_client = no_redirect_client()?;
+        file::mkdirp(path.parent().unwrap())?;
+        // Streamed to the file, so an archive is never held in memory whole.
+        download_to_file(
+            &url_str,
+            path,
+            self.download_progress.as_deref(),
+            || async {
+                let resp = match plugin_headers.filter(|h| !h.is_empty()) {
+                    Some(plugin_headers) => {
+                        // The headers belong to the plugin's own `url`; a rewritten
+                        // mirror is not trusted with them.
+                        match self
+                            .get_following_redirects(
+                                no_redirect_client,
+                                &request_url,
+                                url,
+                                plugin_headers,
+                            )
+                            .await?
+                        {
+                            Some(resp) => resp,
+                            None => return Ok(None),
+                        }
+                    }
+                    None => {
+                        let mut request = client.get(request_url.clone());
+                        if let Some(resolver) = &self.http_headers_resolver {
+                            request = request.headers(resolver(&request_url));
+                        }
+                        request.send().await?
+                    }
+                };
+                Ok(Some(resp))
+            },
+        )
+        .await??
+        .ok_or_else(|| format!("too many redirects downloading {request_url}"))?;
+        Ok(())
+    }
+
+    /// GET `url` with the plugin's headers, following redirects by hand so the
+    /// headers are only sent to the origin of `trusted` (the plugin's own
+    /// `url`). A rewritten mirror or a redirect to another host, port or scheme
+    /// (e.g. a signed storage URL) does not receive them. Returns `None` when
+    /// the redirect limit is exceeded.
+    async fn get_following_redirects(
+        &self,
+        client: &reqwest::Client,
+        url: &Url,
+        trusted: &Url,
+        plugin_headers: &HeaderMap,
+    ) -> reqwest::Result<Option<reqwest::Response>> {
+        const MAX_REDIRECTS: usize = 10;
+        let mut current = url.clone();
+        for _ in 0..=MAX_REDIRECTS {
+            let mut headers = self
+                .http_headers_resolver
+                .as_ref()
+                .map(|resolver| resolver(&current))
+                .unwrap_or_default();
+            if current.origin() == trusted.origin() {
+                headers.extend(plugin_headers.clone());
+            }
+            let resp = client.get(current.clone()).headers(headers).send().await?;
+            if !resp.status().is_redirection() {
+                return Ok(Some(resp));
+            }
+            let Some(next) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|l| l.to_str().ok())
+                .and_then(|l| current.join(l).ok())
+            else {
+                return Ok(Some(resp));
+            };
+            current = next;
+        }
+        Ok(None)
+    }
+
+    pub(super) fn download_path_for(
+        download_dir: &Path,
+        sdk: &str,
+        version: &str,
+        url: &Url,
+    ) -> Result<PathBuf> {
+        let filename = url
+            .path_segments()
+            .and_then(|mut s| s.next_back())
+            .ok_or("No filename in URL")?;
+        Ok(download_dir.join(format!("{sdk}-{version}")).join(filename))
+    }
+
+    pub(super) async fn verify(
+        &self,
+        pre_install: &PreInstall,
+        file: &Path,
+    ) -> Result<Option<VerifiedAttestation>> {
+        self.log_emit(format!("Verifying {file:?} checksum"));
+        if let Some(locked) = &self.locked_checksum {
+            match locked.split_once(':') {
+                Some(("sha256", hex)) => xx::hash::ensure_checksum_sha256(file, hex)?,
+                Some(("sha512", hex)) => xx::hash::ensure_checksum_sha512(file, hex)?,
+                _ => {
+                    return Err(crate::VfoxError::Error(format!(
+                        "cannot verify {file:?} against the locked checksum {locked}: only sha256 and sha512 are supported"
+                    )));
+                }
+            }
+        }
+        if let Some(sha256) = &pre_install.sha256 {
+            xx::hash::ensure_checksum_sha256(file, sha256)?;
+        }
+        if let Some(sha512) = &pre_install.sha512 {
+            xx::hash::ensure_checksum_sha512(file, sha512)?;
+        }
+        if let Some(sha1) = &pre_install.sha1 {
+            ensure_checksum(file, "sha1", sha1, &xx::hash::file_hash_sha1(file)?)?;
+        }
+        if let Some(md5) = &pre_install.md5 {
+            ensure_checksum(file, "md5", md5, &xx::hash::file_hash_md5(file)?)?;
+        }
+        let mut verified: Option<VerifiedAttestation> = None;
+        // Only skip attestation verification when the plugin provides a strong checksum
+        // (sha256/sha512) — otherwise there would be no meaningful integrity check left.
+        // sha1/md5 are verified above but do not qualify: both are collision-broken.
+        let has_checksum = pre_install.sha256.is_some() || pre_install.sha512.is_some();
+        if let Some(attestation) = &pre_install.attestation
+            && !(self.skip_verification && has_checksum)
+        {
+            self.log_emit(format!("Verify {file:?} attestation"));
+            if let Some(owner) = &attestation.github_owner
+                && let Some(repo) = &attestation.github_repo
+            {
+                let token = std::env::var("MISE_GITHUB_TOKEN")
+                    .or_else(|_| std::env::var("GITHUB_TOKEN"))
+                    .or(Err("GitHub artifact attestation verification requires either the MISE_GITHUB_TOKEN or GITHUB_TOKEN environment variable set"))?;
+                mise_sigstore::verify_github_attestation(
+                    file,
+                    owner.as_str(),
+                    repo.as_str(),
+                    Some(token.as_str()),
+                    attestation.github_signer_workflow.as_deref(),
+                    crate::http::sigstore_retry_config(),
+                )
+                .await?;
+                // All configured verifications always execute (no short-circuit).
+                // Priority only affects which variant is *recorded* in `verified`.
+                // GitHub attestations have the highest recording priority.
+                verified = Some(VerifiedAttestation::GithubAttestations {
+                    owner: owner.clone(),
+                    repo: repo.clone(),
+                    signer_workflow: attestation.github_signer_workflow.clone(),
+                });
+            }
+
+            if let Some(sig_or_bundle_path) = &attestation.cosign_sig_or_bundle_path {
+                if let Some(public_key_path) = &attestation.cosign_public_key_path {
+                    mise_sigstore::verify_cosign_signature_with_key(
+                        file,
+                        sig_or_bundle_path,
+                        public_key_path,
+                    )
+                    .await?;
+                } else {
+                    let identity = mise_sigstore::CosignIdentity {
+                        identity: attestation.cosign_certificate_identity.clone(),
+                        identity_regexp: attestation.cosign_certificate_identity_regexp.clone(),
+                        oidc_issuer: attestation.cosign_certificate_oidc_issuer.clone(),
+                        ..Default::default()
+                    };
+                    mise_sigstore::verify_cosign_signature(file, sig_or_bundle_path, &identity)
+                        .await?;
+                }
+                // Cosign has the lowest recording priority: only record it if no
+                // higher-priority verification was already recorded.
+                if verified.is_none() {
+                    verified = Some(VerifiedAttestation::Cosign {
+                        sig_or_bundle_path: sig_or_bundle_path.clone(),
+                        public_key_path: attestation.cosign_public_key_path.clone(),
+                    });
+                }
+            }
+
+            if let Some(provenance_path) = &attestation.slsa_provenance_path {
+                if let (Some(identity), Some(issuer)) = (
+                    attestation.slsa_signer_identity.as_deref(),
+                    attestation.slsa_signer_issuer.as_deref(),
+                ) {
+                    let min_level = attestation.slsa_min_level.unwrap_or(1u8);
+                    if attestation.slsa_source_tag.is_none() {
+                        debug!(
+                            "the plugin sets no slsa_source_tag; not checking the SLSA provenance's tag"
+                        );
+                    }
+                    let signer = mise_sigstore::SlsaSignerIdentity {
+                        identity,
+                        issuer,
+                        source_repository: attestation.slsa_source_repository.as_deref(),
+                        source_tag: attestation.slsa_source_tag.as_deref(),
+                    };
+                    mise_sigstore::verify_slsa_provenance(file, provenance_path, min_level, signer)
+                        .await?;
+                    // SLSA has mid-tier recording priority: record it unless GitHub
+                    // attestation (higher priority) was already recorded.
+                    // Note: if Cosign also passed, SLSA supersedes it (SLSA > Cosign).
+                    if !matches!(
+                        verified,
+                        Some(VerifiedAttestation::GithubAttestations { .. })
+                    ) {
+                        verified = Some(VerifiedAttestation::Slsa {
+                            provenance_path: provenance_path.clone(),
+                        });
+                    }
+                } else {
+                    debug!("skipping SLSA provenance without expected signer identity and issuer");
+                }
+            }
+        }
+        Ok(verified)
+    }
+
+    fn extract(&self, file: &Path, install_dir: &Path) -> Result<()> {
+        self.log_emit(format!("Extracting {file:?} to {install_dir:?}"));
+        let filename = file.file_name().unwrap().to_string_lossy().to_string();
+        let parent = install_dir.parent().unwrap();
+        file::mkdirp(parent)?;
+        // Next to the install directory so the final move stays a rename. Hidden, because
+        // the install directory's parent can be the installs root itself (identity layout),
+        // where every visible entry is read as a tool.
+        let tmp = TempDir::with_prefix_in(extraction_dir_prefix(&filename), parent)?;
+        file::remove_dir_all(install_dir)?;
+        let move_to_install = || {
+            let subdirs = file::ls(tmp.path())?;
+            if subdirs.len() == 1 && subdirs.first().unwrap().is_dir() {
+                let subdir = subdirs.first().unwrap();
+                file::mv(subdir, install_dir)?;
+            } else {
+                file::mv(tmp.path(), install_dir)?;
+            }
+            // PostInstall hooks copy, write and chmod fixed names below the install
+            // directory, which follows any link the archive shipped. `untar` keeps links
+            // whatever their target, and `ZipArchive::extract` only checks them against
+            // the temporary directory, which stripping a top-level directory moves them
+            // out of, so check them against the install directory. This also refuses a
+            // lone top-level link promoted to be the install directory itself.
+            if let Err(err) = ensure_symlinks_stay_within(install_dir) {
+                let _ = file::remove_dir_all(install_dir);
+                return Err(err);
+            }
+            Result::Ok(())
+        };
+        if filename.ends_with(".tar.gz") || filename.ends_with(".tgz") {
+            xx::archive::untar_gz(file, tmp.path())?;
+            move_to_install()?;
+        } else if filename.ends_with(".tar.xz") || filename.ends_with(".txz") {
+            xx::archive::untar_xz(file, tmp.path())?;
+            move_to_install()?;
+        } else if filename.ends_with(".tar.bz2")
+            || filename.ends_with(".tbz2")
+            || filename.ends_with(".tbz")
+        {
+            xx::archive::untar_bz2(file, tmp.path())?;
+            move_to_install()?;
+        } else if filename.ends_with(".zip") {
+            // `ZipArchive::extract` creates symlink entries (rejecting ones that escape the
+            // destination); `xx::archive::unzip` would write them as regular files.
+            zip::ZipArchive::new(std::fs::File::open(file)?)
+                .and_then(|mut archive| archive.extract(tmp.path()))
+                .map_err(|err| format!("failed to extract {file:?}: {err}"))?;
+            move_to_install()?;
+        } else {
+            file::mv(file, install_dir.join(&filename))?;
+            #[cfg(unix)]
+            file::make_executable(install_dir.join(&filename))?;
+        }
+        Ok(())
+    }
+}
+
+/// Fails if a symlink under `root` points outside of it. Each target is resolved component
+/// by component, following every link on the way, so chains and links through linked
+/// directories are checked; components that do not exist are taken as written.
+pub(crate) fn ensure_symlinks_stay_within(root: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(root)?.file_type().is_symlink() {
+        return Err(format!("the archive's top-level entry is a symlink: {root:?}").into());
+    }
+    let real_root = root.canonicalize()?;
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir)? {
+            let path = entry?.path();
+            let kind = std::fs::symlink_metadata(&path)?.file_type();
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if kind.is_symlink() {
+                let target = std::fs::read_link(&path)?;
+                let base = path.parent().unwrap().canonicalize()?;
+                if !link_target_stays_within(&real_root, root, &base, &target) {
+                    return Err(format!(
+                        "symlink {path:?} points outside of the install directory: {target:?}"
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolves `target` as seen from the directory `base` (already real), following every
+/// link on the way, and reports whether each step stays under `root` (the real path of
+/// the tree, which is `given_root` as the caller spelled it). Components that do not
+/// exist are taken as written. A chain of links that loops without leaving `root` is
+/// harmless, so the walk stops after `MAX_LINKS` links and accepts it.
+fn link_target_stays_within(root: &Path, given_root: &Path, base: &Path, target: &Path) -> bool {
+    use std::collections::VecDeque;
+    use std::path::Component;
+    const MAX_LINKS: usize = 40;
+    let parts = |path: &Path| -> VecDeque<PathBuf> {
+        path.components()
+            .map(|part| PathBuf::from(part.as_os_str()))
+            .collect()
+    };
+    let mut current = base.to_path_buf();
+    let mut pending = parts(target);
+    let mut followed = 0;
+    while let Some(part) = pending.pop_front() {
+        match Path::new(&part).components().next().unwrap() {
+            Component::Prefix(_) | Component::RootDir => {
+                // An absolute path stays inside only if it names the tree's root, by
+                // either spelling; walk the rest from the root rather than through the
+                // root's ancestors.
+                let absolute: PathBuf = std::iter::once(part).chain(pending.drain(..)).collect();
+                let Some(rest) = [root, given_root]
+                    .into_iter()
+                    .find_map(|root| absolute.strip_prefix(root).ok())
+                else {
+                    return false;
+                };
+                pending = parts(rest);
+                current = root.to_path_buf();
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                current.pop();
+            }
+            Component::Normal(name) => {
+                let candidate = current.join(name);
+                match std::fs::read_link(&candidate) {
+                    Ok(link) => {
+                        followed += 1;
+                        if followed > MAX_LINKS {
+                            return true;
+                        }
+                        for part in link.components().rev() {
+                            pending.push_front(PathBuf::from(part.as_os_str()));
+                        }
+                    }
+                    Err(_) => current = candidate,
+                }
+            }
+        }
+        if !current.starts_with(root) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The name prefix of the directory an archive is extracted into before it is moved to
+/// the install directory. A leading dot keeps it out of directory listings of the installs
+/// tree while it exists.
+fn extraction_dir_prefix(archive_name: &str) -> String {
+    format!(".{archive_name}.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extraction_directories_are_hidden() {
+        for name in ["node-20.tar.gz", "tool.zip", "bin"] {
+            let prefix = extraction_dir_prefix(name);
+            assert!(prefix.starts_with('.'), "{prefix}");
+            assert!(prefix.contains(name), "{prefix}");
+        }
+    }
+
+    #[test]
+    fn extraction_leaves_only_the_install_directory_beside_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("tool-1.0.tar.gz");
+        {
+            let source = temp.path().join("tool-1.0");
+            std::fs::create_dir_all(source.join("bin")).unwrap();
+            std::fs::write(source.join("bin/tool"), "#!/bin/sh\n").unwrap();
+            let status = std::process::Command::new("tar")
+                .arg("-czf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(temp.path())
+                .arg("tool-1.0")
+                .status();
+            if !status.is_ok_and(|status| status.success()) {
+                return; // no tar to build the fixture with
+            }
+        }
+        let installs = temp.path().join("installs");
+        let install_dir = installs.join("tool-abcd1234");
+        let vfox = Vfox::test();
+        vfox.extract(&archive, &install_dir).unwrap();
+
+        assert!(install_dir.join("bin/tool").is_file());
+        let entries: Vec<_> = std::fs::read_dir(&installs)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(entries, vec!["tool-abcd1234".to_string()]);
+    }
+
+    /// Packs `tree` (a directory under `temp`) into `archive` with the system `tar`.
+    /// Returns false when there is no `tar` to build the fixture with.
+    #[cfg(unix)]
+    fn tar_gz(temp: &Path, archive: &Path, tree: &str) -> bool {
+        std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(archive)
+            .arg("-C")
+            .arg(temp)
+            .arg(tree)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracting_a_tarball_rejects_symlinks_that_leave_the_install_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        for (name, target) in [
+            ("relative", PathBuf::from("../../../victim")),
+            ("absolute", victim.clone()),
+        ] {
+            let tree = format!("tool-{name}");
+            let source = temp.path().join(&tree);
+            std::fs::create_dir_all(source.join("bin")).unwrap();
+            std::fs::write(source.join("README"), "readme").unwrap();
+            std::os::unix::fs::symlink(&target, source.join("bin/tool")).unwrap();
+            let archive = temp.path().join(format!("{tree}.tar.gz"));
+            if !tar_gz(temp.path(), &archive, &tree) {
+                return;
+            }
+            let installs = temp.path().join(format!("installs-{name}"));
+            let install_dir = installs.join("tool-abcd1234");
+            let err = Vfox::test().extract(&archive, &install_dir).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("points outside of the install directory"),
+                "{name}: {err}"
+            );
+            assert!(!install_dir.exists(), "{name}");
+        }
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracting_a_tarball_keeps_symlinks_inside_the_install_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("tool-1.0");
+        std::fs::create_dir_all(source.join("libexec")).unwrap();
+        std::fs::write(source.join("libexec/tool"), "#!/bin/sh\n").unwrap();
+        std::os::unix::fs::symlink("libexec", source.join("bin")).unwrap();
+        let archive = temp.path().join("tool-1.0.tar.gz");
+        if !tar_gz(temp.path(), &archive, "tool-1.0") {
+            return;
+        }
+        let install_dir = temp.path().join("installs/tool-abcd1234");
+        Vfox::test().extract(&archive, &install_dir).unwrap();
+        assert!(install_dir.join("bin").is_symlink());
+        assert!(install_dir.join("bin/tool").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracting_a_tarball_does_not_promote_a_lone_top_level_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let source = temp.path().join("tree");
+        std::fs::create_dir_all(&source).unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("tool")).unwrap();
+        let archive = temp.path().join("tool-1.0.tar.gz");
+        if !tar_gz(&source, &archive, "tool") {
+            return;
+        }
+        let install_dir = temp.path().join("installs/tool-abcd1234");
+        assert!(Vfox::test().extract(&archive, &install_dir).is_err());
+        assert!(!install_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracting_a_zip_keeps_symlinks() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("tool-1.0.zip");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            let options = zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+            zip.start_file("tool-1.0/bin/tool", options).unwrap();
+            zip.write_all(b"#!/bin/sh\n").unwrap();
+            zip.add_symlink("tool-1.0/bin/tool-link", "tool", options)
+                .unwrap();
+            zip.start_file("tool-1.0/lib/node_modules/npm/bin/npm-cli.js", options)
+                .unwrap();
+            zip.write_all(b"// npm\n").unwrap();
+            zip.add_symlink(
+                "tool-1.0/bin/npm",
+                "../lib/node_modules/npm/bin/npm-cli.js",
+                options,
+            )
+            .unwrap();
+            zip.finish().unwrap();
+        }
+        let install_dir = temp.path().join("installs/tool-abcd1234");
+        Vfox::test().extract(&archive, &install_dir).unwrap();
+
+        let link = install_dir.join("bin/tool-link");
+        assert!(link.is_symlink());
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("tool"));
+        // a link into a sibling directory, checked after the top-level directory is stripped
+        let npm = install_dir.join("bin/npm");
+        assert!(npm.is_symlink());
+        assert_eq!(std::fs::read_to_string(&npm).unwrap(), "// npm\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracting_a_zip_rejects_symlinks_that_escape_once_the_top_level_directory_is_stripped() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("tool-1.0.zip");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            // inside the extraction directory, but a sibling of the install directory
+            zip.add_symlink("tool-1.0/bin/link", "../../other-tool", options)
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        let install_dir = temp.path().join("installs/tool-abcd1234");
+        assert!(Vfox::test().extract(&archive, &install_dir).is_err());
+        assert!(!install_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracting_a_zip_rejects_chained_symlinks_that_escape_once_stripped() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("tool-1.0.zip");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            // each link stays inside the extraction directory; together they leave the
+            // install directory once the top-level directory is stripped
+            zip.add_symlink("tool-1.0/x/up", "..", options).unwrap();
+            zip.add_symlink("tool-1.0/y", "x/up/..", options).unwrap();
+            zip.finish().unwrap();
+        }
+        let install_dir = temp.path().join("installs/tool-abcd1234");
+        assert!(Vfox::test().extract(&archive, &install_dir).is_err());
+        assert!(!install_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracting_a_zip_rejects_dangling_links_through_a_linked_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("tool-1.0.zip");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            zip.add_symlink("tool-1.0/alias", "..", options).unwrap();
+            zip.add_symlink("tool-1.0/link", "alias/../missing/outside", options)
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        let install_dir = temp.path().join("installs/tool-abcd1234");
+        assert!(Vfox::test().extract(&archive, &install_dir).is_err());
+        assert!(!install_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracting_a_zip_rejects_a_symlink_as_the_top_level_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("tool-1.0.zip");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            zip.add_symlink("a", ".", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        let install_dir = temp.path().join("installs/tool-abcd1234");
+        assert!(Vfox::test().extract(&archive, &install_dir).is_err());
+        assert!(!install_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracting_a_zip_accepts_symlink_loops_that_stay_inside() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("tool-1.0.zip");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            zip.add_symlink("tool-1.0/a", "b", options).unwrap();
+            zip.add_symlink("tool-1.0/b", "a", options).unwrap();
+            zip.finish().unwrap();
+        }
+        let install_dir = temp.path().join("installs/tool-abcd1234");
+        Vfox::test().extract(&archive, &install_dir).unwrap();
+        assert!(install_dir.join("a").is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracting_a_zip_rejects_symlinks_that_escape_the_install_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("tool-1.0.zip");
+        {
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+            let options = zip::write::SimpleFileOptions::default();
+            zip.add_symlink("tool-1.0/escape", "../../../outside", options)
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        let install_dir = temp.path().join("installs/tool-abcd1234");
+        assert!(Vfox::test().extract(&archive, &install_dir).is_err());
+        assert!(!install_dir.exists());
+    }
+}
