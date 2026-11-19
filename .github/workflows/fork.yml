@@ -25,11 +25,11 @@ permissions:
 
 jobs:
   release:
-    uses: zysys/github-workflows/.github/workflows/fork.yml@57352e0aac9de4021b65725a1c62a442a197239b # v2.0.0
+    uses: zysys/github-workflows/.github/workflows/fork.yml@953c49399d19f37770509f469ea51266e039b668 # v2.1.0
     permissions:
       contents: write
     with:
-      scripts_ref: 57352e0aac9de4021b65725a1c62a442a197239b
+      scripts_ref: 953c49399d19f37770509f469ea51266e039b668
       mirror: main
       binary: mise
       check: 'cargo check --locked --bin mise'
