@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# A fresh machine that already has a different ~/.profile adopts a published
+# setup and changes nothing else. Its adopt must publish nothing: no path
+# deleted and added back, no rewritten encrypted object, and no conflict for
+# a second machine that does the same before it syncs. Undo still restores
+# the profile the machine had and removes the files the adopt created.
+require_cmd git
+export MISE_HISTORY_NOTIFY=false
+capture_test="${ROOT:?}/e2e/cli/test_dotfiles_encrypted_capture"
+MISE_AGE_KEY=$(sed -n 's/^export MISE_AGE_KEY=//p' "$capture_test" | head -1 | tr -d '"')
+[ -n "$MISE_AGE_KEY" ] || {
+  echo "no age key in $capture_test" >&2
+  exit 1
+}
+export MISE_AGE_KEY
+origin="$PWD/adopt-publishes-nothing.git"
+git init -q --bare -b main "$origin"
+mkdir -p "$MISE_CONFIG_DIR" ~/.cfg
+{
+  echo '[history.encryption]'
+  echo 'recipients = ["age1fuvsfq02qr5ju0nhh3rulrwracymjljlr5j49kres24ltd3fjq0s9z9d8l"]'
+  echo '[dotfiles]'
+  echo '"~/.profile" = { mode = "track" }'
+  echo '"~/.cfg/plain.conf" = { mode = "track" }'
+  echo '"~/.cfg/secret.conf" = { mode = "track", encrypt = true }'
+  echo '"~/.cfg/local-secret.conf" = { mode = "track", encrypt = true }'
+} >"$MISE_CONFIG_DIR/config.toml"
+echo 'export FROM=machine-a' >~/.profile
+echo 'plain shared' >~/.cfg/plain.conf
+echo 'secret shared' >~/.cfg/secret.conf
+echo 'secret local shared' >~/.cfg/local-secret.conf
+assert_succeed "mise dot save"
+assert_succeed "mise dot origin set file://$origin --sync manual --yes"
+assert_succeed "mise dot sync"
+before=$(git --git-dir="$origin" rev-parse main)
+
+machine() {
+  local home="$1"
+  shift
+  (
+    cd "$home" || exit
+    env HOME="$home" XDG_CONFIG_HOME="$home/.config" XDG_DATA_HOME="$home/.local/share" \
+      XDG_STATE_HOME="$home/.local/state" XDG_CACHE_HOME="$home/.cache" \
+      MISE_CONFIG_DIR="$home/.config/mise" MISE_STATE_DIR="$home/.local/state/mise" \
+      MISE_DATA_DIR="$home/.local/share/mise" MISE_CACHE_DIR="$home/.cache/mise" \
+      MISE_TRUSTED_CONFIG_PATHS="$home" mise "$@"
+  )
+}
+export -f machine
+new_machine() {
+  local home
+  home="$(dirname "$HOME")/$1"
+  mkdir -p "$home"
+  echo "# the profile a new box ships with ($1)" >"$home/.profile"
+  mkdir -p "$home/.cfg"
+  echo "secret local $1" >"$home/.cfg/local-secret.conf"
+  echo "$home"
+}
+local_secret() { echo "secret local $1"; }
+
+b_home="$(new_machine b)"
+c_home="$(new_machine c)"
+b_profile=$(cat "$b_home/.profile")
+# Neither machine publishes until both have adopted.
+assert_succeed "machine $b_home bootstrap --adopt file://$origin --only dotfiles --replace-history --take-remote-all --force-dotfiles --yes"
+assert_succeed "machine $c_home bootstrap --adopt file://$origin --only dotfiles --replace-history --take-remote-all --force-dotfiles --yes"
+assert "cat $b_home/.profile" "export FROM=machine-a"
+assert "cat $b_home/.cfg/plain.conf" "plain shared"
+assert "cat $b_home/.cfg/secret.conf" "secret shared"
+assert "cat $b_home/.cfg/local-secret.conf" "$(local_secret shared)"
+assert "cat $c_home/.profile" "export FROM=machine-a"
+
+repo_of() { echo "$1/.local/state/mise/history/repo.git"; }
+export -f repo_of
+# No published checkpoint deletes a path. A deletion recorded and added back,
+# on one line or across the history, is the synthetic rewrite this adopt must
+# not publish.
+published_deletions() {
+  git --git-dir="$1" log --format= --name-status "$before"..main | awk '$1 == "D" { print }'
+}
+export -f published_deletions
+assert "published_deletions $(repo_of "$b_home")" ""
+assert "published_deletions $(repo_of "$c_home")" ""
+
+# The adopted remote envelope is the saved object, not a fresh encryption of
+# the same plaintext. Equal plaintext with a different blob is a rewrite.
+adopted_blob() {
+  git --git-dir="$1" rev-parse "${2}:home/.cfg/secret.conf"
+}
+export -f adopted_blob
+assert "adopted_blob $(repo_of "$b_home") main" "$(adopted_blob "$origin" "$before")"
+assert "adopted_blob $(repo_of "$c_home") main" "$(adopted_blob "$origin" "$before")"
+
+# B publishes first. Git then sees no conflict between origin and C, whose
+# objects live in C's own repository.
+assert_succeed "machine $b_home dot sync"
+assert_succeed "machine $b_home dot pull --yes"
+conflicted_paths() {
+  local listed
+  listed=$(GIT_ALTERNATE_OBJECT_DIRECTORIES="$2/objects" git --git-dir="$1" \
+    merge-tree --write-tree --name-only main "$(git --git-dir="$2" rev-parse main)") || return 1
+  printf '%s\n' "$listed" | awk 'NR > 1 && NF { print }'
+}
+export -f conflicted_paths
+assert "conflicted_paths $origin $(repo_of "$c_home")" ""
+
+assert_succeed "machine $c_home dot sync"
+assert_succeed "machine $c_home dot pull --yes"
+assert "git --git-dir=$origin diff --name-only $before main" ""
+assert "cat $b_home/.profile" "export FROM=machine-a"
+assert "cat $c_home/.cfg/secret.conf" "secret shared"
+
+# Undo restores the profile this machine had and removes files the adopt created.
+assert_succeed "machine $b_home dot undo --yes"
+assert "cat $b_home/.profile" "$b_profile"
+assert_fail "test -e $b_home/.cfg/plain.conf"
+assert_fail "test -e $b_home/.cfg/secret.conf"
+assert "cat $b_home/.cfg/local-secret.conf" "$(local_secret b)"
+# The replaced encrypted file is saved as an envelope, never as plaintext.
+recovery_blob() {
+  local repo ref oid
+  repo=$(repo_of "$1")
+  ref=$(git --git-dir="$repo" for-each-ref --format='%(objectname)' refs/mise-history/recovery)
+  oid=$(git --git-dir="$repo" rev-parse "$ref:home/.cfg/local-secret.conf")
+  git --git-dir="$repo" cat-file -p "$oid" | head -1
+}
+export -f recovery_blob
+assert "recovery_blob $b_home" "mise-encrypted-file-v1"

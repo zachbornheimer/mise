@@ -59,7 +59,7 @@ mise dot history
 - [`mise dotfiles add [FLAGS] [TARGET]…`](/cli/dotfiles/add.html)
 - [`mise dotfiles apply [FLAGS] [TARGET]…`](/cli/dotfiles/apply.html)
 - [`mise dotfiles capture [--label <LABEL>] <-- COMMAND>…`](/cli/dotfiles/capture.html)
-- [`mise dotfiles conflicts [--difftool] [--tool <TOOL>] [PATH]…`](/cli/dotfiles/conflicts.html)
+- [`mise dotfiles conflicts [FLAGS] [PATH]…`](/cli/dotfiles/conflicts.html)
 - [`mise dotfiles diff [--prompt-secrets] [TARGET]…`](/cli/dotfiles/diff.html)
 - [`mise dotfiles edit [FLAGS] <TARGET>`](/cli/dotfiles/edit.html)
 - [`mise dotfiles exclude <GLOB>`](/cli/dotfiles/exclude.html)

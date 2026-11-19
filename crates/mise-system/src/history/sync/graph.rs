@@ -93,6 +93,21 @@ impl Candidate {
         if repo.ref_oid(UPSTREAM_REF)? != self.expected_remote {
             bail!("origin changed while applying this setup; reconcile again before publication");
         }
+        // Adopting the saved head itself moves nothing. A save that landed
+        // since only added descendants of it, which stay saved and wait for
+        // the next sync; failing here threw the whole sync away for that.
+        if self.expected_local.as_deref() == Some(self.commit.as_str()) {
+            let head = repo.ref_oid(HistoryRepo::HISTORY_REF)?;
+            if let Some(head) = head.as_deref()
+                && (head == self.commit
+                    || repo
+                        .merge_bases(head, &self.commit)?
+                        .iter()
+                        .any(|base| base == &self.commit))
+            {
+                return Ok(());
+            }
+        }
         // Compare-and-swap also verifies no local boundary/save was inserted
         // during application. The caller must recompute instead of dropping it.
         repo.update_history_head(&self.commit, self.expected_local.as_deref())

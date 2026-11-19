@@ -139,7 +139,7 @@ impl DotfilesOriginSet {
                 }
             },
         };
-        let (store, tracked, _) = super::history::open().await?;
+        let (store, tracked) = super::history::open_store().await?;
         if let Some(reason) = store.unavailable() {
             bail!("cannot connect a setup repository: {reason}");
         }

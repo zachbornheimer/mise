@@ -19,6 +19,9 @@ The watcher does this on its own in `sync` and `fetch-only` mode (the `history.s
 - **`--fetch-only`** — Fetch without pushing
 - **`--allow-plaintext-history`** — Allow pushing older unencrypted versions of files that are now encrypted, and versions that look like they contain secrets
 - **`--best-effort`** — Warn instead of failing when the origin is unreachable
+- **`--wait <DURATION>`** — Wait this long for a running sync or pull instead of failing
+
+  Accepts a duration such as `90s`, `5m` or `1h` (at most one hour). Without it the wait is `history.lock_wait`, 30 seconds by default; `0` fails at once. The refusal names the holder either way.
 - **`-h --help`** — Print help
 
 ## Examples

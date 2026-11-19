@@ -227,6 +227,22 @@ latest checkpoint, unsaved changes), Repository (the origin, branch, mode, and
 sync times), Conflicts, Automatic capture, and Bootstrap. A Next steps list
 names the commands that clear whatever needs attention.
 
+The Conflicts section lists a path both machines changed. A regular text file
+is not listed when the only difference is CRLF versus LF, spaces or tabs at
+the end of a line, or one missing or extra final newline. mise keeps this
+machine's saved bytes, including an encrypted file's saved envelope, and does
+not rewrite them. A `.json`, `.toml`, `.yaml`, or `.yml` file that still differs is merged by
+key when the base, this machine, and the other machine all parse and are at
+most 1 MiB: mappings merge recursively, arrays and scalars are taken whole, a
+key changed on one side takes that side, and the same change on both sides is
+kept. Equal parsed values keep this machine's bytes, including key order and
+TOML or YAML comments. A key changed differently on both sides, or deleted on one side
+and edited on the other, stays a conflict; mise does not write conflict
+markers or pick a side. A file that does not parse, is larger than 1 MiB, or
+has another extension is left to the earlier comparison. A changed byte,
+leading whitespace, a blank line, a lone carriage return, other Unicode
+whitespace, a mode change, a symlink target, and a binary file stay conflicts.
+
 | State                                              | Meaning                                                                                      | What to do                                                            |
 | -------------------------------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
 | `applied`                                          | The target matches its entry.                                                                | Nothing.                                                              |
@@ -272,6 +288,23 @@ any entry or edit is `missing`, `source missing`, `differs`, or
   and `state`.
 - Each `orphaned` element has `target`, `group`, and `state`, which is
   `orphaned` or `orphaned_changed`.
+
+## Conflict handoff {#conflict-handoff}
+
+[`mise dot conflicts --json`](/cli/dotfiles/conflicts.html) prints one record
+per sharing conflict and writes nothing. It does not take the sync lock.
+`--sides DIR` writes each present side as plaintext and adds that side's path
+to the record. Encrypted sides are decrypted first; a plain diff and
+`--difftool` use that same plaintext.
+
+- `path` is the absolute live path. `branch_path` is the path in history.
+- `kind` is the conflict kind. `detail` is present only when the conflict has one.
+- `encrypted` is true when any saved side is an encrypted envelope.
+- `local`, `remote`, and `base` each have `present` and `mode`. An absent side has `mode` `absent`. A present side's `mode` is its Git mode, such as `100644` or `100755`.
+- `resolve.take_remote` and `resolve.keep_local` are exact commands that decide the saved conflict, quoting the absolute live path. `resolve.merged` saves the current live file, keeps that saved version, and syncs it. `resolve` is `null` when no command can decide the conflict.
+- The record never includes file content. Only `--sides` writes files.
+
+`--sides` requires a path that does not exist and creates it at mode `0700`. An existing file, directory, or symlink is refused, so plaintext is never written into a directory someone else can read. Each present side is `conflict-NNNN-local.txt`, `conflict-NNNN-remote.txt`, or `conflict-NNNN-base.txt`, where `NNNN` is that conflict's index, created at mode `0600`. An absent side is omitted. The index keeps two history paths from sharing a file.
 
 ## State files {#state-files}
 
@@ -382,6 +415,24 @@ changes the wait; `MISE_HISTORY_LOCK_WAIT=5m mise dot save` waits up to five
 minutes, and `0` fails at once. `mise dot watch` and `mise dot recover` never
 wait.
 
+A refusal names the holder: the pid it recorded, the command that pid runs, and
+how long it has held the lock. That is the difference between a sync finishing
+in seconds and a watcher parked on the lock, whose window is only open between
+its own syncs. `mise dot sync --wait 5m` and `mise dot pull --wait 5m` queue for
+that long regardless of `history.lock_wait`; stop a watcher you do not want
+instead of waiting for it. A holder from a mise older than this one recorded no
+pid, and the refusal says so.
+
+A fetch, push, or remote listing holds that same sync lock while Git runs, so a
+stalled transfer holds it too.
+[`history.network_timeout`](/configuration/settings.html#history.network_timeout)
+bounds the transfer: the default is five minutes, `0` waits without a limit,
+and a value above `1h` counts as `1h`. When it elapses, mise ends Git and
+everything Git started, including `ssh` and `git-remote-https`, and the error
+names the Git command, how long it ran, and this setting. An HTTPS transfer
+that sends or receives nothing for 30 seconds ends on its own, whatever this
+is set to.
+
 A `mise bootstrap` with nothing tracked and no existing history touches the
 history store only when it first rewrites a dotfile or edit, to keep a private
 journal for recovering interrupted writes. If another mise process holds the
@@ -468,7 +519,11 @@ line. The events are `started`, `already-running`, `captured`, `unchanged`,
 runs for the store, and 1 when Git is unusable, the store cannot be opened, or
 no watch can be installed. `mise dot watch --once` runs one scan and one
 sync, and exits 1 if its save was deferred or failed, or if its sync with the
-origin failed.
+origin failed. A sync that found another sync holding the lock emits
+`sync-skipped`, names the holder, and retries a few seconds later; that is not
+a failure, and `--once` exits 0. A
+failed sync waits somewhere between half and all of its backoff, and a periodic
+fetch lands within a tenth of `history.fetch_interval`.
 
 ## Retention {#retention}
 

@@ -57,6 +57,76 @@ pub const EXECUTABLE_GONE_ADVICE: &str = "the mise executable this watcher runs 
 /// check and cannot read a newer enrollment record.
 pub const STALE_WATCHER_SCHEMA_ADVICE: &str = "the history watcher is running an older mise that cannot read current dotfile tracking metadata; run `mise bootstrap services apply` to restart it on the installed version";
 
+/// What to tell the user when macOS denies a tracked folder to this binary.
+/// Every release installs to a new path, so a previous grant does not cover it.
+pub const MACOS_PRIVACY_HINT: &str = "on macOS, grant this mise binary access to that folder in System Settings > Privacy & Security";
+
+/// The marker a denial report starts with, so a later readable capture can
+/// clear these lines without touching an unrelated degraded reason.
+pub const PERMISSION_DEGRADED_PREFIX: &str = "unreadable: ";
+
+/// Whether `error` is the operating system refusing a read. Only `EPERM`
+/// and `EACCES` are a partial capture; every other failure stays as it is.
+pub fn is_permission_denied(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            error.raw_os_error(),
+            Some(nix::libc::EPERM | nix::libc::EACCES)
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        error.kind() == std::io::ErrorKind::PermissionDenied
+    }
+}
+
+/// One denial, named once: the path, the operating-system error, and the
+/// grant the binary needs before the next capture can read it.
+pub fn permission_denial(path: &str, error: &std::io::Error) -> String {
+    permission_report(path, &error.to_string())
+}
+
+/// What follows the hint, up to the path that ends every denial report.
+const PERMISSION_PATH_MARKER: &str = "; path: ";
+
+/// The same report from a denial a walk or a content read already recorded:
+/// the operating-system error, the grant that fixes it, then the path last.
+/// The path is last because it is the one part with no fixed shape: an error
+/// text and a file name can both contain parentheses, and a fixed hint
+/// followed by a fixed marker is the only boundary neither can imitate. The
+/// path is matched whole, so `~/notes` does not hide `~/notes-other`.
+pub fn permission_report(path: &str, reason: &str) -> String {
+    format!(
+        "{PERMISSION_DEGRADED_PREFIX}{reason}; {MACOS_PRIVACY_HINT}{PERMISSION_PATH_MARKER}{path}"
+    )
+}
+
+/// The display path a denial report names, or nothing when `line` is another
+/// degraded reason. The path is what follows the first hint and marker, so a
+/// path or an error text that contains parentheses is read whole.
+pub fn permission_report_path(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix(PERMISSION_DEGRADED_PREFIX)?;
+    let after_hint = &rest[rest.find(MACOS_PRIVACY_HINT)? + MACOS_PRIVACY_HINT.len()..];
+    after_hint.strip_prefix(PERMISSION_PATH_MARKER)
+}
+
+/// Replaces denial reports with `denied` and leaves every other degraded
+/// reason where it was. An empty `denied` clears only the denial reports.
+/// A path already named is kept once, compared as a path rather than a prefix.
+pub fn replace_permission_denials(degraded: &mut Vec<String>, denied: &[String]) {
+    degraded.retain(|line| permission_report_path(line).is_none());
+    let mut seen = std::collections::BTreeSet::new();
+    for line in denied {
+        let Some(path) = permission_report_path(line) else {
+            continue;
+        };
+        if seen.insert(path) {
+            degraded.push(line.clone());
+        }
+    }
+}
+
 /// Whether a capture error came from a watcher whose enrollment schema
 /// predates tracked-entry exclusions, includes, and plaintext selection.
 ///
@@ -165,6 +235,61 @@ mod tests {
         // without a start time to compare to, the error is reported
         assert_eq!(health(None, Some(earlier)).failing_capture(), Some("boom"));
         assert_eq!(health(Some(started), None).failing_capture(), None);
+    }
+
+    #[test]
+    fn replacing_permission_denials_keeps_an_unrelated_reason() {
+        let first = permission_report("~/Desktop/a", "Operation not permitted");
+        let second = permission_report("~/Desktop/b", "Permission denied");
+        let unrelated = "cannot watch ~/notes: limit reached".to_string();
+        let mut degraded = vec![first, unrelated.clone()];
+        replace_permission_denials(&mut degraded, std::slice::from_ref(&second));
+        assert_eq!(degraded, vec![unrelated.clone(), second]);
+        replace_permission_denials(&mut degraded, &[]);
+        assert_eq!(degraded, vec![unrelated]);
+    }
+
+    #[test]
+    fn a_report_names_its_path_whatever_parentheses_the_error_and_path_hold() {
+        // a real operating-system error text carries its own parentheses
+        let reason = std::io::Error::from_raw_os_error(13).to_string();
+        assert!(reason.contains(" (os error 13)"), "{reason}");
+        let path = "~/notes (work)/a (draft); path: b.toml";
+        let line = permission_report(path, &reason);
+        assert_eq!(permission_report_path(&line), Some(path));
+        assert!(line.contains(MACOS_PRIVACY_HINT), "{line}");
+        assert!(line.contains(&reason), "{line}");
+        assert_eq!(permission_report_path("cannot watch ~/notes: limit"), None);
+    }
+
+    #[test]
+    fn replacing_permission_denials_keeps_a_path_that_starts_with_another() {
+        let shorter = permission_report("~/notes", "Permission denied");
+        let longer = permission_report("~/notes-other", "Permission denied");
+        let mut degraded = vec!["cannot watch ~/notes: limit reached".into()];
+        replace_permission_denials(&mut degraded, &[shorter.clone(), longer.clone()]);
+        assert!(degraded.iter().any(|line| line == &shorter));
+        assert!(degraded.iter().any(|line| line == &longer));
+        assert_eq!(
+            degraded
+                .iter()
+                .filter(|line| permission_report_path(line).is_some())
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_eperm_and_eacces_are_a_permission_denial() {
+        let denied = |code| std::io::Error::from_raw_os_error(code);
+        assert!(is_permission_denied(&denied(nix::libc::EPERM)));
+        assert!(is_permission_denied(&denied(nix::libc::EACCES)));
+        assert!(!is_permission_denied(&denied(nix::libc::EIO)));
+        assert!(!is_permission_denied(&std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "gone"
+        )));
     }
 
     #[test]

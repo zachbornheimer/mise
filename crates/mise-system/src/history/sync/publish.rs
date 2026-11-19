@@ -18,7 +18,31 @@ pub(crate) fn build(
 ) -> Result<Option<String>> {
     let heads = Heads::read(repo)?;
     if heads.local.as_deref() != expected_local {
-        bail!("local saved history changed while planning; reconcile again");
+        // A save landed after planning. The planned checkpoint is still in
+        // the history; when it fast-forwards the origin it is published as
+        // planned, and the newer saves wait for the next sync. Only a merge,
+        // which would have to move the head, must be planned again.
+        let Some(pinned) = expected_local else {
+            bail!("local saved history changed while planning; reconcile again");
+        };
+        if heads.remote.as_deref() != upstream
+            || !fast_forwards(repo, pinned, heads.local.as_deref(), upstream)?
+        {
+            bail!("local saved history changed while planning; reconcile again");
+        }
+        if upstream == Some(pinned) {
+            return Ok(None);
+        }
+        if !allow_plaintext_history {
+            super::files::audit_history(repo, pinned, &Default::default())?;
+            super::secrets::audit_unpublished(
+                repo,
+                pinned,
+                upstream,
+                &mise_settings::Settings::get().history.allow_secret_values,
+            )?;
+        }
+        return Ok(Some(pinned.to_string()));
     }
     if heads.remote.as_deref() != upstream {
         bail!("origin changed while preparing publication; reconcile again");
@@ -37,16 +61,29 @@ pub(crate) fn build(
         // Enrollment is a keyed inventory, not arbitrary JSON text. Git's
         // line merge can conflict on independent additions or combine policy
         // changes into invalid metadata. Validate its structured merge first.
-        if let Some(base) = &heads.base {
-            use crate::history::manifest::Manifest;
-            if let (Some(base), Some(ours), Some(theirs)) = (
-                Manifest::read(repo, base)?,
-                Manifest::read(repo, local)?,
-                Manifest::read(repo, remote)?,
-            ) {
-                merged = Manifest::merge(&base, &ours, &theirs)?.write(repo, &merged)?;
-                conflicts.retain(|path| path != crate::history::manifest::PATH);
-            }
+        // Several merge bases have no commit to read. Their enrollment is
+        // one virtual manifest, the same one sync applies; file conflicts
+        // still settle against a real commit, never that manifest.
+        let base = super::run::enrollment_base(repo, local, remote)?;
+        use crate::history::manifest::Manifest;
+        if let (Some(ours), Some(theirs)) =
+            (Manifest::read(repo, local)?, Manifest::read(repo, remote)?)
+        {
+            merged = Manifest::merge(&base, &ours, &theirs)?.write(repo, &merged)?;
+            conflicts.retain(|path| path != crate::history::manifest::PATH);
+            // A conflicted encrypted path whose decrypted content is equal is not a
+            // conflict to resolve: the local saved envelope stands, and Git's
+            // version of that path is never published.
+            let settled = super::run::settle_conflicts(
+                repo,
+                heads.base.as_deref(),
+                local,
+                remote,
+                &merged,
+                conflicts,
+            )?;
+            merged = settled.0;
+            conflicts = settled.1;
         }
         let unresolved: Vec<_> = conflicts
             .iter()
@@ -97,6 +134,28 @@ pub(crate) fn build(
     Ok(Some(candidate.commit))
 }
 
+/// Whether publishing `pinned` is a plain fast-forward: it is still part of
+/// the saved history (`head` descends from it) and the origin is behind it.
+pub(crate) fn fast_forwards(
+    repo: &HistoryRepo,
+    pinned: &str,
+    head: Option<&str>,
+    upstream: Option<&str>,
+) -> Result<bool> {
+    let contains = |descendant: &str, ancestor: &str| -> Result<bool> {
+        Ok(descendant == ancestor
+            || repo
+                .merge_bases(descendant, ancestor)?
+                .iter()
+                .any(|base| base == ancestor))
+    };
+    let Some(head) = head else { return Ok(false) };
+    Ok(contains(head, pinned)?
+        && match upstream {
+            None => true,
+            Some(upstream) => contains(pinned, upstream)?,
+        })
+}
 pub(crate) fn push(
     remote: &Remote<'_>,
     branch: &str,
