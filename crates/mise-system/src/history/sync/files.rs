@@ -140,7 +140,7 @@ fn audit_history_cached(
                 // A record Git merged as text still holds only envelopes, so
                 // no plaintext enters history through it; its sides are
                 // resolved from decrypted content when it is read.
-                || record_of_envelopes_in(repo, &objects, &object)?;
+                || record_of_envelopes_in(repo, &objects, &object, &path)?;
             if !valid {
                 bail!(
                     "cannot publish: encrypted path {path} has an unencrypted or invalid version in commit {commit}; encrypting the latest version does not erase earlier plaintext. Remove that history before pushing, or use `mise dot sync --allow-plaintext-history` to publish it anyway",
@@ -772,11 +772,12 @@ fn normalized_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     })
 }
 
-/// Whether a record merged as text still holds only envelopes.
+/// Whether a record merged as text still holds only envelopes of this path.
 fn record_of_envelopes_in(
     repo: &HistoryRepo,
     objects: &gix::Repository,
     object: &Object,
+    path: &str,
 ) -> Result<bool> {
     if !repo.blob_starts_with_in(objects, &object.1, MAGIC)? {
         return Ok(false);
@@ -787,9 +788,11 @@ fn record_of_envelopes_in(
     }
     let envelopes = record_envelopes(&bytes);
     Ok(!envelopes.is_empty()
-        && envelopes
-            .iter()
-            .all(|candidate| parse_envelope(candidate).is_some()))
+        && envelopes.iter().all(|candidate| {
+            parse_envelope(candidate).is_some_and(|outer| {
+                outer.path == path && matches!(outer.mode.as_str(), "100644" | "100755" | "120000")
+            })
+        }))
 }
 
 fn open(repo: &HistoryRepo, path: &str, outer: &Envelope, interactive: bool) -> Result<Object> {
@@ -1581,7 +1584,10 @@ mod tests {
             b"one saved version",
             "scheme"
         ));
-        assert!(record_of_envelopes_in(&repo, &repo.gix().unwrap(), &same).unwrap());
+        assert!(record_of_envelopes_in(&repo, &repo.gix().unwrap(), &same, path).unwrap());
+        // the same record under another path is not that path's record
+        let other = "tracked/home/other"; // portable-home-ok
+        assert!(!record_of_envelopes_in(&repo, &repo.gix().unwrap(), &same, other).unwrap());
 
         // Different content is a real conflict, not a record to adopt.
         let conflict = merged_record(b"left version", b"right version");
