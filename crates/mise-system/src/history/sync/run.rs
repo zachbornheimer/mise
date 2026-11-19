@@ -1858,6 +1858,49 @@ pub(super) fn settle_conflicts(
             });
             continue;
         }
+        // A structured file is merged by key before any line merge. A
+        // parsed clash must stay a conflict: a clean line merge would hide it.
+        if let Some(base) = base
+            && let Some(base_object) = repo.object_at(base, path)?
+        {
+            match super::files::merge_by_key(repo, path, &base_object, &saved, &theirs, false)? {
+                super::files::KeyMerge::KeepLocal => {
+                    settled.insert(path.clone());
+                    overlays.push(crate::history::shadow::Overlay {
+                        path: path.clone(),
+                        object: Some(saved),
+                    });
+                    continue;
+                }
+                super::files::KeyMerge::Merged { mode, text } => {
+                    let local_encrypted = repo.blob_starts_with(&saved.1, super::files::MAGIC)?;
+                    let remote_encrypted = repo.blob_starts_with(&theirs.1, super::files::MAGIC)?;
+                    let base_encrypted =
+                        repo.blob_starts_with(&base_object.1, super::files::MAGIC)?;
+                    if local_encrypted != remote_encrypted || local_encrypted != base_encrypted {
+                        continue;
+                    }
+                    let object = if local_encrypted {
+                        let tree = repo.output_tree_of(local)?;
+                        let recipients = super::files::recipients_of(repo, &tree, path, &saved)?;
+                        let scheme = super::files::scheme_of(repo, &saved)?;
+                        super::files::seal(repo, path, &mode, &text, &scheme, &recipients)?
+                    } else {
+                        (mode, repo.store_blob(&text)?)
+                    };
+                    settled.insert(path.clone());
+                    overlays.push(crate::history::shadow::Overlay {
+                        path: path.clone(),
+                        object: Some(object),
+                    });
+                    continue;
+                }
+                super::files::KeyMerge::Clash => {
+                    continue;
+                }
+                super::files::KeyMerge::Inapplicable => {}
+            }
+        }
         // A symlink, a binary file, and a mode change are not text to merge.
         // A regular file whose sides changed different lines is merged here
         // exactly as Git used to, before -merge kept one side instead.

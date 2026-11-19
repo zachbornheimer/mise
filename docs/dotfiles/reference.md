@@ -231,9 +231,17 @@ The Conflicts section lists a path both machines changed. A regular text file
 is not listed when the only difference is CRLF versus LF, spaces or tabs at
 the end of a line, or one missing or extra final newline. mise keeps this
 machine's saved bytes, including an encrypted file's saved envelope, and does
-not rewrite them. A changed byte, leading whitespace, a blank line, a lone
-carriage return, other Unicode whitespace, a mode change, a symlink target,
-and a binary file stay conflicts.
+not rewrite them. A `.json`, `.toml`, `.yaml`, or `.yml` file that still differs is merged by
+key when the base, this machine, and the other machine all parse and are at
+most 1 MiB: mappings merge recursively, arrays and scalars are taken whole, a
+key changed on one side takes that side, and the same change on both sides is
+kept. Equal parsed values keep this machine's bytes, including key order and
+TOML or YAML comments. A key changed differently on both sides, or deleted on one side
+and edited on the other, stays a conflict; mise does not write conflict
+markers or pick a side. A file that does not parse, is larger than 1 MiB, or
+has another extension is left to the earlier comparison. A changed byte,
+leading whitespace, a blank line, a lone carriage return, other Unicode
+whitespace, a mode change, a symlink target, and a binary file stay conflicts.
 
 | State                                              | Meaning                                                                                      | What to do                                                            |
 | -------------------------------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |

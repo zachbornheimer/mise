@@ -14,7 +14,10 @@ mod directories;
 pub mod files;
 pub(crate) mod format;
 pub(crate) mod graph;
+mod key_merge;
 pub mod layout;
+#[cfg(test)]
+mod merge_by_key;
 pub mod network;
 #[cfg(test)]
 mod normalized_equal;
