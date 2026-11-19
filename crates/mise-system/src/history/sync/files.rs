@@ -95,9 +95,10 @@ pub(crate) fn audit_history(
     Ok(())
 }
 
-/// Whether `object` is one encrypted envelope for `path`. A record Git merged
-/// as text holds envelopes, but it is not one envelope to copy forward.
-pub(crate) fn clean_envelope(
+/// Whether `object` is an envelope the publish audit accepts for `path`.
+/// A record Git merged as text still holds only envelopes, so no plaintext
+/// enters history through it.
+fn valid_envelope(
     repo: &HistoryRepo,
     objects: &gix::Repository,
     path: &str,
@@ -108,23 +109,9 @@ pub(crate) fn clean_envelope(
             outer.path == path
                 && matches!(outer.mode.as_str(), "100644" | "100755" | "120000")
                 && outer.ciphertext.0.starts_with(b"age-encryption.org/v1\n")
-        }),
+        }) || record_of_envelopes_in(repo, objects, object, path)?,
     )
 }
-
-/// Whether `object` is an envelope the publish audit accepts for `path`.
-/// A record Git merged as text still holds only envelopes, so no plaintext
-/// enters history through it.
-pub(crate) fn valid_envelope(
-    repo: &HistoryRepo,
-    objects: &gix::Repository,
-    path: &str,
-    object: &Object,
-) -> Result<bool> {
-    Ok(clean_envelope(repo, objects, path, object)?
-        || record_of_envelopes_in(repo, objects, object, path)?)
-}
-
 /// One saved version the publish audit refuses: an encrypted path whose
 /// object in `commit` is not a valid envelope.
 #[derive(Clone, Debug, PartialEq, Eq)]
