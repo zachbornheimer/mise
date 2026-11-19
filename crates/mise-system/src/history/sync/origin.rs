@@ -330,7 +330,11 @@ pub(super) fn refuse_missing_branch(remote: &Remote<'_>, branch: &str, url: &str
 pub fn report(outcome: &run::SyncOutcome) {
     match &outcome.published {
         Some(commit) => info!("history: published {}", crate::history::short(commit)),
-        None => info!("history: nothing new to publish"),
+        None => match &outcome.publish_skipped {
+            Some(skip) => info!("history: {}", skip.sentence()),
+            // local and remote tips are equal (or there is nothing saved)
+            None => info!("history: nothing new to publish"),
+        },
     }
     // a directory whose permissions change is a change here, though no
     // file is written

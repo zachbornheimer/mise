@@ -820,13 +820,17 @@ async fn finish_sync(
             "synchronized: {}, {} incoming change(s) pending, {} conflict(s)",
             match &outcome.published {
                 Some(commit) => format!("published {}", crate::history::short(commit)),
-                None => "nothing new to publish".to_string(),
+                None => match &outcome.publish_skipped {
+                    Some(skip) => skip.sentence(),
+                    None => "nothing new to publish".to_string(),
+                },
             },
             outcome.pending,
             outcome.conflicts
         ),
         json!({
             "published": outcome.published,
+            "publish_skipped": outcome.publish_skipped,
             "pending": outcome.pending,
             "conflicts": outcome.conflicts,
         }),
