@@ -10,6 +10,7 @@
 
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use age::ssh;
 use age::{Decryptor, Encryptor, Identity, IdentityFile, Recipient};
@@ -176,7 +177,7 @@ pub async fn decrypt_bytes_mode(
             "encrypted payload exceeds the size limit".into(),
         ));
     }
-    let loaded = load_identities(interactive).await;
+    let loaded = identities_for(interactive).await;
     if loaded.identities.is_empty() {
         if loaded.plugins > 0 {
             return Err(DecryptError::Failed { error: "hardware identity requires an interactive restore with its age plugin installed".into(), hint: String::new() });
@@ -307,20 +308,146 @@ pub async fn ssh_public_key_for_private(path: &Path) -> Result<String> {
 /// named by the settings and the default `age.txt`, and the SSH keys named
 /// by the settings and the default `~/.ssh/id_ed25519` / `id_rsa`.
 pub async fn load_all_identities() -> LoadedIdentities {
+    // Callers of this public loader need their own identities. The shared
+    // load stays with decryption; this copy is the contract those callers
+    // already had, not a copy made once per file.
     load_identities(false).await
 }
 
+/// What a load was read from. Two loads of the same source parse the same
+/// identities, so the second reuses the first. A key file edited or replaced
+/// in place, and one swapped by rename, changes its stamp.
+#[derive(Clone, PartialEq, Eq)]
+struct IdentitySource {
+    age_key: Option<String>,
+    files: Vec<KeyFile>,
+    ssh_files: Vec<KeyFile>,
+    interactive: bool,
+}
+
+/// A key file and the facts that change when its contents change: its
+/// length, its modification time, and, where the platform has them, its
+/// identity and the time its metadata last changed. A rename changes the
+/// identity; an edit changes the length or a time.
+#[derive(Clone, PartialEq, Eq)]
+struct KeyFile {
+    path: PathBuf,
+    stamp: Option<FileStamp>,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct FileStamp {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    identity: (u64, u64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl FileStamp {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        let (identity, changed) = {
+            use std::os::unix::fs::MetadataExt;
+            ((meta.dev(), meta.ino()), (meta.ctime(), meta.ctime_nsec()))
+        };
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok()?,
+            #[cfg(unix)]
+            identity,
+            #[cfg(unix)]
+            changed,
+        })
+    }
+}
+
+impl IdentitySource {
+    async fn current(interactive: bool) -> Self {
+        Self {
+            age_key: env::var("MISE_AGE_KEY").ok().filter(|key| !key.is_empty()),
+            files: get_all_identity_files()
+                .await
+                .into_iter()
+                .map(KeyFile::of)
+                .collect(),
+            ssh_files: get_all_ssh_identity_files()
+                .into_iter()
+                .map(KeyFile::of)
+                .collect(),
+            interactive,
+        }
+    }
+}
+
+impl KeyFile {
+    fn of(path: PathBuf) -> Self {
+        let stamp = FileStamp::of(&path);
+        Self { path, stamp }
+    }
+}
+
+struct CachedIdentities {
+    source: IdentitySource,
+    loaded: Arc<LoadedIdentities>,
+}
+
+/// One load for an interactive decryption and one for an unattended one.
+/// The two alternate within a sync, and one slot would reload on every file.
+static IDENTITIES: LazyLock<[Mutex<Option<CachedIdentities>>; 2]> =
+    LazyLock::new(|| [Mutex::new(None), Mutex::new(None)]);
+
+async fn identities_for(interactive: bool) -> Arc<LoadedIdentities> {
+    cached_identities(&IdentitySource::current(interactive).await).await
+}
+
+async fn cached_identities(source: &IdentitySource) -> Arc<LoadedIdentities> {
+    let slot = &IDENTITIES[usize::from(source.interactive)];
+    if let Some(cached) = slot.lock().ok().and_then(|cache| {
+        cache
+            .as_ref()
+            .filter(|cached| &cached.source == source)
+            .map(|cached| Arc::clone(&cached.loaded))
+    }) {
+        return cached;
+    }
+    let (loaded, reusable) = load_from(source).await;
+    let loaded = Arc::new(loaded);
+    // A read that failed is not remembered: the file may be readable a moment
+    // later, and a cached failure would keep every later decryption from it.
+    if reusable
+        && let Ok(mut cache) = slot.lock()
+        && cache.as_ref().is_none_or(|cached| &cached.source != source)
+    {
+        *cache = Some(CachedIdentities {
+            source: source.clone(),
+            loaded: Arc::clone(&loaded),
+        });
+    }
+    loaded
+}
+
 async fn load_identities(interactive: bool) -> LoadedIdentities {
-    let identity_files = get_all_identity_files().await;
-    let ssh_identity_files = get_all_ssh_identity_files();
+    // This public loader's caller needs identities it can move. Age identities
+    // are not Clone, so this is a separate read, not a copy of the shared load
+    // decryption reuses. It is not read once per file.
+    load_from(&IdentitySource::current(interactive).await)
+        .await
+        .0
+}
+
+async fn load_from(source: &IdentitySource) -> (LoadedIdentities, bool) {
+    let identity_files = &source.files;
+    let ssh_identity_files = &source.ssh_files;
+    let mut reusable = true;
     let mut loaded = LoadedIdentities::default();
     let mut plugin_sources = Vec::new();
 
-    if let Ok(age_key) = env::var("MISE_AGE_KEY")
-        && !age_key.is_empty()
-    {
+    if let Some(age_key) = &source.age_key {
         plugin_sources.push(age_key.clone());
-        let age_key = software_identity_text(&age_key);
+        let age_key = software_identity_text(age_key);
         // raw secret keys first
         for line in age_key.lines() {
             let line = line.trim();
@@ -340,11 +467,12 @@ async fn load_identities(interactive: bool) -> LoadedIdentities {
         }
     }
 
-    for path in identity_files {
-        if !path.exists() {
+    for file in identity_files {
+        let path = &file.path;
+        if file.stamp.is_none() {
             continue;
         }
-        match file::read_to_string(&path) {
+        match file::read_to_string(path) {
             Ok(content) => {
                 plugin_sources.push(content.clone());
                 let content = software_identity_text(&content);
@@ -363,18 +491,22 @@ async fn load_identities(interactive: bool) -> LoadedIdentities {
                 }
             }
             Err(e) => {
+                // Read a moment later, the file may be readable. Remembering
+                // this load would keep every later decryption from it.
+                reusable = false;
                 debug!("age: failed to read identity file {:?}: {}", path, e);
             }
         }
     }
 
-    for path in ssh_identity_files {
-        if !path.exists() {
+    for file in ssh_identity_files {
+        let path = &file.path;
+        if file.stamp.is_none() {
             continue;
         }
-        match std::fs::File::open(&path) {
-            Ok(file) => {
-                let mut reader = BufReader::new(file);
+        match std::fs::File::open(path) {
+            Ok(opened) => {
+                let mut reader = BufReader::new(opened);
                 match ssh::Identity::from_buffer(&mut reader, Some(path.display().to_string())) {
                     Ok(identity) => {
                         if let Some(reason) = UnusableSshIdentity::classify(&identity) {
@@ -391,6 +523,7 @@ async fn load_identities(interactive: bool) -> LoadedIdentities {
                 }
             }
             Err(e) => {
+                reusable = false;
                 debug!("age: failed to read SSH identity file {:?}: {}", path, e);
             }
         }
@@ -398,9 +531,9 @@ async fn load_identities(interactive: bool) -> LoadedIdentities {
 
     // Try software recovery identities before touching hardware.
     for text in plugin_sources {
-        add_plugin_identities(&text, interactive, &mut loaded);
+        add_plugin_identities(&text, source.interactive, &mut loaded);
     }
-    loaded
+    (loaded, reusable)
 }
 
 fn software_identity_text(text: &str) -> String {
@@ -686,6 +819,75 @@ mod tests {
         let err = encrypt_bytes(b"x", &[]).unwrap_err().to_string();
         assert!(err.contains("no age recipients"), "{err}");
         assert!(!err.contains("experimental"), "{err}");
+    }
+
+    /// A source naming one key file and nothing else, so the test never reads
+    /// this machine's own keys.
+    fn source_of(path: &std::path::Path) -> IdentitySource {
+        IdentitySource {
+            age_key: None,
+            files: vec![KeyFile::of(path.to_path_buf())],
+            ssh_files: vec![],
+            interactive: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replaced_key_file_is_read_again() {
+        use age::secrecy::ExposeSecret;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("age.txt");
+        let key = age::x25519::Identity::generate();
+        std::fs::write(&path, key.to_string().expose_secret()).unwrap();
+        let source = source_of(&path);
+
+        let first = cached_identities(&source).await;
+        let again = cached_identities(&source).await;
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "an unchanged key file must be parsed once"
+        );
+
+        // Replaced by rename: the new file has its own identity, whatever its
+        // length or the clock's resolution.
+        let other = age::x25519::Identity::generate();
+        let replacement = tmp.path().join("age.txt.next");
+        std::fs::write(&replacement, other.to_string().expose_secret()).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let rotated = cached_identities(&source_of(&path)).await;
+        assert!(
+            !Arc::ptr_eq(&first, &rotated),
+            "a replaced key file must be read again"
+        );
+        assert_ne!(first.x25519_public, rotated.x25519_public);
+    }
+
+    #[tokio::test]
+    async fn a_key_file_that_cannot_be_read_is_not_remembered() {
+        use age::secrecy::ExposeSecret;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("age.txt");
+        // Present, so it is a source, and not readable as a file.
+        std::fs::create_dir(&path).unwrap();
+        let source = source_of(&path);
+
+        let failed = cached_identities(&source).await;
+        assert!(failed.identities.is_empty());
+        let again = cached_identities(&source).await;
+        assert!(
+            !Arc::ptr_eq(&failed, &again),
+            "a failed read must be tried again, not remembered"
+        );
+
+        std::fs::remove_dir(&path).unwrap();
+        let key = age::x25519::Identity::generate();
+        std::fs::write(&path, key.to_string().expose_secret()).unwrap();
+        let loaded = cached_identities(&source_of(&path)).await;
+        assert_eq!(
+            loaded.identities.len(),
+            1,
+            "the readable key must be loaded"
+        );
     }
 }
 

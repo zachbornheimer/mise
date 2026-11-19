@@ -33,10 +33,19 @@ struct VerifiedAncestry {
     protected: BTreeSet<String>,
 }
 
-// Process-local only: never trust an editable on-disk cache as proof that
-// plaintext was audited. The watcher reuses this across its short-lived stores.
+// The process remembers a proof it has already checked. The file beside the
+// repository carries that proof to the next process, but only when a secret
+// that never leaves this repository authenticates it. A copied proof, a
+// forged head, or a forged protected set fails that check and is ignored.
 static AUDITS: LazyLock<Mutex<BTreeMap<PathBuf, VerifiedAncestry>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// The audit rules this proof was written under. A different version is not
+/// proof: the history is audited again.
+const AUDIT_RULES_VERSION: u32 = 1;
+const PROOF_DIR: &str = "mise-audit";
+const PROOF_FILE: &str = "verified-ancestry";
+const PROOF_SECRET: &str = "secret";
 
 /// Raw bytes serialized as a MessagePack `bin`, whatever the serializer's
 /// default for `Vec<u8>` is.
@@ -83,22 +92,16 @@ fn audit_history_cached(
     head: &str,
     protected: &BTreeSet<String>,
 ) -> Result<usize> {
-    let cached = AUDITS
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(repo.dir()).cloned())
-        .filter(|cached| {
-            cached.head == head
-                || repo
-                    .merge_bases(&cached.head, head)
-                    .is_ok_and(|bases| bases.len() == 1 && bases[0] == cached.head)
-        });
+    let cached = remembered_ancestry(repo, head);
     if cached
         .as_ref()
         .is_some_and(|cached| cached.head == head && protected.is_subset(&cached.protected))
     {
         return Ok(0);
     }
+    // Opened once for the whole audit: opening it scans every pack index, so
+    // doing it per blob is most of a long audit's cost.
+    let objects = repo.gix()?;
     let mut commits = match &cached {
         Some(cached) => repo.rev_list_after(head, &cached.head)?,
         None => repo.rev_list(head, usize::MAX)?,
@@ -109,10 +112,7 @@ fn audit_history_cached(
     }
     // Policy changes cannot hide older plaintext, including on a merge
     // parent or a platform that this machine never activates.
-    crate::history::manifest::Manifest::read_distinct(repo, &commits, |manifest| {
-        protected.extend(manifest.encrypted_paths());
-        std::ops::ControlFlow::Continue(())
-    })?;
+    enrolled_paths(&objects, &commits, &mut protected)?;
     // A newly protected path invalidates the old proof for that policy: its
     // plaintext may live anywhere in old ancestry, including a merge parent.
     if cached
@@ -120,18 +120,19 @@ fn audit_history_cached(
         .is_some_and(|cached| cached.protected != protected)
     {
         commits = repo.rev_list(head, usize::MAX)?;
+        enrolled_paths(&objects, &commits, &mut protected)?;
     }
     let inspected = commits.len();
     let mut checked = BTreeSet::new();
     if !protected.is_empty() {
-        repo.visit_paths_in(&commits, &protected, |commit, entry| {
+        repo.visit_paths_in_open(&objects, &commits, &protected, |commit, entry| {
             if !checked.insert((entry.path.clone(), entry.mode.clone(), entry.oid.clone())) {
                 return Ok(());
             }
             let path = entry.path;
             let object = (entry.mode, entry.oid);
-            let valid =
-                envelope(repo, &object, agecrypt::MAX_ENCRYPTED_BYTES)?.is_some_and(|outer| {
+            let valid = envelope_in(repo, &objects, &object, agecrypt::MAX_ENCRYPTED_BYTES)?
+                .is_some_and(|outer| {
                     outer.path == path
                         && matches!(outer.mode.as_str(), "100644" | "100755" | "120000")
                         && outer.ciphertext.0.starts_with(b"age-encryption.org/v1\n")
@@ -139,7 +140,7 @@ fn audit_history_cached(
                 // A record Git merged as text still holds only envelopes, so
                 // no plaintext enters history through it; its sides are
                 // resolved from decrypted content when it is read.
-                || record_of_envelopes(repo, &object)?;
+                || record_of_envelopes_in(repo, &objects, &object)?;
             if !valid {
                 bail!(
                     "cannot publish: encrypted path {path} has an unencrypted or invalid version in commit {commit}; encrypting the latest version does not erase earlier plaintext. Remove that history before pushing, or use `mise dot sync --allow-plaintext-history` to publish it anyway",
@@ -148,21 +149,204 @@ fn audit_history_cached(
             Ok(())
         })?;
     }
+    remember_ancestry(repo, head, protected);
+    Ok(inspected)
+}
+
+/// The proof this process already checked, or the one the repository's own
+/// secret authenticates. A missing, unreadable, corrupt, copied, or
+/// wrong-version proof is no proof. A verified head that is not an ancestor
+/// of `head` is no proof either.
+fn remembered_ancestry(repo: &HistoryRepo, head: &str) -> Option<VerifiedAncestry> {
+    let remembered = AUDITS
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(repo.dir()).cloned());
+    let proof = remembered.or_else(|| durable_ancestry(repo));
+    proof.filter(|cached| {
+        cached.head == head
+            || repo
+                .merge_bases(&cached.head, head)
+                .is_ok_and(|bases| bases.len() == 1 && bases[0] == cached.head)
+    })
+}
+
+fn durable_ancestry(repo: &HistoryRepo) -> Option<VerifiedAncestry> {
+    let secret = std::fs::read(proof_secret(repo.dir())).ok()?;
+    if secret.len() != 32 {
+        return None;
+    }
+    let bytes = std::fs::read(proof_file(repo.dir())).ok()?;
+    let proof = serde_json::from_slice::<DurableProof>(&bytes).ok()?;
+    let repository = repository_identity(repo.dir()).ok()?;
+    if proof.rules != AUDIT_RULES_VERSION
+        || proof.repository != repository
+        || !proof_authentic(&secret, &repository, &proof)
+    {
+        return None;
+    }
+    Some(VerifiedAncestry {
+        head: proof.head,
+        protected: proof.protected,
+    })
+}
+
+fn remember_ancestry(repo: &HistoryRepo, head: &str, protected: BTreeSet<String>) {
+    let ancestry = VerifiedAncestry {
+        head: head.into(),
+        protected,
+    };
     if let Ok(mut cache) = AUDITS.lock() {
         // One watcher normally uses one repository. Bound temporary onboarding
         // probes without adding another durable history or state file.
         if cache.len() >= 64 && !cache.contains_key(repo.dir()) {
             cache.pop_first();
         }
-        cache.insert(
-            repo.dir().to_path_buf(),
-            VerifiedAncestry {
-                head: head.into(),
-                protected,
-            },
-        );
+        cache.insert(repo.dir().to_path_buf(), ancestry.clone());
     }
-    Ok(inspected)
+    // A proof this process could not record does not undo the audit. The next
+    // process audits again.
+    let _ = record_durable_ancestry(repo, &ancestry);
+}
+
+fn record_durable_ancestry(repo: &HistoryRepo, ancestry: &VerifiedAncestry) -> Result<()> {
+    let dir = proof_dir(repo.dir());
+    crate::history::store::create_private_dir(&dir)?;
+    // The secret and the proof are one record. Two audits finishing together
+    // must not leave a proof signed by a secret the file no longer holds.
+    let _record = PROOF_RECORD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let secret = proof_secret_bytes(&dir)?;
+    let proof = signed_proof(
+        &secret,
+        &repository_identity(repo.dir())?,
+        &ancestry.head,
+        &ancestry.protected,
+    );
+    let mut temporary = tempfile::NamedTempFile::new_in(&dir)?;
+    serde_json::to_writer(temporary.as_file_mut(), &proof)?;
+    temporary.as_file().sync_all()?;
+    mise_util::file::persist_atomic(temporary, &proof_file(repo.dir()))?;
+    Ok(())
+}
+
+static PROOF_RECORD: Mutex<()> = Mutex::new(());
+
+/// The secret that makes a proof belong to this repository. Created once,
+/// private to the user, and never copied with the proof: a proof moved beside
+/// another repository has no matching secret there.
+fn proof_secret_bytes(dir: &std::path::Path) -> Result<Vec<u8>> {
+    let path = dir.join(PROOF_SECRET);
+    if let Ok(secret) = std::fs::read(&path)
+        && secret.len() == 32
+    {
+        return Ok(secret);
+    }
+    let mut secret = [0u8; 32];
+    rand::fill(&mut secret);
+    let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
+    use std::io::Write;
+    temporary.write_all(&secret)?;
+    temporary.as_file().sync_all()?;
+    mise_util::file::persist_atomic(temporary, &path)?;
+    Ok(secret.to_vec())
+}
+
+fn proof_dir(repo: &std::path::Path) -> std::path::PathBuf {
+    repo.parent().unwrap_or(repo).join(PROOF_DIR)
+}
+
+fn proof_file(repo: &std::path::Path) -> std::path::PathBuf {
+    proof_dir(repo).join(PROOF_FILE)
+}
+
+fn proof_secret(repo: &std::path::Path) -> std::path::PathBuf {
+    proof_dir(repo).join(PROOF_SECRET)
+}
+
+#[derive(Serialize, Deserialize)]
+struct DurableProof {
+    rules: u32,
+    /// The repository directory's own file identity when the proof was
+    /// written. A directory copy gets a new identity, so the copied secret
+    /// and proof together still do not vouch for the copy.
+    repository: String,
+    head: String,
+    protected: BTreeSet<String>,
+    mac: String,
+}
+
+fn signed_proof(
+    secret: &[u8],
+    repository: &str,
+    head: &str,
+    protected: &BTreeSet<String>,
+) -> DurableProof {
+    let key = <[u8; 32]>::try_from(secret).expect("the proof secret is 32 bytes");
+    DurableProof {
+        rules: AUDIT_RULES_VERSION,
+        repository: repository.into(),
+        head: head.into(),
+        protected: protected.clone(),
+        mac: proof_mac(&key, repository, head, protected),
+    }
+}
+
+/// The repository directory's file identity, not its path. Two directories
+/// with the same path at different times, and a copied directory, are not
+/// the same repository.
+fn repository_identity(repo: &std::path::Path) -> Result<String> {
+    let id = file_id::get_file_id(repo).wrap_err("reading the history repository identity")?;
+    Ok(format!("{id:?}"))
+}
+
+fn proof_authentic(secret: &[u8], repository: &str, proof: &DurableProof) -> bool {
+    let Ok(secret) = <[u8; 32]>::try_from(secret) else {
+        return false;
+    };
+    let expected = proof_mac(&secret, repository, &proof.head, &proof.protected);
+    // Compare the whole digest. A shorter prefix would accept a truncated mac.
+    expected.len() == proof.mac.len()
+        && expected
+            .bytes()
+            .zip(proof.mac.bytes())
+            .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+            == 0
+}
+
+fn proof_mac(
+    secret: &[u8; 32],
+    repository: &str,
+    head: &str,
+    protected: &BTreeSet<String>,
+) -> String {
+    let claims = serde_json::to_vec(&(AUDIT_RULES_VERSION, repository, head, protected))
+        .expect("the audit proof claims are JSON");
+    hex::encode(blake3::keyed_hash(secret, &claims).as_bytes())
+}
+
+fn enrolled_paths(
+    objects: &gix::Repository,
+    commits: &[String],
+    protected: &mut BTreeSet<String>,
+) -> Result<()> {
+    let mut seen = BTreeSet::new();
+    for commit in commits {
+        let tree = objects
+            .find_commit(gix::ObjectId::from_hex(commit.as_bytes())?)?
+            .tree()?;
+        let Some(entry) = tree.lookup_entry_by_path(crate::history::manifest::PATH)? else {
+            continue;
+        };
+        // One manifest blob is one enrollment, however many commits name it.
+        if !seen.insert(entry.object_id()) {
+            continue;
+        }
+        let manifest = crate::history::manifest::Manifest::read_gix_entry(&entry)?;
+        protected.extend(manifest.encrypted_paths());
+    }
+    Ok(())
 }
 
 /// Resolve encrypted files from the same committed enrollment metadata.
@@ -242,15 +426,26 @@ fn control_file(path: &str) -> bool {
 }
 
 fn envelope(repo: &HistoryRepo, object: &Object, limit: u64) -> Result<Option<Envelope>> {
+    envelope_in(repo, &repo.gix()?, object, limit)
+}
+
+/// [`envelope`] through one open repository, so an audit of many blobs does
+/// not scan every pack index once per blob.
+fn envelope_in(
+    repo: &HistoryRepo,
+    objects: &gix::Repository,
+    object: &Object,
+    limit: u64,
+) -> Result<Option<Envelope>> {
     // A gitlink names a commit in another repository, not a readable blob.
     if object.0 == "160000" {
         return Ok(None);
     }
-    if !repo.blob_starts_with(&object.1, MAGIC)? {
+    if !repo.blob_starts_with_in(objects, &object.1, MAGIC)? {
         return Ok(None);
     }
     // Only encrypted envelopes have this limit; do not change plaintext sync.
-    let bytes = repo.cat_object_bounded(&object.1, limit)?;
+    let bytes = repo.cat_object_bounded_in(objects, &object.1, limit)?;
     let Some(body) = bytes.strip_prefix(MAGIC) else {
         return Ok(None);
     };
@@ -486,11 +681,15 @@ fn normalized_lines(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 
 /// Whether a record merged as text still holds only envelopes.
-fn record_of_envelopes(repo: &HistoryRepo, object: &Object) -> Result<bool> {
-    if !repo.blob_starts_with(&object.1, MAGIC)? {
+fn record_of_envelopes_in(
+    repo: &HistoryRepo,
+    objects: &gix::Repository,
+    object: &Object,
+) -> Result<bool> {
+    if !repo.blob_starts_with_in(objects, &object.1, MAGIC)? {
         return Ok(false);
     }
-    let bytes = repo.cat_object_bounded(&object.1, agecrypt::MAX_ENCRYPTED_BYTES)?;
+    let bytes = repo.cat_object_bounded_in(objects, &object.1, agecrypt::MAX_ENCRYPTED_BYTES)?;
     if !is_marker_record(&bytes) {
         return Ok(false);
     }
@@ -904,6 +1103,198 @@ mod tests {
         );
     }
 
+    /// A verified ancestry written beside the history repository must skip
+    /// that history after this process forgets it. Clearing only the
+    /// in-memory proof must not force the commits to be read again, and a
+    /// later plaintext version of a protected path must still be refused.
+    #[test]
+    fn persisted_audit_proof_skips_verified_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let key = age::x25519::Identity::generate();
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        // a repository path, not a machine path: no home directory is read
+        let path = "tracked/home/secret"; // portable-home-ok
+        let cipher = repo
+            .hash_blob(&encode(path, "100644", b"private", "test", &recipients).unwrap())
+            .unwrap();
+        let tree = repo
+            .write_tree(&[("100644".into(), cipher, path.into())])
+            .unwrap();
+        let head = repo
+            .commit_tree(&tree, vec![], "encrypted from the first commit")
+            .unwrap();
+        let protected = BTreeSet::from([path.to_string()]);
+
+        assert!(
+            audit_history_cached(&repo, &head, &protected).unwrap() > 0,
+            "the first audit must read the history"
+        );
+        // This process still remembers the audit. Drop only that memory, as
+        // a fresh process would, and require the proof beside the repository
+        // to carry it. The removal is this repository alone.
+        AUDITS.lock().unwrap().remove(repo.dir());
+        assert_eq!(
+            audit_history_cached(&repo, &head, &protected).unwrap(),
+            0,
+            "a verified proof beside the repository must skip the history"
+        );
+
+        let plain = repo.hash_blob(b"private").unwrap();
+        let exposed = repo
+            .write_tree(&[("100644".into(), plain, path.into())])
+            .unwrap();
+        let exposed = repo
+            .commit_tree(&exposed, vec![&head], "plaintext after encryption")
+            .unwrap();
+        assert!(
+            audit_history_cached(&repo, &exposed, &protected).is_err(),
+            "a new protected plaintext version must still be refused"
+        );
+    }
+
+    /// A proof that does not belong to this repository, or that no longer
+    /// describes its history, is not proof. Each case forgets only this
+    /// repository's memory and must read the history again.
+    #[test]
+    fn a_proof_that_does_not_belong_to_this_repository_is_not_proof() {
+        let (_tmp, repo, head, protected) = audited_history();
+        let proof = std::fs::read(proof_file(repo.dir())).unwrap();
+        let secret = std::fs::read(proof_secret(repo.dir())).unwrap();
+
+        // Bytes appended after a valid envelope are not a valid proof.
+        let mut appended = proof.clone();
+        appended.extend_from_slice(b"\nforged");
+        forget_and_replace(&repo, &appended);
+        assert!(
+            audit_history_cached(&repo, &head, &protected).unwrap() > 0,
+            "an appended proof must be audited again"
+        );
+
+        // A corrupt file is not a proof, even beside the right secret.
+        forget_and_replace(&repo, b"not a proof");
+        assert!(
+            audit_history_cached(&repo, &head, &protected).unwrap() > 0,
+            "a corrupt proof must be audited again"
+        );
+
+        // A verified head that is not an ancestor of the proposed head is
+        // not proof about that head.
+        let unrelated = repo
+            .commit_tree(&repo.mktree("").unwrap(), vec![], "other")
+            .unwrap();
+        let foreign = signed_proof(
+            &secret,
+            &repository_identity(repo.dir()).unwrap(),
+            &unrelated,
+            &protected,
+        );
+        forget_and_replace(&repo, &serde_json::to_vec(&foreign).unwrap());
+        assert!(
+            audit_history_cached(&repo, &head, &protected).unwrap() > 0,
+            "a non-ancestor proof must be audited again"
+        );
+
+        // The proof covers only the original path. Asking about a larger set
+        // must read the history again: the old proof says nothing about the
+        // new path. Restore that original proof first; a proof signed for the
+        // grown set would legitimately skip it.
+        forget_and_replace(&repo, &proof);
+        let grown = BTreeSet::from(["tracked/home/secret".into(), "tracked/home/other".into()]);
+        assert!(
+            audit_history_cached(&repo, &head, &grown).unwrap() > 0,
+            "a grown protected set must be audited again"
+        );
+        // The new path's older plaintext is what that reread has to find.
+        let other = repo.hash_blob(b"older plaintext").unwrap();
+        let exposed = repo
+            .write_tree(&[
+                (
+                    "100644".into(),
+                    repo.object_at(&head, "tracked/home/secret")
+                        .unwrap()
+                        .unwrap()
+                        .1,
+                    "tracked/home/secret".into(),
+                ),
+                ("100644".into(), other, "tracked/home/other".into()),
+            ])
+            .unwrap();
+        let exposed = repo
+            .commit_tree(&exposed, vec![&head], "plaintext on a newly protected path")
+            .unwrap();
+        AUDITS.lock().unwrap().remove(repo.dir());
+        assert!(
+            audit_history_cached(&repo, &exposed, &grown).is_err(),
+            "older plaintext on a newly protected path must be refused"
+        );
+
+        // A protected object that wears the envelope magic but is not an
+        // envelope is not an encrypted version. The proof of the valid
+        // parent does not cover it.
+        let malformed = repo
+            .hash_blob(b"mise-encrypted-file-v1\nnot-an-envelope")
+            .unwrap();
+        let malformed_tree = repo
+            .write_tree(&[("100644".into(), malformed, "tracked/home/secret".into())])
+            .unwrap();
+        let malformed_head = repo
+            .commit_tree(&malformed_tree, vec![&head], "malformed envelope")
+            .unwrap();
+        AUDITS.lock().unwrap().remove(repo.dir());
+        assert!(
+            audit_history_cached(&repo, &malformed_head, &protected).is_err(),
+            "a malformed envelope must be refused"
+        );
+
+        // The same history in another repository does not make this
+        // repository's proof belong there. The secret does not travel.
+        let other = tempfile::tempdir().unwrap();
+        let other = HistoryRepo::open_or_init_in(other.path()).unwrap().unwrap();
+        let copied = other
+            .commit_tree(&other.mktree("").unwrap(), vec![], "copied")
+            .unwrap();
+        audit_history_cached(&other, &copied, &BTreeSet::new()).unwrap();
+        AUDITS.lock().unwrap().remove(other.dir());
+        std::fs::write(proof_file(other.dir()), &proof).unwrap();
+        assert!(
+            audit_history_cached(&other, &copied, &BTreeSet::new()).unwrap() > 0,
+            "a copied proof must not vouch for another repository"
+        );
+
+        // A proof written under different rules is not this version's proof.
+        let mut wrong = serde_json::from_slice::<DurableProof>(&proof).unwrap();
+        wrong.rules = AUDIT_RULES_VERSION + 1;
+        forget_and_replace(&repo, &serde_json::to_vec(&wrong).unwrap());
+        assert!(
+            audit_history_cached(&repo, &head, &protected).unwrap() > 0,
+            "a wrong rules version must be audited again"
+        );
+    }
+
+    fn audited_history() -> (tempfile::TempDir, HistoryRepo, String, BTreeSet<String>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let key = age::x25519::Identity::generate();
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        let path = "tracked/home/secret"; // portable-home-ok
+        let cipher = repo
+            .hash_blob(&encode(path, "100644", b"private", "test", &recipients).unwrap())
+            .unwrap();
+        let tree = repo
+            .write_tree(&[("100644".into(), cipher, path.into())])
+            .unwrap();
+        let head = repo.commit_tree(&tree, vec![], "encrypted").unwrap();
+        let protected = BTreeSet::from([path.to_string()]);
+        audit_history_cached(&repo, &head, &protected).unwrap();
+        (tmp, repo, head, protected)
+    }
+
+    fn forget_and_replace(repo: &HistoryRepo, proof: &[u8]) {
+        AUDITS.lock().unwrap().remove(repo.dir());
+        std::fs::write(proof_file(repo.dir()), proof).unwrap();
+    }
+
     #[test]
     fn encrypted_tip_does_not_hide_plaintext_in_ancestry_or_merge_parents() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1066,7 +1457,7 @@ mod tests {
             b"one saved version",
             "scheme"
         ));
-        assert!(record_of_envelopes(&repo, &same).unwrap());
+        assert!(record_of_envelopes_in(&repo, &repo.gix().unwrap(), &same).unwrap());
 
         // Different content is a real conflict, not a record to adopt.
         let conflict = merged_record(b"left version", b"right version");

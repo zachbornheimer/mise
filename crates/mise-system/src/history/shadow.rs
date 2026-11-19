@@ -894,14 +894,15 @@ impl HistoryRepo {
 
     /// Visits every file at or under one of `paths` in each of `commits`, in
     /// order. A subtree already visited at the same path is skipped, since
-    /// everything in it was visited with it.
-    pub(crate) fn visit_paths_in<'a>(
+    /// everything in it was visited with it. Reuses the caller's repository
+    /// for tree traversal and blob reads.
+    pub(crate) fn visit_paths_in_open<'a>(
         &self,
+        repo: &gix::Repository,
         commits: impl IntoIterator<Item = &'a String>,
         paths: &BTreeSet<String>,
         mut visit: impl FnMut(&str, TreeEntry) -> Result<()>,
     ) -> Result<()> {
-        let repo = self.gix()?;
         let mut subtrees = BTreeSet::new();
         for commit in commits {
             let tree = repo
@@ -917,7 +918,7 @@ impl HistoryRepo {
                         continue;
                     }
                     let subtree = entry.object()?.into_tree();
-                    for mut nested in Self::gix_tree_entries(&repo, &subtree)? {
+                    for mut nested in Self::gix_tree_entries(repo, &subtree)? {
                         nested.path = format!("{path}/{}", nested.path);
                         visit(commit, nested)?;
                     }
@@ -1375,21 +1376,7 @@ impl HistoryRepo {
     /// The blob `id`, refusing anything over `limit` bytes before reading
     /// it, as `cat-file blob` refuses an object that is not a blob.
     fn gix_blob(&self, id: gix::ObjectId, limit: u64) -> Result<Vec<u8>> {
-        let repo = self.gix()?;
-        let header = repo
-            .find_header(id)
-            .wrap_err_with(|| format!("reading {id}"))?;
-        if header.kind() != gix::object::Kind::Blob {
-            bail!("reading {id}: a {} is not a blob", header.kind());
-        }
-        if header.size() > limit {
-            bail!("object exceeds the encrypted content size limit");
-        }
-        Ok(repo
-            .find_object(id)
-            .wrap_err_with(|| format!("reading {id}"))?
-            .detach()
-            .data)
+        Self::blob_in(&self.gix()?, id, limit)
     }
 
     pub fn blob_starts_with(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
@@ -1454,6 +1441,43 @@ impl HistoryRepo {
             eyre::bail!("object exceeds the encrypted content size limit");
         }
         self.cat_object(oid)
+    }
+
+    /// [`Self::cat_object_bounded`] through an already open repository. A walk
+    /// over many encrypted blobs opens the object database once.
+    pub(crate) fn cat_object_bounded_in(
+        &self,
+        objects: &gix::Repository,
+        oid: &str,
+        limit: u64,
+    ) -> Result<Vec<u8>> {
+        if let Some(bytes) = self.transient_blob(oid) {
+            if bytes.len() as u64 > limit {
+                bail!("object exceeds the encrypted content size limit");
+            }
+            return Ok(bytes);
+        }
+        if let Some(id) = Self::object_id(oid) {
+            return Self::blob_in(objects, id, limit);
+        }
+        self.cat_object_bounded(oid, limit)
+    }
+
+    fn blob_in(objects: &gix::Repository, id: gix::ObjectId, limit: u64) -> Result<Vec<u8>> {
+        let header = objects
+            .find_header(id)
+            .wrap_err_with(|| format!("reading {id}"))?;
+        if header.kind() != gix::object::Kind::Blob {
+            bail!("reading {id}: a {} is not a blob", header.kind());
+        }
+        if header.size() > limit {
+            bail!("object exceeds the encrypted content size limit");
+        }
+        Ok(objects
+            .find_object(id)
+            .wrap_err_with(|| format!("reading {id}"))?
+            .detach()
+            .data)
     }
 
     /// Writes `bytes` as a blob, as `hash-object -w --stdin` does (no
