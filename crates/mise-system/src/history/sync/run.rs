@@ -1530,12 +1530,20 @@ mod repository_conflict_tests {
         assert_eq!(status.conflicts.len(), 1);
     }
 
-    fn tree_z(entries: &[(&str, &str)]) -> Vec<u8> {
+    fn tree_z(entries: &[(&str, &str, &str, &str)]) -> Vec<u8> {
         let mut listing = vec![];
-        for (path, oid) in entries {
-            listing.extend_from_slice(format!("100644 blob {oid}\t{path}\0").as_bytes());
+        for (mode, kind, oid, name) in entries {
+            listing.extend_from_slice(format!("{mode} {kind} {oid}\t{name}\0").as_bytes());
         }
         listing
+    }
+
+    /// `home/a` holding `content`, one level at a time: mktree refuses a name
+    /// that contains a slash.
+    fn file_tree(repo: &crate::history::shadow::HistoryRepo, content: &str) -> Result<String> {
+        let blob = repo.hash_blob(content.as_bytes())?;
+        let home = repo.mktree_z(&tree_z(&[("100644", "blob", &blob, "a")]))?;
+        repo.mktree_z(&tree_z(&[("040000", "tree", &home, "home")]))
     }
 
     /// The state this ticket reports: a path no stream here selects changed on
@@ -1552,13 +1560,9 @@ mod repository_conflict_tests {
             return Ok(());
         };
         let tracked = TrackedSet::default();
-        let blob = |text: &str| repo.hash_blob(text.as_bytes());
-        let base = repo.mktree_z(&tree_z(&[("home/.a", &blob("base")?)]))?;
-        let base = repo.commit_tree(&base, vec![], "base")?;
-        let local = repo.mktree_z(&tree_z(&[("home/.a", &blob("local")?)]))?;
-        let local = repo.commit_tree(&local, vec![&base], "local")?;
-        let remote = repo.mktree_z(&tree_z(&[("home/.a", &blob("remote")?)]))?;
-        let remote = repo.commit_tree(&remote, vec![&base], "remote")?;
+        let base = repo.commit_tree(&file_tree(&repo, "base")?, vec![], "base")?;
+        let local = repo.commit_tree(&file_tree(&repo, "local")?, vec![&base], "local")?;
+        let remote = repo.commit_tree(&file_tree(&repo, "remote")?, vec![&base], "remote")?;
         repo.update_ref(
             crate::history::shadow::HistoryRepo::HISTORY_REF,
             &local,
@@ -1570,11 +1574,11 @@ mod repository_conflict_tests {
         let RepositoryTree::Conflicted(paths) = planned else {
             panic!("a divergent path outside every stream is not planned silently");
         };
-        assert_eq!(paths, ["home/.a"]);
+        assert_eq!(paths, ["home/a"]);
 
         let mut resolutions = BTreeMap::new();
         resolutions.insert(
-            "home/.a".to_string(),
+            "home/a".to_string(),
             Resolution {
                 local: None,
                 remote: None,
