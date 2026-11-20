@@ -79,6 +79,14 @@ pub(crate) struct DotfilesPull {
     /// conflict keeps this machine's. Each kept path must already be saved.
     #[usage(long, conflicts = "take_remote_all")]
     keep_local_all: bool,
+
+    /// Wait this long for a running sync or pull instead of failing
+    ///
+    /// Accepts a duration such as `90s`, `5m` or `1h` (at most one hour).
+    /// Without it the wait is `history.lock_wait`, 30 seconds by default;
+    /// `0` fails at once. The refusal names the holder either way.
+    #[usage(long, value_name = "DURATION")]
+    wait: Option<String>,
 }
 
 impl DotfilesPull {
@@ -86,7 +94,7 @@ impl DotfilesPull {
         if !crate::config::Settings::get().history.enabled {
             bail!("history is disabled (history.enabled = false)");
         }
-        let (store, tracked, _) = super::history::open().await?;
+        let (store, tracked) = super::history::open_store().await?;
         if let Some(reason) = store.unavailable() {
             bail!("cannot apply: {reason}");
         }
@@ -102,6 +110,11 @@ impl DotfilesPull {
                 keep_local_all: self.keep_local_all,
                 automatic: false,
                 plan_only: false,
+                wait: self
+                    .wait
+                    .as_deref()
+                    .map(crate::system::history::scope::parse_lock_wait)
+                    .transpose()?,
             },
         )
         .await?;

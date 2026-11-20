@@ -101,7 +101,7 @@ impl Located {
     }
 }
 
-pub(crate) fn is_safe_branch_path(path: &str) -> bool {
+pub fn is_safe_branch_path(path: &str) -> bool {
     !path.is_empty()
         && path.split('/').all(|component| {
             !component.is_empty()

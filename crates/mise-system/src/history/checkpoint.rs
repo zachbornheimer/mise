@@ -65,6 +65,10 @@ pub struct Draft {
     /// checkpoint holds under other recipients, including the saved
     /// versions it carries forward rather than reads live.
     pub re_encrypt: bool,
+    /// Commit the snapshot without moving the published history. A fresh
+    /// adoption's protective snapshot records files this machine does not have
+    /// as absent; publishing that would delete them for every other machine.
+    pub recovery_only: bool,
 }
 
 impl Draft {
@@ -208,6 +212,22 @@ impl Store {
 
     pub(crate) fn list(&self) -> Result<Vec<Entry>> {
         store::list_in(&self.state_dir)
+    }
+
+    /// How many checkpoints are indexed, without reading their records.
+    pub fn checkpoint_count(&self) -> Result<usize> {
+        store::count_in(&self.state_dir)
+    }
+
+    /// The newest checkpoint, without reading the older ones.
+    pub fn latest(&self) -> Result<Option<Entry>> {
+        store::latest_in(&self.state_dir)
+    }
+
+    /// The newest checkpoint holding a content snapshot, without reading the
+    /// older ones.
+    pub fn latest_with_snapshot(&self) -> Result<Option<Entry>> {
+        store::latest_snapshot_entry_in(&self.state_dir)
     }
 
     /// The id and uuid of the newest checkpoint holding a content snapshot:
@@ -452,8 +472,35 @@ impl Store {
                 match repo.capture_tracked(&walk, &recipients, console::user_attended_stderr()) {
                     Ok(result) => {
                         coverage.omitted.extend(result.omitted.iter().cloned());
-                        for warning in &result.warnings {
-                            warn!("history: {warning}");
+                        for denial in &result.permission_denied {
+                            if !walk
+                                .permission_denied
+                                .iter()
+                                .any(|found| found.path == denial.path)
+                            {
+                                walk.permission_denied.push(denial.clone());
+                            }
+                        }
+                        let mut warned = std::collections::BTreeSet::new();
+                        for denial in &walk.permission_denied {
+                            if warned.insert(denial.path.as_str()) {
+                                warn!(
+                                    "history: {}",
+                                    super::health::permission_report(&denial.path, &denial.reason)
+                                );
+                            }
+                        }
+                        for omitted in &result.omitted {
+                            if !walk
+                                .permission_denied
+                                .iter()
+                                .any(|denial| denial.path == omitted.path)
+                            {
+                                warn!(
+                                    "history: {} was not captured: {}",
+                                    omitted.path, omitted.reason
+                                );
+                            }
                         }
                         let (composed, partial) = self.compose_manual(
                             repo,
@@ -586,6 +633,7 @@ impl Store {
             if draft.re_encrypt {
                 info!("history: {}", re_encrypt_report(&re_encrypted));
             }
+            record_permission_denials(&self.state_dir, &walk.permission_denied)?;
             return Ok(Outcome::Unchanged);
         }
         if !draft.has_metadata() && snapshot.is_none() {
@@ -778,6 +826,7 @@ impl Store {
             reserved_id,
             &messages,
             !draft.protective && heard(&draft),
+            draft.recovery_only,
         )?;
         if available
             && snapshot.is_some()
@@ -790,6 +839,9 @@ impl Store {
         }
         if draft.re_encrypt && snapshot.is_some() {
             info!("history: {}", re_encrypt_report(&re_encrypted));
+        }
+        if available && snapshot.is_some() {
+            record_permission_denials(&self.state_dir, &walk.permission_denied)?;
         }
         Ok(Outcome::Created(entry))
     }
@@ -816,6 +868,7 @@ impl Store {
         reserved_id: Option<u64>,
         messages: &[String],
         speak: bool,
+        recovery_only: bool,
     ) -> Result<Box<Entry>> {
         let id = reserved_id.unwrap_or_else(|| {
             let id = index.next_id.max(1);
@@ -828,7 +881,13 @@ impl Store {
                 let commit = repo
                     .write_checkpoint_commit(checkpoint.tree.snapshot.as_deref(), &checkpoint)
                     .wrap_err("writing the checkpoint")?;
-                let advanced = repo.update_history_head(&commit, parent.as_deref());
+                let advanced = if recovery_only {
+                    // The snapshot stays reachable for undo, and out of the
+                    // history every other machine fetches.
+                    repo.retain_recovery(&commit)
+                } else {
+                    repo.update_history_head(&commit, parent.as_deref())
+                };
                 // Updating the ref makes the snapshot durable. Even a later
                 // symbolic-HEAD, metadata-cache, index, or enrollment failure
                 // must not lose its warnings. A failed snapshot can still
@@ -845,7 +904,7 @@ impl Store {
                 {
                     self.deliver_capture_notices(messages, speak);
                 }
-                advanced.wrap_err("advancing the checkpoint")?;
+                advanced.wrap_err("recording the checkpoint")?;
                 commit
             }
             None => String::new(),
@@ -1032,10 +1091,25 @@ impl Store {
         };
         let existing = store::load_index_in(&self.state_dir)?;
         let mut entries = vec![];
-        let commits: Vec<_> = repo
-            .history_messages()?
+        let messages = repo.history_messages()?;
+        // A fresh adoption's protective snapshot is not an ancestor of the
+        // published history. Undo finds it by the commit the operation
+        // recorded, so the rebuilt index keeps every private recovery tip.
+        // Published history stays last: it is the baseline the next capture
+        // compares against.
+        let published: std::collections::BTreeSet<String> =
+            messages.iter().map(|(commit, _)| commit.clone()).collect();
+        let mut recovery = vec![];
+        for (commit, message) in repo.recovery_commits()? {
+            if !published.contains(&commit) {
+                recovery.push((commit, message));
+            }
+        }
+        // Recovery tips come first and published history last. Reversing the
+        // combined list would make a private snapshot the baseline.
+        let commits: Vec<_> = recovery
             .into_iter()
-            .rev()
+            .chain(messages.into_iter().rev())
             .map(|(commit, message)| Ok((commit, HistoryRepo::annotation_from_message(&message)?)))
             .collect::<Result<_>>()?;
         let mut annotations: BTreeMap<String, Vec<Annotation>> = BTreeMap::new();
@@ -1132,7 +1206,11 @@ struct ManualPlan {
 /// Tells the user what the walk left out, so a credential store or a
 /// nested repository under a tracked directory never looks saved. A
 /// command the user ran (a save, a baseline, a bootstrap, rollback, or
-/// Each skipped repository as the rebuilt record will spell it.
+/// undo outcome) lists each path; the watcher's captures and the
+/// protective captures before an operation get one summary line, since
+/// they run on every edit or are followed by the outcome's full report. A
+/// baseline reports only the paths it enrolls, not those under entries
+/// tracked earlier.
 ///
 /// **One writer, so the comparison can be exact.** The skips reach the
 /// trailer as tree paths, through `Checkpoint::portable_path`, and come
@@ -1156,11 +1234,23 @@ fn skipped_as_rebuilt(
         .collect()
 }
 
-/// undo outcome) lists each path; the watcher's captures and the
-/// protective captures before an operation get one summary line, since
-/// they run on every edit or are followed by the outcome's full report. A
-/// baseline reports only the paths it enrolls, not those under entries
-/// tracked earlier.
+/// Writes the denials a capture observed into `health.json`, replacing
+/// earlier denial lines and leaving every other degraded reason. An empty
+/// list clears the denials: the observation could read what it tried.
+fn record_permission_denials(state_dir: &Path, denied: &[super::store::PathReason]) -> Result<()> {
+    let lines: Vec<String> = denied
+        .iter()
+        .map(|denial| super::health::permission_report(&denial.path, &denial.reason))
+        .collect();
+    let mut health = super::health::read(state_dir).unwrap_or_default();
+    let before = health.watcher.degraded.clone();
+    super::health::replace_permission_denials(&mut health.watcher.degraded, &lines);
+    if health.watcher.degraded == before {
+        return Ok(());
+    }
+    super::health::write(state_dir, &mut health)
+}
+
 fn report_omissions(walk: &super::tracked::Walk, draft: &Draft) {
     let trigger = draft.trigger();
     let explicit = trigger != Trigger::Edit && !draft.protective;
@@ -1175,7 +1265,18 @@ fn report_omissions(walk: &super::tracked::Walk, draft: &Draft) {
                 .iter()
                 .any(|root| super::tracked::display_under(&reported.path, root))
     };
-    let omitted: Vec<store::PathReason> = walk.omitted.iter().filter(enrolled).cloned().collect();
+    let omitted: Vec<store::PathReason> = walk
+        .omitted
+        .iter()
+        .filter(enrolled)
+        .filter(|omitted| {
+            !walk
+                .permission_denied
+                .iter()
+                .any(|denial| denial.path == omitted.path)
+        })
+        .cloned()
+        .collect();
     let nested: Vec<store::PathReason> = walk.nested.iter().filter(enrolled).cloned().collect();
     if omitted.is_empty() && nested.is_empty() {
         return;
@@ -1668,6 +1769,7 @@ mod tests {
                     Index::default(),
                     None,
                     std::slice::from_ref(&notice),
+                    false,
                     false
                 )
                 .is_err()
@@ -1698,6 +1800,7 @@ mod tests {
                 Index::default(),
                 None,
                 &["history: synthetic credential saved in plaintext".into()],
+                false,
                 false,
             );
             assert_eq!(result.is_err(), fail_commit);
@@ -2286,5 +2389,483 @@ mod tests {
         let mut described = Draft::new(Trigger::Edit);
         described.description = Some("x".into());
         assert!(described.has_metadata());
+    }
+
+    /// A directory the OS refuses to read is not a deletion and does not
+    /// stop the save of a sibling. The denied path keeps the object the
+    /// previous checkpoint stored, and the save reports it until it can be
+    /// read again.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_keeps_last_saved_version_of_unreadable_path() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct Restore(PathBuf, u32);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+            }
+        }
+
+        let state = tempfile::tempdir()?;
+        // portable-home-ok: history maps paths under the real home, so a
+        // tracked fixture has to live there
+        let live = tempfile::tempdir_in(*mise_util::dirs::HOME)?;
+        let readable = live.path().join("readable.toml");
+        let denied_dir = live.path().join("denied");
+        let denied = denied_dir.join("settings.toml");
+        std::fs::write(&readable, "first")?;
+        std::fs::create_dir(&denied_dir)?;
+        std::fs::write(&denied, "saved-settings")?;
+        let policy = crate::files::FilePolicy::for_mode(crate::files::FileMode::Track);
+        let readable_entry = TrackedEntry::new(readable.clone(), "track", policy);
+        let denied_entry = TrackedEntry::new(denied.clone(), "track", policy);
+        let enroll = |entry: &TrackedEntry, path: &Path| -> Result<_> {
+            Ok(super::super::manifest::Enrollment {
+                path: entry.tree_path(path)?,
+                autosave: true,
+                encrypt: false,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            })
+        };
+        let tracked = TrackedSet {
+            manifest: super::super::manifest::Manifest {
+                enrollment: vec![
+                    enroll(&readable_entry, &readable)?,
+                    enroll(&denied_entry, &denied)?,
+                ],
+                ..Default::default()
+            },
+            entries: vec![readable_entry, denied_entry],
+            ..Default::default()
+        };
+        let store = Store::open_in(state.path())?;
+        let Outcome::Created(_) = store.attempt(&tracked, Draft::new(Trigger::Save))? else {
+            panic!("the first save recorded nothing");
+        };
+        let repo = store.repo().expect("git is required");
+        let head = repo.ref_oid(HistoryRepo::HISTORY_REF)?.unwrap();
+        let denied_tree = tracked.entry_for(&denied).unwrap().tree_path(&denied)?;
+        let (_, saved_oid) = repo
+            .object_at(&head, &denied_tree)?
+            .expect("denied file saved");
+
+        let restore = Restore(denied_dir.clone(), 0o700);
+        std::fs::set_permissions(&denied_dir, std::fs::Permissions::from_mode(0o000))?;
+        if nix::unistd::geteuid().is_root() {
+            drop(restore);
+            return Ok(());
+        }
+        let probe = std::fs::symlink_metadata(&denied).expect_err("a non-root denial was readable");
+        assert_eq!(probe.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::write(&readable, "edited")?;
+        let saved = match store.attempt(&tracked, Draft::new(Trigger::Save))? {
+            Outcome::Created(saved) => saved,
+            outcome => {
+                panic!("a readable edit was not saved while a sibling was denied: {outcome:?}")
+            }
+        };
+        let head = repo.ref_oid(HistoryRepo::HISTORY_REF)?.unwrap();
+        let readable_tree = tracked.entry_for(&readable).unwrap().tree_path(&readable)?;
+        let (_, readable_oid) = repo
+            .object_at(&head, &readable_tree)?
+            .expect("readable file saved");
+        assert_eq!(repo.cat_object(&readable_oid)?, b"edited");
+        let (_, kept_oid) = repo
+            .object_at(&head, &denied_tree)?
+            .expect("denied file was deleted from the checkpoint");
+        assert_eq!(
+            kept_oid, saved_oid,
+            "the denied file was replaced instead of keeping its last saved object"
+        );
+        let health = crate::history::health::read(state.path()).expect("health.json");
+        let _ = &saved;
+        let report = health
+            .watcher
+            .degraded
+            .iter()
+            .find(|line| line.contains(&display_path(&denied)))
+            .expect("health.json watcher.degraded does not name the denied path");
+        assert!(
+            report.contains("Operation not permitted") || report.contains("Permission denied"),
+            "{report}"
+        );
+        drop(restore);
+        Ok(())
+    }
+
+    /// A denied path nothing has saved is reported and stored as absent,
+    /// not as an empty file.
+    #[cfg(unix)]
+    #[test]
+    fn a_never_saved_denied_path_is_absent_and_reported() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            return Ok(());
+        }
+        let state = tempfile::tempdir()?;
+        // portable-home-ok: history maps paths under the real home
+        let live = tempfile::tempdir_in(*mise_util::dirs::HOME)?;
+        let path = live.path().join("notes.toml");
+        std::fs::write(&path, "new")?;
+        let mode = std::fs::symlink_metadata(&path)?.permissions().mode();
+        let restore = MoveMode(path.clone(), mode);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))?;
+        let probe = std::fs::File::open(&path).expect_err("a non-root file was readable");
+        assert_eq!(probe.kind(), std::io::ErrorKind::PermissionDenied);
+        let policy = crate::files::FilePolicy::for_mode(crate::files::FileMode::Track);
+        let entry = TrackedEntry::new(path.clone(), "track", policy);
+        let tracked = enrolled(vec![(entry, path.clone())])?;
+        let store = Store::open_in(state.path())?;
+        let saved = match store.attempt(&tracked, Draft::new(Trigger::Save))? {
+            Outcome::Created(saved) => saved,
+            outcome => panic!("a never-saved denial stopped the checkpoint: {outcome:?}"),
+        };
+        let head = store
+            .repo()
+            .unwrap()
+            .ref_oid(HistoryRepo::HISTORY_REF)?
+            .unwrap();
+        let tree = tracked.entry_for(&path).unwrap().tree_path(&path)?;
+        assert!(store.repo().unwrap().object_at(&head, &tree)?.is_none());
+        assert!(
+            saved
+                .checkpoint
+                .tree
+                .coverage
+                .omitted
+                .iter()
+                .any(|omitted| omitted.path == display_path(&path))
+        );
+        drop(restore);
+        Ok(())
+    }
+
+    /// Restoring access captures the live bytes and clears only this path's
+    /// denial, leaving an unrelated degraded reason where it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_denied_report_clears_after_the_path_can_be_read() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            return Ok(());
+        }
+        let state = tempfile::tempdir()?;
+        // portable-home-ok: history maps paths under the real home
+        let live = tempfile::tempdir_in(*mise_util::dirs::HOME)?;
+        let path = live.path().join("notes.toml");
+        std::fs::write(&path, "saved")?;
+        let policy = crate::files::FilePolicy::for_mode(crate::files::FileMode::Track);
+        let entry = TrackedEntry::new(path.clone(), "track", policy);
+        let tracked = enrolled(vec![(entry, path.clone())])?;
+        let store = Store::open_in(state.path())?;
+        store.attempt(&tracked, Draft::new(Trigger::Save))?;
+        let mode = std::fs::symlink_metadata(&path)?.permissions().mode();
+        let restore = MoveMode(path.clone(), mode);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))?;
+        store.attempt(&tracked, Draft::new(Trigger::Save))?;
+        let unrelated = "cannot watch ~/notes: limit reached".to_string();
+        let mut health = crate::history::health::read(state.path()).unwrap_or_default();
+        health.watcher.degraded.push(unrelated.clone());
+        crate::history::health::write(state.path(), &mut health)?;
+        drop(restore);
+        std::fs::write(&path, "readable-again")?;
+        store.attempt(&tracked, Draft::new(Trigger::Save))?;
+        let health = crate::history::health::read(state.path()).unwrap_or_default();
+        assert!(
+            health
+                .watcher
+                .degraded
+                .iter()
+                .all(|line| !line.contains(&display_path(&path)))
+        );
+        assert!(
+            health
+                .watcher
+                .degraded
+                .iter()
+                .any(|line| line == &unrelated)
+        );
+        Ok(())
+    }
+
+    /// A denied directory keeps every previously saved descendant, not the
+    /// ones a partial walk happened to read.
+    #[cfg(unix)]
+    #[test]
+    fn a_denied_directory_keeps_every_previously_saved_descendant() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            return Ok(());
+        }
+        let state = tempfile::tempdir()?;
+        // portable-home-ok: history maps paths under the real home
+        let live = tempfile::tempdir_in(*mise_util::dirs::HOME)?;
+        let dir = live.path().join("folder");
+        std::fs::create_dir(&dir)?;
+        let first = dir.join("one.toml");
+        let second = dir.join("two.toml");
+        std::fs::write(&first, "one")?;
+        std::fs::write(&second, "two")?;
+        let sibling = live.path().join("sibling.toml");
+        std::fs::write(&sibling, "before")?;
+        let policy = crate::files::FilePolicy::for_mode(crate::files::FileMode::Track);
+        let tracked = enrolled(vec![
+            (TrackedEntry::new(dir.clone(), "track", policy), dir.clone()),
+            (
+                TrackedEntry::new(sibling.clone(), "track", policy),
+                sibling.clone(),
+            ),
+        ])?;
+        let store = Store::open_in(state.path())?;
+        store.attempt(&tracked, Draft::new(Trigger::Save))?;
+        let repo = store.repo().unwrap();
+        let head = repo.ref_oid(HistoryRepo::HISTORY_REF)?.unwrap();
+        let oid = |path: &Path| -> Result<String> {
+            Ok(repo
+                .object_at(&head, &tracked.entry_for(path).unwrap().tree_path(path)?)?
+                .unwrap()
+                .1)
+        };
+        let first_oid = oid(&first)?;
+        let second_oid = oid(&second)?;
+        let mode = std::fs::symlink_metadata(&dir)?.permissions().mode();
+        let restore = MoveMode(dir.clone(), mode);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000))?;
+        let probe = std::fs::read_dir(&dir).expect_err("a non-root directory was readable");
+        assert_eq!(probe.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::write(&sibling, "after")?;
+        store.attempt(&tracked, Draft::new(Trigger::Save))?;
+        let head = repo.ref_oid(HistoryRepo::HISTORY_REF)?.unwrap();
+        let kept = |path: &Path| -> Result<String> {
+            Ok(repo
+                .object_at(&head, &tracked.entry_for(path).unwrap().tree_path(path)?)?
+                .expect("descendant deleted")
+                .1)
+        };
+        assert_eq!(kept(&first)?, first_oid);
+        assert_eq!(kept(&second)?, second_oid);
+        drop(restore);
+        Ok(())
+    }
+
+    /// A file whose metadata is readable but whose contents are refused
+    /// keeps its saved object. The open is the denial, not the walk.
+    #[cfg(unix)]
+    #[test]
+    fn a_denied_file_content_read_keeps_its_saved_object() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            return Ok(());
+        }
+        let state = tempfile::tempdir()?;
+        // portable-home-ok: history maps paths under the real home
+        let live = tempfile::tempdir_in(*mise_util::dirs::HOME)?;
+        let denied = live.path().join("notes.toml");
+        let readable = live.path().join("other.toml");
+        std::fs::write(&denied, "saved-notes")?;
+        std::fs::write(&readable, "before")?;
+        let policy = crate::files::FilePolicy::for_mode(crate::files::FileMode::Track);
+        let tracked = enrolled(vec![
+            (
+                TrackedEntry::new(denied.clone(), "track", policy),
+                denied.clone(),
+            ),
+            (
+                TrackedEntry::new(readable.clone(), "track", policy),
+                readable.clone(),
+            ),
+        ])?;
+        let store = Store::open_in(state.path())?;
+        store.attempt(&tracked, Draft::new(Trigger::Save))?;
+        let repo = store.repo().unwrap();
+        let head = repo.ref_oid(HistoryRepo::HISTORY_REF)?.unwrap();
+        let tree = tracked.entry_for(&denied).unwrap().tree_path(&denied)?;
+        let saved_oid = repo.object_at(&head, &tree)?.unwrap().1;
+        let mode = std::fs::symlink_metadata(&denied)?.permissions().mode();
+        let restore = MoveMode(denied.clone(), mode);
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))?;
+        assert!(
+            std::fs::symlink_metadata(&denied).is_ok(),
+            "metadata must stay readable"
+        );
+        let probe = std::fs::File::open(&denied).expect_err("content was readable");
+        assert_eq!(probe.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::write(&readable, "after")?;
+        store.attempt(&tracked, Draft::new(Trigger::Save))?;
+        let head = repo.ref_oid(HistoryRepo::HISTORY_REF)?.unwrap();
+        let kept = repo
+            .object_at(&head, &tree)?
+            .expect("content denial deleted the file")
+            .1;
+        assert_eq!(kept, saved_oid);
+        drop(restore);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    struct MoveMode(PathBuf, u32);
+    #[cfg(unix)]
+    impl Drop for MoveMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    /// Restoring a denied file without changing its bytes is still a
+    /// recovery: the denial report clears even though the checkpoint is
+    /// unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn an_unchanged_readable_capture_clears_a_permission_report() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            return Ok(());
+        }
+        let state = tempfile::tempdir()?;
+        // portable-home-ok: history maps paths under the real home
+        let live = tempfile::tempdir_in(*mise_util::dirs::HOME)?;
+        let path = live.path().join("notes.toml");
+        std::fs::write(&path, "saved")?;
+        let policy = crate::files::FilePolicy::for_mode(crate::files::FileMode::Track);
+        let tracked = enrolled(vec![(
+            TrackedEntry::new(path.clone(), "track", policy),
+            path.clone(),
+        )])?;
+        let store = Store::open_in(state.path())?;
+        store.attempt(&tracked, Draft::new(Trigger::Save))?;
+        let mode = std::fs::symlink_metadata(&path)?.permissions().mode();
+        let restore = MoveMode(path.clone(), mode);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))?;
+        store.attempt(&tracked, Draft::new(Trigger::Save))?;
+        assert!(
+            crate::history::health::read(state.path())
+                .expect("denial recorded")
+                .watcher
+                .degraded
+                .iter()
+                .any(|line| {
+                    crate::history::health::permission_report_path(line)
+                        == Some(display_path(&path).as_str())
+                })
+        );
+        drop(restore);
+        let outcome = store.attempt(&tracked, Draft::new(Trigger::Save))?;
+        assert!(
+            matches!(outcome, Outcome::Unchanged),
+            "restoring the same bytes created a checkpoint: {outcome:?}"
+        );
+        let health = crate::history::health::read(state.path()).unwrap_or_default();
+        assert!(
+            health.watcher.degraded.iter().all(|line| {
+                crate::history::health::permission_report_path(line)
+                    != Some(display_path(&path).as_str())
+            }),
+            "an unchanged recovery left the denial: {health:?}"
+        );
+        Ok(())
+    }
+
+    /// An encrypted file the operating system refuses to open keeps its
+    /// saved envelope. A readable sibling in the same save is stored, and
+    /// the denial is named.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_encrypted_file_keeps_its_saved_envelope() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::geteuid().is_root() {
+            return Ok(());
+        }
+        let state = tempfile::tempdir()?;
+        // portable-home-ok: history maps paths under the real home
+        let live = tempfile::tempdir_in(*mise_util::dirs::HOME)?;
+        let denied = live.path().join("secret.toml");
+        let sibling = live.path().join("settings.toml");
+        std::fs::write(&denied, "saved-secret")?;
+        std::fs::write(&sibling, "before")?;
+        let identity = age::x25519::Identity::generate();
+        let mut policy = crate::files::FilePolicy::for_mode(crate::files::FileMode::Track);
+        policy.encrypt = true;
+        let plain = crate::files::FilePolicy::for_mode(crate::files::FileMode::Track);
+        let mut tracked = enrolled(vec![
+            (
+                TrackedEntry::new(denied.clone(), "track", policy),
+                denied.clone(),
+            ),
+            (
+                TrackedEntry::new(sibling.clone(), "track", plain),
+                sibling.clone(),
+            ),
+        ])?;
+        tracked.manifest.enrollment[0].encrypt = true;
+        tracked.manifest.recipients = vec![identity.to_public().to_string()];
+        let store = Store::open_in(state.path())?;
+        store.attempt(&tracked, Draft::new(Trigger::Save))?;
+        let repo = store.repo().unwrap();
+        let head = repo.ref_oid(HistoryRepo::HISTORY_REF)?.unwrap();
+        let denied_tree = tracked.entry_for(&denied).unwrap().tree_path(&denied)?;
+        let saved = repo
+            .object_at(&head, &denied_tree)?
+            .expect("envelope saved");
+        let saved_bytes = repo.cat_object(&saved.1)?;
+        assert!(
+            saved_bytes.starts_with(b"mise-encrypted-file-v1\n"),
+            "the baseline did not store an encrypted envelope"
+        );
+        let mode = std::fs::symlink_metadata(&denied)?.permissions().mode();
+        let restore = MoveMode(denied.clone(), mode);
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000))?;
+        assert!(std::fs::symlink_metadata(&denied).is_ok());
+        let probe = std::fs::File::open(&denied).expect_err("encrypted content was readable");
+        assert_eq!(probe.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::write(&sibling, "after")?;
+        store.attempt(&tracked, Draft::new(Trigger::Save))?;
+        let head = repo.ref_oid(HistoryRepo::HISTORY_REF)?.unwrap();
+        let kept = repo
+            .object_at(&head, &denied_tree)?
+            .expect("an unreadable encrypted file was deleted");
+        assert_eq!(kept.1, saved.1, "the saved envelope was replaced");
+        let sibling_tree = tracked.entry_for(&sibling).unwrap().tree_path(&sibling)?;
+        let sibling_oid = repo.object_at(&head, &sibling_tree)?.unwrap().1;
+        assert_eq!(repo.cat_object(&sibling_oid)?, b"after");
+        let health = crate::history::health::read(state.path()).expect("health.json");
+        assert!(
+            health.watcher.degraded.iter().any(|line| {
+                crate::history::health::permission_report_path(line)
+                    == Some(display_path(&denied).as_str())
+            }),
+            "{health:?}"
+        );
+        drop(restore);
+        Ok(())
+    }
+
+    fn enrolled(entries: Vec<(TrackedEntry, PathBuf)>) -> Result<TrackedSet> {
+        let mut enrollment = vec![];
+        let mut tracked_entries = vec![];
+        for (entry, path) in entries {
+            enrollment.push(super::super::manifest::Enrollment {
+                path: entry.tree_path(&path)?,
+                autosave: true,
+                encrypt: false,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            });
+            tracked_entries.push(entry);
+        }
+        Ok(TrackedSet {
+            manifest: super::super::manifest::Manifest {
+                enrollment,
+                ..Default::default()
+            },
+            entries: tracked_entries,
+            ..Default::default()
+        })
     }
 }

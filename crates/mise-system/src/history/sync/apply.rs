@@ -9,6 +9,7 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use eyre::{Result, bail};
 use indexmap::IndexMap;
@@ -47,6 +48,9 @@ pub struct ApplyRequest {
     /// With `dry_run`: the plan is shown before a question, so no
     /// "nothing was changed" note.
     pub plan_only: bool,
+    /// How long a pull someone ran waits for the sync lock before giving
+    /// up (`--wait`); `None` uses `history.lock_wait`.
+    pub wait: Option<Duration>,
 }
 
 impl ApplyRequest {
@@ -60,6 +64,7 @@ impl ApplyRequest {
             keep_local_all: false,
             automatic: true,
             plan_only: false,
+            wait: None,
         }
     }
 }
@@ -99,7 +104,13 @@ pub async fn apply(
     tracked: &TrackedSet,
     req: &ApplyRequest,
 ) -> Result<ApplyOutcome> {
-    let _sync_lock = run::lock(store)?;
+    // a pull someone ran waits its turn behind a running sync; the watcher's
+    // automatic apply never waits
+    let _sync_lock = if req.automatic {
+        run::lock(store)?
+    } else {
+        run::lock_queued(store, req.wait)?
+    };
     apply_locked(store, tracked, req).await
 }
 
@@ -345,6 +356,13 @@ impl Pull<'_> {
                             if !encrypted.contains(&conflict.branch_path) {
                                 return Ok(object);
                             }
+                            // The origin version this conflict is about is
+                            // not an envelope: it is the plaintext itself,
+                            // and taking it is what the path needs. The next
+                            // save encrypts it under this machine's policy.
+                            if conflict.kind == super::reconcile::ConflictKind::PlaintextUpstream {
+                                return Ok(object);
+                            }
                             super::files::decrypt(
                                 repo,
                                 &conflict.branch_path,
@@ -511,7 +529,9 @@ impl Pull<'_> {
             .or(status.upstream_commit.as_deref())
             .or(self.planned_head.as_deref());
         Ok(directory_tree
-            .map(|tree| super::directories::plan(self.repo, self.tracked, tree))
+            .map(|tree| {
+                super::directories::plan(self.repo, self.tracked, tree).map(|plan| plan.steps)
+            })
             .transpose()?
             .unwrap_or_default())
     }
@@ -605,15 +625,22 @@ impl Pull<'_> {
                         .pending
                         .object
                         .as_ref()
-                        .map(|object| {
-                            super::files::commit_object(
+                        .map(|object| -> Result<super::reconcile::Object> {
+                            let object = super::files::commit_object(
                                 repo,
                                 &step.pending.branch_path,
                                 object,
                                 &self.tracked.manifest,
                                 &parents,
                                 self.interactive(),
-                            )
+                            )?;
+                            // A comparison object lives only in this process;
+                            // Git's tree write needs it in the repository.
+                            if repo.object_type(&object.1)?.is_some() {
+                                return Ok(object);
+                            }
+                            let bytes = repo.cat_object(&object.1)?;
+                            Ok((object.0, repo.store_blob(&bytes)?))
                         })
                         .transpose()?,
                 })
@@ -851,7 +878,7 @@ impl Applying<'_> {
             self.adopted_head = Some(remote.to_owned());
             // every path this pull writes, the ones it creates included,
             // and manual-save ones as they are now: undo puts back exactly
-            // what was here
+            // what was here. The snapshot stays off the published history.
             let written: Vec<PathBuf> = self.ready.iter().map(|step| step.path.clone()).collect();
             self.scope.recapture_before(&written)?;
             self.protected_head = repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)?;
@@ -1028,6 +1055,7 @@ impl Applying<'_> {
             message: Some("apply failed; recovery attempted".into()),
         });
         let mut operation_id = None;
+        let recovery = scope.before().map(|(_, commit)| commit);
         scope.with_operation(|op| operation_id = Some(op.id.clone()));
         if recovery_errors.is_empty() {
             scope.finish(status.application_failure.clone(), summary);
@@ -1070,6 +1098,12 @@ impl Applying<'_> {
                 && recorded_by_this_operation(&head)?
                 && repo.delete_history_head(&head).is_ok()
             {
+                // Drop this adoption's private snapshot before rebuilding.
+                // Rebuilding first would keep its stale index entry after the
+                // ref is gone.
+                if let Some(recovery) = &recovery {
+                    repo.release_recovery(recovery)?;
+                }
                 pull.store.rebuild_index()?;
             }
             status.application_failure = None;
@@ -1629,7 +1663,11 @@ pub fn describe_conflicts(conflicts: &[Conflict]) -> Vec<(String, String)> {
                 .path()
                 .map(display_path)
                 .unwrap_or_else(|| conflict.branch_path.clone());
-            (path, conflict.kind.describe().to_string())
+            let description = match &conflict.detail {
+                Some(detail) => format!("{}; {detail}", conflict.kind.describe()),
+                None => conflict.kind.describe().to_string(),
+            };
+            (path, description)
         })
         .collect()
 }

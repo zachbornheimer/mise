@@ -31,6 +31,7 @@ pub(crate) const MAX_BYTES: u64 = 1024 * 1024 * 1024;
 #[cfg(test)]
 thread_local! {
     static READ_META_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static GIX_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -41,6 +42,16 @@ pub(crate) fn reset_read_meta_calls() {
 #[cfg(test)]
 pub(crate) fn read_meta_calls() -> usize {
     READ_META_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_gix_opens() {
+    GIX_OPENS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn gix_opens() -> usize {
+    GIX_OPENS.with(std::cell::Cell::get)
 }
 
 /// One top-level root of a snapshot tree and the files to add under it,
@@ -61,6 +72,8 @@ pub(crate) struct CaptureResult {
     pub warnings: Vec<String>,
     /// Files which were discovered but could not be read. They are not deletions.
     pub omitted: Vec<super::store::PathReason>,
+    /// Content reads the operating system refused. A subset of `omitted`.
+    pub permission_denied: Vec<super::store::PathReason>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -113,12 +126,17 @@ pub struct HistoryRepo {
     /// Comparison and decrypted bytes live only for this process. They must
     /// never become objects merely because a preflight or diff read them.
     transient: std::sync::Mutex<TransientObjects>,
+    /// Learned on the first open and reused: a blob id computed from bytes
+    /// does not need the object database open again.
+    object_hash: std::sync::Mutex<Option<gix::hash::Kind>>,
 }
 
 #[derive(Default)]
 struct TransientObjects {
     blobs: BTreeMap<String, Vec<u8>>,
-    decrypted: BTreeMap<String, (String, String)>,
+    /// Ciphertext object -> the path it was opened for, and what it opened to.
+    /// The path is part of the key: the same blob under another path is not a hit.
+    decrypted: BTreeMap<String, (String, (String, String))>,
 }
 
 impl std::fmt::Debug for TransientObjects {
@@ -151,6 +169,7 @@ struct EncryptionCacheEntry {
 /// tree written from what was left dropped a sorted prefix of its paths,
 /// which a checkpoint then recorded as deliberate deletions and published
 /// to every other machine.
+#[cfg(test)]
 struct ScratchIndex {
     path: PathBuf,
     owner: PathBuf,
@@ -164,12 +183,14 @@ struct ScratchIndex {
 /// process's, for as long as this process runs. A process id would not:
 /// the system reuses them, so a name built from one can collide with a
 /// name an earlier process is still using.
+#[cfg(test)]
 fn scratch_nonce() -> &'static str {
     static NONCE: std::sync::LazyLock<String> =
         std::sync::LazyLock::new(|| format!("{:032x}", rand::random::<u128>()));
     &NONCE
 }
 
+#[cfg(test)]
 impl ScratchIndex {
     /// A scratch index in `dir`, distinct from every other live one.
     fn new(dir: &Path, purpose: &str) -> Self {
@@ -203,6 +224,7 @@ impl ScratchIndex {
     }
 }
 
+#[cfg(test)]
 impl Drop for ScratchIndex {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -228,6 +250,7 @@ impl Drop for ScratchIndex {
 /// Guessing from age instead would eventually delete the index of a
 /// composition suspended midway and truncate the very snapshot this all
 /// exists to protect.
+#[cfg(test)]
 fn sweep_scratch_indexes(dir: &Path) {
     use std::sync::{LazyLock, Mutex};
 
@@ -304,9 +327,77 @@ fn encryption_cache_key(dir: &Path) -> Result<[u8; 32]> {
 }
 
 impl HistoryRepo {
-    pub(crate) const HISTORY_REF: &'static str = "refs/heads/main";
+    pub const HISTORY_REF: &'static str = "refs/heads/main";
+    /// A protective snapshot taken during a fresh adoption. It is this
+    /// machine's recovery record, not a checkpoint of the shared setup:
+    /// fetch and push name `main` only, so this ref never leaves the machine.
+    pub(crate) const RECOVERY_REF: &'static str = "refs/mise-history/recovery";
+
+    /// Keeps `commit` reachable without dropping an earlier recovery snapshot.
+    /// Each adoption gets its own ref; undo names the commit, and a rebuilt
+    /// index walks every ref under the prefix.
+    pub(crate) fn retain_recovery(&self, commit: &str) -> Result<()> {
+        let name = format!("{}/{}", Self::RECOVERY_REF, &commit[..12]);
+        if self.ref_oid(&name)?.as_deref() == Some(commit) {
+            return Ok(());
+        }
+        self.update_ref(&name, commit, None)
+    }
+
+    /// Drops the private ref of one recovery snapshot. Other adoptions keep
+    /// theirs.
+    pub(crate) fn release_recovery(&self, commit: &str) -> Result<()> {
+        self.delete_ref(&format!("{}/{}", Self::RECOVERY_REF, &commit[..12]))
+    }
+
+    /// Every private adoption recovery tip. Its parent is published history,
+    /// which the index already lists, so the remote ancestry is not walked.
+    pub(crate) fn recovery_commits(&self) -> Result<Vec<(String, String)>> {
+        let mut messages = vec![];
+        let prefix = format!("{}/", Self::RECOVERY_REF);
+        let repo = self.gix()?;
+        for (name, oid) in self.list_refs(&prefix)? {
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let object = repo.find_commit(gix::ObjectId::from_hex(oid.as_bytes())?)?;
+            let message = String::from_utf8_lossy(object.message_raw()?.as_ref())
+                .trim()
+                .to_string();
+            messages.push((oid, message));
+        }
+        Ok(messages)
+    }
+
     const MATCHER_TRAILER: &'static str = "Mise-History-Matcher: ";
     pub(crate) const RECORD_TRAILER: &'static str = "Mise-History: ";
+    /// Nothing mise stores is merged by Git's text merge: an encrypted path
+    /// holds an envelope whose two sides are ciphertext, and the setup
+    /// manifest is a keyed inventory. Git keeps one side of a conflicting path
+    /// instead of writing markers into it, and mise resolves every such path
+    /// from decrypted content before anything is committed.
+    fn write_no_text_merge(git: &GitPlumbing) -> Result<()> {
+        const LINE: &str = "* -merge";
+        let dir = git.git_dir().join("info");
+        let path = dir.join("attributes");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        if existing.lines().any(|line| line.trim() == LINE) {
+            return Ok(());
+        }
+        super::store::create_private_dir(&dir)?;
+        let mut content = existing;
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(LINE);
+        content.push('\n');
+        use std::io::Write;
+        let mut temporary = tempfile::NamedTempFile::new_in(&dir)?;
+        temporary.write_all(content.as_bytes())?;
+        temporary.persist(&path).map_err(|err| err.error)?;
+        Ok(())
+    }
+
     pub fn path_in(state_dir: &Path) -> PathBuf {
         repo_dir_in(state_dir)
     }
@@ -320,6 +411,14 @@ impl HistoryRepo {
         let git = GitPlumbing::new(Self::path_in(state_dir));
         git.init_bare()
             .wrap_err_with(|| format!("initializing {}", display_path(git.git_dir())))?;
+        // Written before anything reads or merges this history: a repository
+        // created before this existed gains it on its next open here.
+        Self::write_no_text_merge(&git).wrap_err_with(|| {
+            format!(
+                "recording merge attributes in {}",
+                display_path(git.git_dir())
+            )
+        })?;
         // the binary may exist and still be unusable (a stub, a broken
         // install): probe it once so callers can say capture is unavailable
         git.run(PlumbingCall::new(["rev-parse", "--is-bare-repository"]))
@@ -327,6 +426,7 @@ impl HistoryRepo {
         let repo = Self {
             git,
             transient: Default::default(),
+            object_hash: Default::default(),
         };
         if !repo.list_refs("refs/checkpoints/")?.is_empty() {
             bail!(
@@ -448,7 +548,11 @@ impl HistoryRepo {
         let mut roots = walk.roots.clone();
         let mut overlays = vec![];
         let mut recipients = None;
-        let encrypted_by_root: Vec<Vec<PathBuf>> = roots
+        // a set, not a Vec: the retain below asks membership for every tracked
+        // file of the root, and a linear scan per file made one save compare
+        // 3,817 paths against 3,700 others — 14 million comparisons on the
+        // real store, and the reason `mise dot status` never finished
+        let encrypted_by_root: Vec<std::collections::BTreeSet<PathBuf>> = roots
             .iter()
             .map(|root| {
                 root.files
@@ -484,31 +588,38 @@ impl HistoryRepo {
             }
             None => BTreeMap::new(),
         };
+        // opened once: every cached entry below asks whether its blob is an
+        // encrypted envelope, and opening a repository scans every pack index
+        let gix = self.gix()?;
+        let mut denied = vec![];
         for (root, encrypted) in roots.iter_mut().zip(encrypted_by_root) {
             root.files.retain(|rel| !encrypted.contains(rel));
             for rel in encrypted {
                 let live = root.path.join(&rel);
-                let metadata = std::fs::symlink_metadata(&live)?;
-                let (mode, bytes) = if metadata.file_type().is_symlink() {
-                    (
-                        "120000",
-                        path_bytes(&std::fs::read_link(&live)?).into_owned(),
-                    )
-                } else if metadata.is_file() {
-                    #[cfg(unix)]
-                    let executable = {
-                        use std::os::unix::fs::PermissionsExt;
-                        metadata.permissions().mode() & 0o100 != 0
-                    };
-                    #[cfg(not(unix))]
-                    let executable = false;
-                    let bytes = mise_util::agecrypt::read_bounded(
-                        std::fs::File::open(&live)?,
-                        mise_util::agecrypt::MAX_PLAINTEXT_BYTES,
-                    )?;
-                    (if executable { "100755" } else { "100644" }, bytes)
-                } else {
-                    bail!("cannot encrypt non-file {}", display_path(&live));
+                let metadata = match std::fs::symlink_metadata(&live) {
+                    Ok(metadata) => metadata,
+                    Err(error) if super::health::is_permission_denied(&error) => {
+                        Self::push_denial(&mut denied, &live, &error);
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let read = Self::read_encrypted(&live, &metadata);
+                let (mode, bytes) = match read {
+                    Ok(read) => read,
+                    Err(error)
+                        if error
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(super::health::is_permission_denied) =>
+                    {
+                        Self::push_denial(
+                            &mut denied,
+                            &live,
+                            error.downcast_ref::<std::io::Error>().unwrap(),
+                        );
+                        continue;
+                    }
+                    Err(error) => return Err(error),
                 };
                 let path = history_path(&root.label, &rel)?;
                 let fingerprint = blake3::keyed_hash(&cache_key, &bytes).to_hex().to_string();
@@ -520,7 +631,7 @@ impl HistoryRepo {
                             && entry.scheme == scheme
                     })
                     .filter(|entry| {
-                        self.blob_starts_with(&entry.oid, b"mise-encrypted-file-v1\n")
+                        self.blob_starts_with_in(&gix, &entry.oid, b"mise-encrypted-file-v1\n")
                             .unwrap_or(false)
                     });
                 let previous = in_history.remove(&path);
@@ -560,7 +671,7 @@ impl HistoryRepo {
                                 let encoded = super::sync::files::encode(
                                     &path, mode, &bytes, &scheme, recipients,
                                 )?;
-                                self.hash_blob(&encoded)?
+                                self.hash_blob_in(&gix, &encoded)?
                             }
                         };
                         cache.insert(
@@ -583,6 +694,16 @@ impl HistoryRepo {
         }
         // No encrypted input is ever handed to git add or hash-object.
         let mut captured = self.capture(&roots)?;
+        for denial in denied {
+            if !captured
+                .permission_denied
+                .iter()
+                .any(|found| found.path == denial.path)
+            {
+                captured.omitted.push(denial.clone());
+                captured.permission_denied.push(denial);
+            }
+        }
         captured.tree = self.compose(&captured.tree, &overlays)?;
         captured.roots = walk
             .roots
@@ -608,6 +729,7 @@ impl HistoryRepo {
     /// exactly the listed files.
     pub(crate) fn capture(&self, roots: &[CaptureRoot]) -> Result<CaptureResult> {
         let mut omitted = vec![];
+        let mut denied = vec![];
         let mut entries: Vec<(String, String)> = vec![]; // (oid, name)
         let mut records = vec![];
         for root in roots {
@@ -622,7 +744,7 @@ impl HistoryRepo {
                 continue;
             }
             let tree = self
-                .tree_for_root(root, &mut omitted)
+                .tree_for_root(root, &mut omitted, &mut denied)
                 .wrap_err_with(|| format!("snapshotting {}", display_path(&root.path)))?;
             entries.push((tree, root.label.clone()));
             records.push(record);
@@ -641,6 +763,7 @@ impl HistoryRepo {
                 .map(|failure| format!("{} was not captured: {}", failure.path, failure.reason))
                 .collect(),
             omitted,
+            permission_denied: denied,
         })
     }
 
@@ -649,7 +772,11 @@ impl HistoryRepo {
         &self,
         root: &CaptureRoot,
         omitted: &mut Vec<super::store::PathReason>,
+        denied: &mut Vec<super::store::PathReason>,
     ) -> Result<String> {
+        // opening a repository scans every pack index: one open serves every
+        // file of the root, not one per file
+        let gix = self.gix()?;
         let mut overlays = vec![];
         for rel in &root.files {
             let live = root.path.join(rel);
@@ -658,7 +785,7 @@ impl HistoryRepo {
                 let (mode, oid) = if meta.file_type().is_symlink() {
                     (
                         "120000",
-                        self.hash_blob(path_bytes(&std::fs::read_link(&live)?).as_ref())?,
+                        self.hash_blob_in(&gix, path_bytes(&std::fs::read_link(&live)?).as_ref())?,
                     )
                 } else if meta.is_dir() {
                     ("160000", mise_util::git::Git::new(&live).current_sha()?)
@@ -676,7 +803,7 @@ impl HistoryRepo {
                     )?;
                     (
                         if executable { "100755" } else { "100644" },
-                        self.hash_blob(&bytes)?,
+                        self.hash_blob_in(&gix, &bytes)?,
                     )
                 } else {
                     bail!("cannot capture non-file {}", display_path(&live));
@@ -691,13 +818,72 @@ impl HistoryRepo {
             })();
             match captured {
                 Ok(overlay) => overlays.push(overlay),
-                Err(error) => omitted.push(super::store::PathReason {
-                    path: display_path(&live),
-                    reason: format!("unreadable: {error:#}"),
-                }),
+                Err(error) => {
+                    let path = display_path(&live);
+                    if let Some(io) = error.downcast_ref::<std::io::Error>()
+                        && super::health::is_permission_denied(io)
+                        && !denied.iter().any(|found| found.path == path)
+                    {
+                        denied.push(super::store::PathReason {
+                            path: path.clone(),
+                            reason: format!("unreadable: {io}"),
+                        });
+                    }
+                    omitted.push(super::store::PathReason {
+                        path,
+                        reason: format!("unreadable: {error:#}"),
+                    });
+                }
             }
         }
         self.compose(&self.empty_object("tree")?, &overlays)
+    }
+
+    /// The bytes of an encrypted file, or why they could not be read.
+    /// A permission denial is omitted by the caller; every other error fails
+    /// the snapshot, as an encrypted read did before.
+    fn read_encrypted(
+        live: &Path,
+        metadata: &std::fs::Metadata,
+    ) -> Result<(&'static str, Vec<u8>)> {
+        if metadata.file_type().is_symlink() {
+            return Ok((
+                "120000",
+                path_bytes(&std::fs::read_link(live)?).into_owned(),
+            ));
+        }
+        if metadata.is_file() {
+            #[cfg(unix)]
+            let executable = {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode() & 0o100 != 0
+            };
+            #[cfg(not(unix))]
+            let executable = false;
+            let bytes = mise_util::agecrypt::read_bounded(
+                std::fs::File::open(live)?,
+                mise_util::agecrypt::MAX_PLAINTEXT_BYTES,
+            )?;
+            return Ok((if executable { "100755" } else { "100644" }, bytes));
+        }
+        bail!("cannot encrypt non-file {}", display_path(live))
+    }
+
+    /// Names a permission denial once. The reason keeps the operating-system
+    /// error and nothing else, so a report can render it without parsing.
+    fn push_denial(
+        denied: &mut Vec<super::store::PathReason>,
+        path: &Path,
+        error: &std::io::Error,
+    ) {
+        let path = display_path(path);
+        if denied.iter().any(|found| found.path == path) {
+            return;
+        }
+        denied.push(super::store::PathReason {
+            path,
+            reason: error.to_string(),
+        });
     }
 
     /// One level of tree from an `ls-tree`-style listing.
@@ -823,7 +1009,11 @@ impl HistoryRepo {
             return Ok(vec![]);
         };
         let head = head.peel_to_id()?.detach();
-        let commits = gix::traverse::commit::topo::Builder::new(&repo)
+        Self::messages_from(&repo, head)
+    }
+
+    fn messages_from(repo: &gix::Repository, head: gix::ObjectId) -> Result<Vec<(String, String)>> {
+        let commits = gix::traverse::commit::topo::Builder::new(repo)
             .with_tips([head])
             .sorting(gix::traverse::commit::topo::Sorting::TopoOrder)
             .build()?;
@@ -842,20 +1032,23 @@ impl HistoryRepo {
     /// Git process per commit. Open it for each walk so objects and refs
     /// written by Git are always visible.
     pub(crate) fn gix(&self) -> Result<gix::Repository> {
+        #[cfg(test)]
+        GIX_OPENS.with(|count| count.set(count.get() + 1));
         gix::open_opts(self.dir(), gix::open::Options::isolated())
             .wrap_err_with(|| format!("opening {} with gix", display_path(self.dir())))
     }
 
     /// Visits every file at or under one of `paths` in each of `commits`, in
     /// order. A subtree already visited at the same path is skipped, since
-    /// everything in it was visited with it.
-    pub(crate) fn visit_paths_in<'a>(
+    /// everything in it was visited with it. Reuses the caller's repository
+    /// for tree traversal and blob reads.
+    pub(crate) fn visit_paths_in_open<'a>(
         &self,
+        repo: &gix::Repository,
         commits: impl IntoIterator<Item = &'a String>,
         paths: &BTreeSet<String>,
         mut visit: impl FnMut(&str, TreeEntry) -> Result<()>,
     ) -> Result<()> {
-        let repo = self.gix()?;
         let mut subtrees = BTreeSet::new();
         for commit in commits {
             let tree = repo
@@ -871,7 +1064,7 @@ impl HistoryRepo {
                         continue;
                     }
                     let subtree = entry.object()?.into_tree();
-                    for mut nested in Self::gix_tree_entries(&repo, &subtree)? {
+                    for mut nested in Self::gix_tree_entries(repo, &subtree)? {
                         nested.path = format!("{path}/{}", nested.path);
                         visit(commit, nested)?;
                     }
@@ -1171,32 +1364,91 @@ impl HistoryRepo {
         from: Option<&gix::Tree<'_>>,
         to: &gix::Tree<'_>,
     ) -> Result<Vec<Change>> {
-        let from = if let Some(tree) = from {
-            Self::gix_tree_entries(repo, tree)?
-        } else {
-            vec![]
-        }
-        .into_iter()
-        .map(|entry| (entry.path, (entry.mode, entry.oid)))
-        .collect::<BTreeMap<_, _>>();
-        let to = Self::gix_tree_entries(repo, to)?
-            .into_iter()
-            .map(|entry| (entry.path, (entry.mode, entry.oid)))
-            .collect::<BTreeMap<_, _>>();
         let mut changes = vec![];
-        for path in from.keys().chain(to.keys()).collect::<BTreeSet<_>>() {
-            let status = match (from.get(path), to.get(path)) {
+        Self::gix_diff_level(
+            repo,
+            from.map(|tree| tree.id),
+            Some(to.id),
+            "",
+            &mut changes,
+        )?;
+        changes.sort_by(|left, right| left.path.cmp(&right.path));
+        Ok(changes)
+    }
+
+    /// One level of [`Self::gix_changes`]. A subtree whose id is the same on
+    /// both sides holds the same files, so it is not opened: a checkpoint
+    /// that changed one file reads the directories on that file's path, not
+    /// every saved file twice.
+    fn gix_diff_level(
+        repo: &gix::Repository,
+        from: Option<gix::ObjectId>,
+        to: Option<gix::ObjectId>,
+        prefix: &str,
+        changes: &mut Vec<Change>,
+    ) -> Result<()> {
+        // name -> (is a tree, mode, id)
+        type Level = BTreeMap<String, (bool, gix::object::tree::EntryMode, gix::ObjectId)>;
+        let read = |id: Option<gix::ObjectId>| -> Result<Level> {
+            let Some(id) = id else {
+                return Ok(Level::new());
+            };
+            let tree = repo.find_tree(id)?;
+            let mut level = Level::new();
+            for entry in tree.decode()?.entries.iter() {
+                let name = std::str::from_utf8(entry.filename.as_ref()).wrap_err(
+                    "history cannot represent a non-UTF-8 filename; refusing to change its bytes",
+                )?;
+                level.insert(
+                    name.to_string(),
+                    (entry.mode.is_tree(), entry.mode, entry.oid.to_owned()),
+                );
+            }
+            Ok(level)
+        };
+        let (from, to) = (read(from)?, read(to)?);
+        for name in from.keys().chain(to.keys()).collect::<BTreeSet<_>>() {
+            let path = format!("{prefix}{name}");
+            let (left, right) = (from.get(name), to.get(name));
+            if left == right {
+                continue;
+            }
+            let tree_of = |side: Option<&(bool, _, gix::ObjectId)>| {
+                side.and_then(|(is_tree, _, id)| is_tree.then_some(*id))
+            };
+            let file_of = |side: Option<&(bool, gix::object::tree::EntryMode, gix::ObjectId)>| {
+                side.and_then(|(is_tree, mode, id)| (!is_tree).then_some((*mode, *id)))
+            };
+            let (left_tree, right_tree) = (tree_of(left), tree_of(right));
+            if left_tree.is_some() || right_tree.is_some() {
+                Self::gix_diff_level(repo, left_tree, right_tree, &format!("{path}/"), changes)?;
+            }
+            let status = match (file_of(left), file_of(right)) {
                 (None, Some(_)) => 'A',
                 (Some(_), None) => 'D',
                 (Some(left), Some(right)) if left != right => 'M',
                 _ => continue,
             };
-            changes.push(Change {
-                status,
-                path: path.clone(),
-            });
+            changes.push(Change { status, path });
         }
-        Ok(changes)
+        Ok(())
+    }
+
+    /// [`Self::ls_tree`] through an already open repository. A walk over a
+    /// tree's files opens it once and passes it here, not once per file.
+    pub(crate) fn ls_tree_in(
+        &self,
+        objects: &gix::Repository,
+        spec: &str,
+    ) -> Result<Vec<TreeEntry>> {
+        if let Some(id) = Self::object_id(spec) {
+            let tree = objects
+                .find_object(id)
+                .wrap_err_with(|| format!("reading {spec}"))?
+                .peel_to_tree()?;
+            return Self::gix_tree_entries(objects, &tree);
+        }
+        self.ls_tree(spec)
     }
 
     /// Recursive listing of a tree (or a path inside it).
@@ -1287,31 +1539,28 @@ impl HistoryRepo {
     /// The blob `id`, refusing anything over `limit` bytes before reading
     /// it, as `cat-file blob` refuses an object that is not a blob.
     fn gix_blob(&self, id: gix::ObjectId, limit: u64) -> Result<Vec<u8>> {
-        let repo = self.gix()?;
-        let header = repo
-            .find_header(id)
-            .wrap_err_with(|| format!("reading {id}"))?;
-        if header.kind() != gix::object::Kind::Blob {
-            bail!("reading {id}: a {} is not a blob", header.kind());
-        }
-        if header.size() > limit {
-            bail!("object exceeds the encrypted content size limit");
-        }
-        Ok(repo
-            .find_object(id)
-            .wrap_err_with(|| format!("reading {id}"))?
-            .detach()
-            .data)
+        Self::blob_in(&self.gix()?, id, limit)
     }
 
-    pub(crate) fn blob_starts_with(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
-        if let Some(bytes) = self.transient_blob(oid) {
-            return Ok(bytes.starts_with(prefix));
+    pub fn blob_starts_with(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
+        if self.transient_blob(oid).is_none() && Self::object_id(oid).is_some() {
+            return self.blob_starts_with_in(&self.gix()?, oid, prefix);
         }
-        if let Some(id) = Self::object_id(oid) {
+        self.blob_starts_with_in_git(oid, prefix)
+    }
+
+    /// [`Self::blob_starts_with`] through an already open repository. Opening
+    /// one scans every pack index, so a walk that asks about many blobs opens
+    /// it once and passes it here, not once per blob.
+    pub(crate) fn blob_starts_with_in(
+        &self,
+        repo: &gix::Repository,
+        oid: &str,
+        prefix: &[u8],
+    ) -> Result<bool> {
+        if let (None, Some(id)) = (self.transient_blob(oid), Self::object_id(oid)) {
             // gix reads a full object id without starting Git; a blob
             // shorter than the prefix cannot match, so it is never read
-            let repo = self.gix()?;
             let header = repo
                 .find_header(id)
                 .wrap_err_with(|| format!("reading {id}"))?;
@@ -1325,6 +1574,14 @@ impl HistoryRepo {
                 .find_object(id)
                 .wrap_err_with(|| format!("reading {id}"))?;
             return Ok(object.data.starts_with(prefix));
+        }
+        self.blob_starts_with_in_git(oid, prefix)
+    }
+
+    /// A transient (not yet written) blob, or a revision only Git resolves.
+    fn blob_starts_with_in_git(&self, oid: &str, prefix: &[u8]) -> Result<bool> {
+        if let Some(bytes) = self.transient_blob(oid) {
+            return Ok(bytes.starts_with(prefix));
         }
         self.git.blob_starts_with(oid, prefix)
     }
@@ -1349,22 +1606,73 @@ impl HistoryRepo {
         self.cat_object(oid)
     }
 
+    /// [`Self::cat_object_bounded`] through an already open repository. A walk
+    /// over many encrypted blobs opens the object database once.
+    pub(crate) fn cat_object_bounded_in(
+        &self,
+        objects: &gix::Repository,
+        oid: &str,
+        limit: u64,
+    ) -> Result<Vec<u8>> {
+        if let Some(bytes) = self.transient_blob(oid) {
+            if bytes.len() as u64 > limit {
+                bail!("object exceeds the encrypted content size limit");
+            }
+            return Ok(bytes);
+        }
+        if let Some(id) = Self::object_id(oid) {
+            return Self::blob_in(objects, id, limit);
+        }
+        self.cat_object_bounded(oid, limit)
+    }
+
+    fn blob_in(objects: &gix::Repository, id: gix::ObjectId, limit: u64) -> Result<Vec<u8>> {
+        let header = objects
+            .find_header(id)
+            .wrap_err_with(|| format!("reading {id}"))?;
+        if header.kind() != gix::object::Kind::Blob {
+            bail!("reading {id}: a {} is not a blob", header.kind());
+        }
+        if header.size() > limit {
+            bail!("object exceeds the encrypted content size limit");
+        }
+        Ok(objects
+            .find_object(id)
+            .wrap_err_with(|| format!("reading {id}"))?
+            .detach()
+            .data)
+    }
+
     /// Writes `bytes` as a blob, as `hash-object -w --stdin` does (no
     /// filters), without starting Git once per file of a snapshot.
     pub(crate) fn hash_blob(&self, bytes: &[u8]) -> Result<String> {
-        Ok(self
-            .gix()?
+        self.hash_blob_in(&self.gix()?, bytes)
+    }
+
+    /// [`Self::hash_blob`] through an already open repository, for a walk that
+    /// writes many blobs (opening one scans every pack index).
+    pub(crate) fn hash_blob_in(&self, repo: &gix::Repository, bytes: &[u8]) -> Result<String> {
+        Ok(repo
             .write_blob(bytes)
             .wrap_err("writing a blob")?
+            .to_string())
+    }
+
+    /// Store a synthesized blob through the same Git child that writes the
+    /// trees referring to it: a tree built from an object no child can read
+    /// fails at `write-tree`.
+    pub(crate) fn store_blob(&self, bytes: &[u8]) -> Result<String> {
+        Ok(self
+            .output_str(PlumbingCall::new(["hash-object", "-w", "--stdin"]).stdin(bytes))?
+            .trim()
             .to_string())
     }
 
     /// Compute the normal Git identity without writing an object. Read APIs
     /// can resolve it in memory until this repository handle is dropped.
     pub(crate) fn transient_blob_id(&self, bytes: &[u8]) -> Result<String> {
-        let oid =
-            gix::objs::compute_hash(self.gix()?.object_hash(), gix::object::Kind::Blob, bytes)?
-                .to_string();
+        let oid = gix::objs::compute_hash(self.object_hash()?, gix::object::Kind::Blob, bytes)?
+            .to_string();
         self.transient
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1382,7 +1690,7 @@ impl HistoryRepo {
             .cloned()
     }
 
-    pub(crate) fn decrypted_object(&self, ciphertext: &str) -> Option<(String, String)> {
+    pub(crate) fn decrypted_object(&self, ciphertext: &str) -> Option<(String, (String, String))> {
         self.transient
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -1391,12 +1699,35 @@ impl HistoryRepo {
             .cloned()
     }
 
-    pub(crate) fn remember_decrypted(&self, ciphertext: &str, object: (String, String)) {
+    pub(crate) fn remember_decrypted(
+        &self,
+        ciphertext: &str,
+        path: &str,
+        object: (String, String),
+    ) {
         self.transient
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .decrypted
-            .insert(ciphertext.into(), object);
+            .insert(ciphertext.into(), (path.into(), object));
+    }
+
+    /// The hash kind of this repository, learned once. Computing a blob id
+    /// from bytes does not need the object database open.
+    pub(crate) fn object_hash(&self) -> Result<gix::hash::Kind> {
+        if let Some(kind) = *self
+            .object_hash
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+        {
+            return Ok(kind);
+        }
+        let kind = self.gix()?.object_hash();
+        *self
+            .object_hash
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(kind);
+        Ok(kind)
     }
 
     /// Compares two trees, from `a` to `b`. With `paths`, a path that exists
@@ -1721,16 +2052,35 @@ impl HistoryRepo {
         let Some(object) = self.object_at(tree, path)? else {
             return Ok(None);
         };
+        self.restored(&self.encrypted_paths_of(tree)?, path, object)
+            .map(Some)
+    }
+
+    /// The encrypted streams `tree` declares, read once for a walk over its
+    /// files ([`Self::restored`]) instead of once per file.
+    pub(crate) fn encrypted_paths_of(&self, tree: &str) -> Result<BTreeSet<String>> {
+        Ok(super::manifest::Manifest::read(self, tree)?
+            .map(|manifest| manifest.encrypted_paths())
+            .unwrap_or_default())
+    }
+
+    /// [`Self::restored_object_at`] for an object already listed from the
+    /// tree, with the tree's encrypted streams read beforehand: a walk over
+    /// every saved file then reads the manifest once, not once per file.
+    pub(crate) fn restored(
+        &self,
+        encrypted_paths: &BTreeSet<String>,
+        path: &str,
+        object: (String, String),
+    ) -> Result<(String, String)> {
         if matches!(object.0.as_str(), "040000" | "160000") {
-            return Ok(Some(object));
+            return Ok(object);
         }
-        let encrypted = super::manifest::Manifest::read(self, tree)?.is_some_and(|manifest| {
-            manifest.encrypted_paths().iter().any(|prefix| {
-                path == prefix
-                    || path
-                        .strip_prefix(prefix)
-                        .is_some_and(|rest| rest.starts_with('/'))
-            })
+        let encrypted = encrypted_paths.iter().any(|prefix| {
+            path == prefix
+                || path
+                    .strip_prefix(prefix.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
         });
         if encrypted {
             return super::sync::files::decrypt(
@@ -1738,60 +2088,65 @@ impl HistoryRepo {
                 path,
                 &object,
                 console::user_attended_stderr(),
-            )
-            .map(Some);
+            );
         }
-        Ok(Some(object))
+        Ok(object)
     }
 
     /// Builds a tree from `base` with `overlays` applied: each path is
     /// removed from the tree and, when an object is given, replaced by it.
     ///
-    /// **Applied to a listing in memory, then written in one index update.**
-    /// Asking Git to apply each overlay cost two processes apiece, and a
-    /// snapshot overlays every tracked file, so `mise dot status` on a few
-    /// hundred files spent seconds starting Git. The result is the tree
-    /// [`Self::compose_by_git`] builds, failures included: a path added
+    /// **Applied to the tree in this process, writing only what changed.**
+    /// Listing every file and handing the lot to Git cost the whole tree on
+    /// every call, and a snapshot composes more than once. The result is the
+    /// tree [`Self::compose_by_git`] builds, failures included: a path added
     /// beneath a file is refused, as `update-index` refuses it, while a
     /// subtree replaces a file in its way, as `read-tree --prefix` does.
     pub(crate) fn compose(&self, base: &str, overlays: &[Overlay]) -> Result<String> {
         if overlays.is_empty() {
             return Ok(base.to_string());
         }
-        let mut entries: BTreeMap<String, (String, String)> = self
-            .ls_tree(base)?
-            .into_iter()
-            .map(|entry| (entry.path, (entry.mode, entry.oid)))
-            .collect();
+        // the overlays are applied to the base tree in this process: only the
+        // trees along the changed paths are read and written, where listing
+        // every file and handing the lot to two Git processes cost the whole
+        // tree on every call, and a save composes more than once
+        let repo = self.gix()?;
+        let base_id = Self::object_id(base)
+            .ok_or_else(|| eyre::eyre!("composing needs a tree id, not {base}"))?;
+        let mut editor = repo
+            .find_object(base_id)
+            .wrap_err_with(|| format!("reading {base}"))?
+            .peel_to_tree()?
+            .edit()?;
         for overlay in overlays {
-            // what `ls-files -- :(literal)<path>` lists: the path and everything under it
-            let dir = format!("{}/", overlay.path);
-            entries.remove(&overlay.path);
-            let under: Vec<String> = entries
-                .range(dir.clone()..)
-                .take_while(|(path, _)| path.starts_with(&dir))
-                .map(|(path, _)| path.clone())
-                .collect();
-            for path in under {
-                entries.remove(&path);
-            }
+            // the path and everything under it is replaced
+            editor.remove(overlay.path.as_str())?;
             let ancestors: Vec<&str> = overlay
                 .path
                 .match_indices('/')
                 .map(|(at, _)| &overlay.path[..at])
-                .filter(|ancestor| entries.contains_key(*ancestor))
+                .filter(|ancestor| {
+                    editor
+                        .get(*ancestor)
+                        .is_some_and(|entry| !entry.mode().is_tree())
+                })
                 .collect();
             match &overlay.object {
                 None => {}
                 Some((mode, oid)) if mode == "040000" => {
-                    let subtree = self.ls_tree(oid)?;
-                    if !subtree.is_empty() {
+                    let id = gix::ObjectId::from_hex(oid.as_bytes())?;
+                    let holds_files = repo
+                        .find_object(id)?
+                        .peel_to_tree()?
+                        .iter()
+                        .next()
+                        .is_some();
+                    // an empty subtree adds nothing, and takes nothing away
+                    if holds_files {
                         for ancestor in &ancestors {
-                            entries.remove(*ancestor);
+                            editor.remove(*ancestor)?;
                         }
-                    }
-                    for entry in subtree {
-                        entries.insert(format!("{dir}{}", entry.path), (entry.mode, entry.oid));
+                        editor.upsert(overlay.path.as_str(), tree_entry_kind(mode)?, id)?;
                     }
                 }
                 Some((mode, oid)) => {
@@ -1801,28 +2156,13 @@ impl HistoryRepo {
                             overlay.path
                         );
                     }
-                    entries.insert(overlay.path.clone(), (mode.clone(), oid.clone()));
+                    let id = gix::ObjectId::from_hex(oid.as_bytes())?;
+                    editor.upsert(overlay.path.as_str(), tree_entry_kind(mode)?, id)?;
                 }
             }
         }
-        if entries.is_empty() {
-            return self.empty_object("tree");
-        }
-        let mut info: Vec<u8> = vec![];
-        for (path, (mode, oid)) in &entries {
-            info.extend_from_slice(format!("{mode} {oid}\t{path}").as_bytes());
-            info.push(0);
-        }
-        let scratch = ScratchIndex::new(self.dir(), "compose");
-        let index = scratch.path();
-        // index-only operations; git still insists on a work tree
-        self.git.run(
-            PlumbingCall::new(["update-index", "-z", "--index-info"])
-                .work_tree(self.dir())
-                .index_file(index)
-                .stdin(&info),
-        )?;
-        self.write_tree_retrying(index)
+        // Windows refuses a loose object another process holds open
+        retry_on_permission_denied(|| Ok(editor.write()?.to_string()))
     }
 
     /// `git write-tree` over `index`, tried again when Windows refuses a loose
@@ -1833,6 +2173,7 @@ impl HistoryRepo {
     /// replace a loose object another process holds open, so it fails with
     /// `Permission denied`. The object is then written by the other process,
     /// and a second attempt finds it already there.
+    #[cfg(test)]
     fn write_tree_retrying(&self, index: &Path) -> Result<String> {
         retry_on_permission_denied(|| {
             self.output_str(PlumbingCall::new(["write-tree"]).index_file(index))
@@ -1899,7 +2240,7 @@ impl HistoryRepo {
     }
 
     /// The commit a ref points at, if the ref exists.
-    pub(crate) fn ref_oid(&self, name: &str) -> Result<Option<String>> {
+    pub fn ref_oid(&self, name: &str) -> Result<Option<String>> {
         // **Every pull reads these refs dozens of times**, and a Git process
         // apiece made them most of the processes a short pull started. A
         // full ref name gix resolves itself; anything else is a revision
@@ -2077,6 +2418,12 @@ impl HistoryRepo {
 
     /// Merge complete ordinary trees using Git's recursive merge-base handling.
     /// Conflict trees are never adopted or written into live configuration.
+    ///
+    /// An encrypted blob is opaque. Git text-merges one because its bytes are
+    /// ASCII, and the result (conflict markers, or a clean line merge of two
+    /// envelopes) is not an age envelope. A path both sides changed is reported
+    /// as a conflict and the tree keeps one parent's blob, never a synthesized
+    /// merge. The caller decides which side; this layer only refuses to invent one.
     pub(crate) fn merge_tree(&self, local: &str, remote: &str) -> Result<(String, Vec<String>)> {
         let output = self.git.output_unchecked(PlumbingCall::new([
             "merge-tree",
@@ -2100,11 +2447,58 @@ impl HistoryRepo {
             .filter(|tree| !tree.is_empty())
             .ok_or_else(|| eyre::eyre!("Git did not return a merged tree"))?
             .to_owned();
-        let conflicts = fields
+        let mut conflicts: Vec<String> = fields
             .filter(|path| !path.is_empty())
             .map(str::to_owned)
             .collect();
+        let tree = self.refuse_merged_ciphertext(&tree, local, remote, &mut conflicts)?;
         Ok((tree, conflicts))
+    }
+
+    /// Replace an encrypted blob git synthesized (conflict markers, or a clean
+    /// line merge of two envelopes) with one parent's blob and report the path.
+    /// A blob only one side changed is left alone, and so is a blob that already
+    /// is one parent's.
+    fn refuse_merged_ciphertext(
+        &self,
+        tree: &str,
+        local: &str,
+        remote: &str,
+        conflicts: &mut Vec<String>,
+    ) -> Result<String> {
+        let magic: &[u8] = b"mise-encrypted-file-v1\n";
+        let mut overlays = Vec::new();
+        for entry in self.ls_tree(tree)? {
+            if !self.blob_starts_with(&entry.oid, magic)? {
+                continue;
+            }
+            let ours = self.object_at(local, &entry.path)?;
+            let theirs = self.object_at(remote, &entry.path)?;
+            let is_envelope = |object: &Option<(String, String)>| {
+                object
+                    .as_ref()
+                    .is_some_and(|object| self.blob_starts_with(&object.1, magic).unwrap_or(false))
+            };
+            if !is_envelope(&ours) && !is_envelope(&theirs) {
+                continue;
+            }
+            let synthesized = ours.as_ref().is_none_or(|object| object.1 != entry.oid)
+                && theirs.as_ref().is_none_or(|object| object.1 != entry.oid);
+            if !synthesized {
+                continue;
+            }
+            if !conflicts.iter().any(|path| path == &entry.path) {
+                conflicts.push(entry.path.clone());
+            }
+            overlays.push(Overlay {
+                path: entry.path,
+                object: ours.or(theirs),
+            });
+        }
+        if overlays.is_empty() {
+            return Ok(tree.to_owned());
+        }
+        self.compose(tree, &overlays)
     }
 
     /// Every object, including blobs of earlier versions, reachable from `head`.
@@ -2215,12 +2609,14 @@ impl HistoryRepo {
         }
     }
 
-    /// Runs a network command with the user's git configuration.
+    /// Runs a network command with the user's git configuration, bounded
+    /// by `history.network_timeout`. `0` waits without a limit.
     pub(crate) fn network<'a>(
         &self,
         args: impl IntoIterator<Item = &'a str>,
     ) -> Result<std::process::Output> {
-        self.git.network_output(PlumbingCall::new(args))
+        self.git
+            .network_output(PlumbingCall::new(args), super::scope::network_timeout())
     }
 
     pub(crate) const ANNOTATION_TRAILER: &'static str = "Mise-Annotation: ";
@@ -2295,6 +2691,19 @@ pub(crate) fn unavailable_reason() -> String {
     }
 }
 
+/// The kind a tree entry of git mode `mode` has in a gix tree editor.
+fn tree_entry_kind(mode: &str) -> Result<gix::objs::tree::EntryKind> {
+    use gix::objs::tree::EntryKind;
+    Ok(match mode {
+        "040000" => EntryKind::Tree,
+        "100644" => EntryKind::Blob,
+        "100755" => EntryKind::BlobExecutable,
+        "120000" => EntryKind::Link,
+        "160000" => EntryKind::Commit,
+        other => bail!("unsupported tree entry mode {other}"),
+    })
+}
+
 /// Runs `run`, again after a short pause while it fails with `Permission
 /// denied`, up to five attempts in all; any other error is returned at once.
 fn retry_on_permission_denied<T>(mut run: impl FnMut() -> Result<T>) -> Result<T> {
@@ -2326,6 +2735,7 @@ mod tests {
         let repo = super::HistoryRepo {
             git: mise_util::git::GitPlumbing::new(path),
             transient: Default::default(),
+            object_hash: Default::default(),
         };
         let tree = repo.empty_object("tree").unwrap();
         let commit = repo.commit_tree(&tree, vec![], "sha256 history").unwrap();
@@ -2354,6 +2764,7 @@ mod tests {
         let repo = super::HistoryRepo {
             git: mise_util::git::GitPlumbing::new(path),
             transient: Default::default(),
+            object_hash: Default::default(),
         };
         let tree = repo.empty_object("tree").unwrap();
         let message = format!("apply\n\n{}", "x".repeat(200 * 1024));
@@ -2397,6 +2808,7 @@ mod tests {
             let repo = super::HistoryRepo {
                 git: mise_util::git::GitPlumbing::new(path),
                 transient: Default::default(),
+                object_hash: Default::default(),
             };
             for bytes in contents {
                 let expected = repo
@@ -3696,5 +4108,45 @@ mod tests {
         assert_eq!(link.mode, "160000");
         // the nested repository itself was not touched
         assert_eq!(git_in(&nested, &["status", "--porcelain"]), "?? untracked");
+    }
+
+    /// Two encrypted envelopes that share the header and differ below it must
+    /// not be text-merged. Git would commit the conflict markers; the merge
+    /// keeps one parent's blob and reports the path.
+    #[test]
+    fn merging_two_encrypted_blobs_does_not_commit_conflict_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let envelope = |body: &str| {
+            let mut bytes = b"mise-encrypted-file-v1\nshared line\n".to_vec();
+            bytes.extend_from_slice(body.as_bytes());
+            bytes.extend_from_slice(b"\ntrailer\n");
+            repo.hash_blob(&bytes).unwrap()
+        };
+        let tree = |oid: String| {
+            repo.write_tree(&[("100644".into(), oid, "home/secret".into())])
+                .unwrap()
+        };
+        let base = repo
+            .commit_tree(&tree(envelope("base")), vec![], "base")
+            .unwrap();
+        let local = repo
+            .commit_tree(&tree(envelope("local side")), vec![&base], "local")
+            .unwrap();
+        let remote = repo
+            .commit_tree(&tree(envelope("remote side")), vec![&base], "remote")
+            .unwrap();
+        let (merged, conflicts) = repo.merge_tree(&local, &remote).unwrap();
+        assert!(
+            conflicts.iter().any(|path| path == "home/secret"),
+            "{conflicts:?}"
+        );
+        let object = repo.object_at(&merged, "home/secret").unwrap().unwrap();
+        let bytes = repo.cat_object(&object.1).unwrap();
+        assert!(!bytes.windows(7).any(|window| window == b"<<<<<<<"));
+        assert_eq!(
+            object.1,
+            repo.object_at(&local, "home/secret").unwrap().unwrap().1
+        );
     }
 }

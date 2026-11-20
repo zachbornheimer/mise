@@ -289,6 +289,10 @@ pub struct Walk {
     /// Every captured file with the entry that owns it and its policy.
     pub files: BTreeMap<PathBuf, (usize, Policy)>,
     pub omitted: Vec<PathReason>,
+    /// Paths the operating system refused to read (`EPERM` or `EACCES`).
+    /// A subset of `omitted`: retention still sees the omission, and only
+    /// this list is a partial capture rather than a failure.
+    pub permission_denied: Vec<PathReason>,
     /// Credential-named files an `include` list selected for plaintext
     /// capture, so every report can say so.
     pub plaintext: Vec<PathReason>,
@@ -1024,10 +1028,13 @@ fn walk_entry(
         Ok(meta) => meta,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
         Err(err) => {
-            walk.omitted.push(PathReason {
-                path: display,
-                reason: format!("unreadable: {err}"),
-            });
+            record_unreadable(
+                &mut walk.omitted,
+                &mut walk.permission_denied,
+                display,
+                Some(&err),
+                &err,
+            );
             return;
         }
     };
@@ -1081,10 +1088,14 @@ fn walk_entry(
                     .path()
                     .map(display_path)
                     .unwrap_or_else(|| display.clone());
-                walk.omitted.push(PathReason {
+                let io = err.io_error();
+                record_unreadable(
+                    &mut walk.omitted,
+                    &mut walk.permission_denied,
                     path,
-                    reason: format!("unreadable: {err}"),
-                });
+                    io,
+                    &err,
+                );
                 continue;
             }
         };
@@ -1194,10 +1205,14 @@ fn walk_entry(
         let meta = match candidate.metadata() {
             Ok(meta) => meta,
             Err(err) => {
-                walk.omitted.push(PathReason {
-                    path: display_path(path),
-                    reason: format!("unreadable: {err}"),
-                });
+                let io = err.io_error();
+                record_unreadable(
+                    &mut walk.omitted,
+                    &mut walk.permission_denied,
+                    display_path(path),
+                    io,
+                    &err,
+                );
                 continue;
             }
         };
@@ -1233,6 +1248,31 @@ fn walk_entry(
             }),
         }
     }
+}
+
+/// Records an unreadable path. A permission denial is also named in
+/// `denied`, once, so a report can tell it from a vanished path or a
+/// size limit. Every other error stays an omission exactly as before.
+fn record_unreadable(
+    omitted: &mut Vec<PathReason>,
+    denied: &mut Vec<PathReason>,
+    path: String,
+    io: Option<&std::io::Error>,
+    display: &dyn std::fmt::Display,
+) {
+    if let Some(io) = io
+        && super::health::is_permission_denied(io)
+        && !denied.iter().any(|found| found.path == path)
+    {
+        denied.push(PathReason {
+            path: path.clone(),
+            reason: io.to_string(),
+        });
+    }
+    omitted.push(PathReason {
+        path,
+        reason: format!("unreadable: {display}"),
+    });
 }
 
 /// Size of a capturable file, or why it is omitted.
@@ -2681,6 +2721,19 @@ pub(crate) fn mode_from(
 ) -> Option<u32> {
     let key = governing_key(roots, entries, path)?;
     Some(permissions.get(&key).copied().unwrap_or(0o755))
+}
+
+/// The mode a manifest records for a directory, `None` when it records
+/// none. Differs from `mode_from` only in the missing record: a caller that
+/// guards a live mode has to know the record is absent, not defaulted.
+pub(crate) fn recorded_mode_from(
+    roots: &super::sync::layout::Roots,
+    entries: &[TrackedEntry],
+    permissions: &BTreeMap<String, u32>,
+    path: &Path,
+) -> Option<u32> {
+    let key = governing_key(roots, entries, path)?;
+    permissions.get(&key).copied()
 }
 
 pub fn ensure_portable_ancestors(path: &Path) -> Result<()> {

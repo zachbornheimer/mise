@@ -19,7 +19,7 @@ mod tests {
             PlumbingCall::new(["fetch"]).env("GIT_AUTHOR_EMAIL", "unexpected@example.com"),
         ] {
             assert!(
-                repo.network_output(call)
+                repo.network_output(call, Some(std::time::Duration::from_secs(1)))
                     .unwrap_err()
                     .to_string()
                     .contains("network Git calls do not accept")

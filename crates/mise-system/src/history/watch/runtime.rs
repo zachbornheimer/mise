@@ -144,7 +144,11 @@ pub async fn run(opts: WatchOptions) -> Result<i32> {
     if opts.once {
         // A one-shot capture has no installed filesystem watches. Failures
         // from a previous watch installation do not describe this run.
-        capture.health.watcher.degraded.clear();
+        capture
+            .health
+            .watcher
+            .degraded
+            .retain(|line| line.starts_with(crate::history::health::PERMISSION_DEGRADED_PREFIX));
         // the restored schedule applies to this capture too: a throttled
         // file whose save is not due is held, not read live
         let outcome = capture.reconcile(&state.tracked, "startup reconcile");
@@ -790,8 +794,9 @@ fn start_sync(
 }
 
 /// Records a sync's outcome and, in `sync` mode, applies what it recorded
-/// as pending. `None` after a failure (retried after the backoff), else
-/// whether a configuration file was written.
+/// as pending. `None` after a failure (retried after the backoff). A held
+/// lock is `Some(false)`: nothing was applied, and it is not a failure.
+/// Otherwise, whether a configuration file was written.
 async fn finish_sync(
     capture: &mut Capture,
     tracked: &TrackedSet,
@@ -801,6 +806,26 @@ async fn finish_sync(
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(err) => {
+            // a held lock is the other sync doing this work, not a failure:
+            // the recorded run of failures stays as the last real sync left it
+            if let Some(held) = err.downcast_ref::<sync_run::SyncLockHeld>() {
+                if let Some(plan) = &mut capture.sync {
+                    plan.skipped(now);
+                }
+                capture.out.emit(
+                    "sync-skipped",
+                    &format!(
+                        "synchronization skipped: {}; retrying in {}",
+                        held.holder,
+                        humantime(SYNC_FOLLOW_UP)
+                    ),
+                    json!({
+                        "holder": held.holder,
+                        "retry_in_secs": SYNC_FOLLOW_UP.as_secs(),
+                    }),
+                );
+                return Some(false);
+            }
             let retry_in = capture.sync_failed(now);
             capture.out.emit(
                 "sync-error",
@@ -1028,11 +1053,22 @@ impl SyncPlan {
     }
 
     fn failed(&mut self, now: Instant) -> Duration {
-        let retry_in = self.backoff;
+        let retry_in = jittered(self.backoff);
         self.next_publish = None;
         self.next_fetch = Some(now + retry_in);
         self.backoff = (self.backoff * 2).min(SYNC_BACKOFF_MAX);
         retry_in
+    }
+
+    /// The lock was held. The failure base stays where it is. The attempt
+    /// that just ended consumed its deadline, so the next one is exactly the
+    /// follow-up from now: a deadline already due would start again at once,
+    /// and a publication saved while this sync ran keeps its deadline unless
+    /// that deadline is already past.
+    fn skipped(&mut self, now: Instant) {
+        let at = now + SYNC_FOLLOW_UP;
+        self.next_fetch = Some(at);
+        self.next_publish = self.next_publish.map(|due| due.max(at));
     }
 
     fn succeeded(&mut self, now: Instant) {
@@ -1043,8 +1079,40 @@ impl SyncPlan {
             .config
             .automatic
             .fetch
-            .then(|| now + self.config.fetch_every);
+            .then(|| now + jittered_around(self.config.fetch_every));
     }
+}
+
+/// A base this short stays exact: the one-second floor and the two-second
+/// retry that follows it.
+const EXACT_BACKOFF: Duration = Duration::from_secs(2);
+/// A fetch interval this short stays exact, so the one-second floor cannot spin.
+const EXACT_FETCH: Duration = Duration::from_secs(10);
+
+/// A delay in `[full / 2, full]`, never above the backoff cap. At or below
+/// [`EXACT_BACKOFF`] the delay stays exact.
+fn jittered(full: Duration) -> Duration {
+    let capped = full.min(SYNC_BACKOFF_MAX);
+    if capped <= EXACT_BACKOFF {
+        return capped;
+    }
+    within(capped / 2, capped)
+}
+
+/// `every`, moved by at most a tenth either way. Below [`EXACT_FETCH`] it
+/// stays exact.
+fn jittered_around(every: Duration) -> Duration {
+    if every < EXACT_FETCH {
+        return every;
+    }
+    within(every - every / 10, every + every / 10)
+}
+
+/// A duration in `[low, high]`. The factor is half-open; the clamp closes it.
+fn within(low: Duration, high: Duration) -> Duration {
+    let factor = rand::random::<f64>();
+    let span = high.saturating_sub(low);
+    low + Duration::from_secs_f64(span.as_secs_f64() * factor).min(span)
 }
 
 /// The final capture before the process ends: a full capture, not only the
@@ -1460,7 +1528,11 @@ fn install(
     capture: &mut Capture,
 ) -> Result<Vec<Anchor>> {
     let mut current: Vec<Anchor> = vec![];
-    capture.health.watcher.degraded.clear();
+    capture
+        .health
+        .watcher
+        .degraded
+        .retain(|line| line.starts_with(crate::history::health::PERMISSION_DEGRADED_PREFIX));
     for anchor in installed {
         if wanted.contains(anchor) {
             current.push(anchor.clone());
@@ -1801,6 +1873,19 @@ impl Capture {
     }
 
     fn write_health(&mut self) {
+        // The store's capture is the authority on which paths are denied:
+        // its permission subset replaces the one in memory, so a denial it
+        // recorded after this watcher loaded appears and one it cleared does
+        // not return. Every other degraded reason stays as it is in memory.
+        if let Some(stored) = health::read(self.store.state_dir()) {
+            let stored: Vec<String> = stored
+                .watcher
+                .degraded
+                .into_iter()
+                .filter(|line| health::permission_report_path(line).is_some())
+                .collect();
+            health::replace_permission_denials(&mut self.health.watcher.degraded, &stored);
+        }
         let now = Instant::now();
         self.health.throttled = self
             .schedule
@@ -1839,6 +1924,14 @@ fn rfc3339_ago(ago: Duration) -> String {
     at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+// JSON lines `Output` emitted on this thread, so a test reads the event a
+// caller of `mise dot watch --json` reads without sharing process stdout.
+#[cfg(test)]
+thread_local! {
+    static JSON_LINES: std::cell::RefCell<Vec<serde_json::Value>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
 #[derive(Clone, Copy)]
 struct Output {
     json: bool,
@@ -1853,6 +1946,8 @@ impl Output {
                 object.insert("at".into(), json!(store::now_rfc3339()));
             }
             use std::io::Write;
+            #[cfg(test)]
+            JSON_LINES.with(|lines| lines.borrow_mut().push(fields.clone()));
             let mut stdout = std::io::stdout().lock();
             let _ = writeln!(stdout, "{fields}");
             let _ = stdout.flush();
@@ -2308,7 +2403,12 @@ mod sync_plan_tests {
         let start = Instant::now();
         let mut plan = SyncPlan::new(config(SyncMode::Sync, 300, 900), start);
         plan.succeeded(start);
-        assert_eq!(plan.next_fetch, Some(start + secs(900)));
+        let due = plan.next_fetch.expect("a successful sync arms a fetch");
+        let wait = due.saturating_duration_since(start);
+        assert!(
+            wait >= secs(810) && wait <= secs(990),
+            "fetch wait {wait:?} outside \u{00b1}10% of 900s"
+        );
         plan.reconfigure(config(SyncMode::Sync, 300, 2), start + secs(5));
         assert_eq!(plan.next_fetch, Some(start + secs(7)));
         plan.reconfigure(config(SyncMode::Sync, 300, 900), start + secs(6));
@@ -2357,5 +2457,435 @@ mod sync_plan_tests {
         assert_eq!(plan.backoff, plan.backoff_floor());
         assert_eq!(plan.next_publish, None);
         assert_eq!(plan.next_fetch, Some(start + secs(100) + SYNC_FIRST_FETCH));
+    }
+}
+
+/// The JSON events `Output` wrote on this thread since the last read.
+#[cfg(test)]
+fn take_json_events() -> Vec<serde_json::Value> {
+    JSON_LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
+}
+
+/// Watcher pacing under contention and failure. These tests name the contract
+/// the production path must meet; they fail against a watcher that treats a
+/// held sync lock as a failure or retries on an exact shared delay.
+#[cfg(test)]
+mod sync_pacing {
+    use super::*;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn config(fetch_every: u64) -> SyncConfig {
+        SyncConfig {
+            automatic: SyncMode::Sync.automatic(),
+            publish_after: secs(300),
+            fetch_every: secs(fetch_every),
+            origin: ("file:///setup.git".to_string(), "main".to_string()),
+        }
+    }
+
+    fn plan_at(fetch_every: u64, now: Instant) -> SyncPlan {
+        SyncPlan::new(config(fetch_every), now)
+    }
+
+    fn plan(fetch_every: u64) -> SyncPlan {
+        plan_at(fetch_every, Instant::now())
+    }
+
+    /// Half of `full` through `full`, never above the backoff cap.
+    fn within_jitter(sampled: Duration, full: Duration) {
+        let capped = full.min(SYNC_BACKOFF_MAX);
+        let low = capped / 2;
+        assert!(
+            sampled >= low && sampled <= capped,
+            "sampled {sampled:?} outside [{low:?}, {capped:?}]"
+        );
+    }
+
+    fn event_named<'a>(
+        events: &'a [serde_json::Value],
+        name: &str,
+    ) -> Option<&'a serde_json::Value> {
+        events
+            .iter()
+            .find(|event| event.get("event").and_then(|value| value.as_str()) == Some(name))
+    }
+
+    fn message_of(event: &serde_json::Value) -> &str {
+        event
+            .get("message")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_failure_delay_is_jittered_inside_half_of_its_exponential_value() {
+        let now = Instant::now();
+        let mut plan = plan(900);
+        let mut full = plan.backoff;
+        for step in 0..8 {
+            let before = plan.backoff;
+            let sampled = plan.failed(now + secs(step));
+            within_jitter(sampled, full);
+            // the sample is drawn from the base; it does not become the base
+            assert_eq!(plan.backoff, (before * 2).min(SYNC_BACKOFF_MAX));
+            assert_eq!(plan.next_fetch, Some(now + secs(step) + sampled));
+            full = plan.backoff;
+        }
+        let capped = plan.failed(now + secs(8));
+        within_jitter(capped, SYNC_BACKOFF_MAX);
+        assert_eq!(plan.backoff, SYNC_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn the_same_failure_base_does_not_always_sample_the_same_delay() {
+        let now = Instant::now();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..24 {
+            let mut plan = plan(900);
+            seen.insert(plan.failed(now));
+        }
+        assert!(
+            seen.len() > 1,
+            "twenty-four samples of a 60s base were identical: {seen:?}"
+        );
+        for sampled in &seen {
+            within_jitter(*sampled, SYNC_BACKOFF_MIN);
+        }
+    }
+
+    #[test]
+    fn a_periodic_fetch_deadline_stays_within_ten_percent_of_fetch_every() {
+        let every = secs(900);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..24 {
+            let now = Instant::now();
+            let mut plan = plan(900);
+            plan.succeeded(now);
+            let due = plan.next_fetch.expect("a successful sync arms a fetch");
+            let wait = due.saturating_duration_since(now);
+            assert!(
+                wait >= every * 9 / 10 && wait <= every * 11 / 10,
+                "fetch wait {wait:?} outside \u{00b1}10% of {every:?}"
+            );
+            seen.insert(wait);
+        }
+        assert!(
+            seen.len() > 1,
+            "twenty-four fetch deadlines were identical: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn zero_fetch_interval_stays_exact_when_jitter_has_no_room() {
+        let now = Instant::now();
+        let mut plan = plan_at(0, now);
+        assert_eq!(plan.next_fetch, Some(now + secs(1)));
+        assert_eq!(plan.failed(now), secs(1));
+        assert_eq!(plan.backoff, secs(2));
+        assert_eq!(plan.failed(now + secs(1)), secs(2));
+        assert_eq!(plan.backoff, secs(4));
+        plan.reconfigure(config(0), now);
+        plan.succeeded(now);
+        assert_eq!(plan.next_fetch, Some(now + secs(1)));
+        assert_eq!(plan.backoff, secs(1));
+    }
+
+    #[test]
+    fn a_fractional_backoff_stays_inside_half_of_itself() {
+        let full = Duration::from_millis(3000);
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let sampled = jittered(full);
+            assert!(
+                sampled >= full / 2 && sampled <= full,
+                "sampled {sampled:?} outside [{:?}, {full:?}]",
+                full / 2
+            );
+            seen.insert(sampled);
+        }
+        assert!(seen.len() > 1, "sixty-four samples of 3s were identical");
+    }
+
+    #[test]
+    fn a_fractional_fetch_interval_stays_within_ten_percent() {
+        let every = Duration::from_millis(10_990);
+        let low = every - every / 10;
+        let high = every + every / 10;
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..64 {
+            let sampled = jittered_around(every);
+            assert!(
+                sampled >= low && sampled <= high,
+                "sampled {sampled:?} outside [{low:?}, {high:?}]"
+            );
+            seen.insert(sampled);
+        }
+        assert!(
+            seen.len() > 1,
+            "sixty-four samples of 10.99s were identical"
+        );
+    }
+
+    #[test]
+    fn a_skip_retries_in_exactly_five_seconds_and_keeps_a_later_publication() {
+        let now = Instant::now();
+        let mut plan = plan_at(900, now);
+        let base = plan.backoff;
+        // the first fetch is fifteen seconds out, and this attempt has not
+        // consumed it: a skip must not keep that later deadline
+        plan.skipped(now);
+        assert_eq!(plan.next_fetch, Some(now + SYNC_FOLLOW_UP));
+        assert_eq!(plan.next_publish, None);
+        assert_eq!(plan.backoff, base);
+
+        // a save made while the sync ran, still in the future, keeps its deadline
+        let mut plan = plan_at(900, now);
+        plan.saved(now);
+        plan.skipped(now + secs(1));
+        assert_eq!(plan.next_fetch, Some(now + secs(1) + SYNC_FOLLOW_UP));
+        assert_eq!(plan.next_publish, Some(now + secs(300)));
+
+        // a publication already due must not start again the moment the skip ends
+        let mut plan = plan_at(900, now);
+        plan.next_publish = Some(now);
+        plan.skipped(now + secs(1));
+        assert_eq!(plan.next_publish, Some(now + secs(1) + SYNC_FOLLOW_UP));
+        assert_eq!(plan.next_fetch, Some(now + secs(1) + SYNC_FOLLOW_UP));
+    }
+
+    #[test]
+    fn reconfiguration_still_keeps_a_deadline_that_nothing_changed() {
+        let start = Instant::now();
+        let mut plan = plan(900);
+        plan.saved(start);
+        let retry = plan.failed(start + secs(1));
+        let (publish, fetch, base) = (plan.next_publish, plan.next_fetch, plan.backoff);
+        assert_eq!(fetch, Some(start + secs(1) + retry));
+        plan.reconfigure(config(900), start + secs(5));
+        assert_eq!(plan.next_publish, publish);
+        assert_eq!(plan.next_fetch, fetch);
+        assert_eq!(plan.backoff, base);
+    }
+
+    struct Fixture {
+        capture: Capture,
+        _dir: tempfile::TempDir,
+    }
+
+    fn capture(fetch_every: u64) -> Fixture {
+        let _ = take_json_events();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_in(dir.path()).unwrap();
+        let mut capture = Capture::new(
+            store,
+            Output { json: true },
+            Limits {
+                base: Duration::from_secs(2),
+                max: Duration::from_secs(86400),
+            },
+        );
+        capture.sync = Some(plan(fetch_every));
+        Fixture { capture, _dir: dir }
+    }
+
+    fn health_of(state_dir: &std::path::Path) -> crate::history::sync::run::SyncStatus {
+        sync_run::read_status(state_dir).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_held_sync_lock_is_skipped_without_touching_failure_health() {
+        let mut fixture = capture(900);
+        let capture = &mut fixture.capture;
+        let state_dir = capture.store.state_dir().to_path_buf();
+        let held = sync_run::lock_in(&state_dir).unwrap();
+        sync_run::write_status(
+            &state_dir,
+            &crate::history::sync::run::SyncStatus {
+                consecutive_failures: 2,
+                failing_since: Some("2026-11-17T00:00:00Z".to_string()),
+                last_error: Some("origin refused the push".to_string()),
+                backoff_until: Some("2026-11-17T00:01:00Z".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let before = health_of(&state_dir);
+        let base = capture.sync.as_ref().unwrap().backoff;
+        let started = Instant::now();
+
+        let applied = finish_sync(
+            capture,
+            &TrackedSet::default(),
+            Err(sync_run::contended(&state_dir, None)),
+        )
+        .await;
+
+        assert_eq!(
+            applied,
+            Some(false),
+            "a held lock applies nothing and is not a failed sync"
+        );
+        let after = health_of(&state_dir);
+        assert_eq!(after.consecutive_failures, before.consecutive_failures);
+        assert_eq!(after.failing_since, before.failing_since);
+        assert_eq!(after.last_error, before.last_error);
+        assert_eq!(
+            after.backoff_until, before.backoff_until,
+            "a skip must not record a new backoff"
+        );
+        assert_eq!(capture.sync.as_ref().unwrap().backoff, base);
+        let finished = Instant::now();
+        let due = capture.sync.as_ref().unwrap().next_fetch.unwrap();
+        let earliest = started + SYNC_FOLLOW_UP;
+        let latest = finished + SYNC_FOLLOW_UP;
+        assert!(
+            due >= earliest && due <= latest,
+            "retry {due:?} outside [{earliest:?}, {latest:?}]"
+        );
+        let events = take_json_events();
+        let skipped =
+            event_named(&events, "sync-skipped").expect("a contended sync emits sync-skipped");
+        let holder = sync_run::contended(&state_dir, None).to_string();
+        let pid = holder
+            .split("pid ")
+            .nth(1)
+            .and_then(|rest| rest.split([',', ' ', ';']).next())
+            .expect("the refusal names a pid");
+        assert!(
+            message_of(skipped).contains(pid),
+            "the skip names the holder {pid}, got {skipped}"
+        );
+        assert!(
+            event_named(&events, "sync-error").is_none(),
+            "a held lock is not a sync-error: {events:?}"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_sync_error_still_counts_as_a_failure() {
+        let mut fixture = capture(900);
+        let capture = &mut fixture.capture;
+        let state_dir = capture.store.state_dir().to_path_buf();
+        let seeded = crate::history::sync::run::SyncStatus {
+            consecutive_failures: 2,
+            failing_since: Some("2026-11-17T00:00:00Z".to_string()),
+            last_error: Some("origin refused the push".to_string()),
+            backoff_until: Some("2026-11-17T00:01:00Z".to_string()),
+            ..Default::default()
+        };
+        sync_run::write_status(&state_dir, &seeded).unwrap();
+        let before = Instant::now();
+
+        let applied = finish_sync(
+            capture,
+            &TrackedSet::default(),
+            Err(eyre::eyre!("origin refused the push")),
+        )
+        .await;
+
+        assert_eq!(applied, None);
+        // sync_locked records the failure; finish_sync only arms the retry
+        // and must not invent a second counter
+        let health = health_of(&state_dir);
+        assert_eq!(health.consecutive_failures, seeded.consecutive_failures);
+        assert_eq!(health.failing_since, seeded.failing_since);
+        assert_eq!(health.last_error, seeded.last_error);
+        assert_ne!(
+            health.backoff_until, seeded.backoff_until,
+            "an ordinary failure records when the retry is due"
+        );
+        let due = capture.sync.as_ref().unwrap().next_fetch.unwrap();
+        let after = Instant::now();
+        assert!(
+            due >= before + SYNC_BACKOFF_MIN / 2 && due <= after + SYNC_BACKOFF_MIN,
+            "retry {due:?} outside [{:?}, {:?}]",
+            before + SYNC_BACKOFF_MIN / 2,
+            after + SYNC_BACKOFF_MIN
+        );
+        assert_eq!(capture.sync.as_ref().unwrap().backoff, secs(120));
+        let events = take_json_events();
+        let error =
+            event_named(&events, "sync-error").expect("an ordinary failure emits sync-error");
+        assert!(
+            message_of(error).contains("origin refused the push"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn write_health_takes_the_stores_denials_and_keeps_in_memory_watch_failures() {
+        let mut fixture = capture(900);
+        let capture = &mut fixture.capture;
+        let state_dir = capture.store.state_dir().to_path_buf();
+        let watch_failure = "cannot watch ~/other: limit reached".to_string();
+        let denial =
+            crate::history::health::permission_report("~/notes.toml", "Operation not permitted");
+        capture.health.watcher.degraded = vec![watch_failure.clone()];
+
+        // a capture recorded a denial after this watcher loaded its health
+        let mut stored = crate::history::health::Health::default();
+        stored.watcher.degraded = vec![denial.clone()];
+        crate::history::health::write(&state_dir, &mut stored).unwrap();
+        capture.write_health();
+        let written = crate::history::health::read(&state_dir).unwrap();
+        assert!(
+            written.watcher.degraded.contains(&denial),
+            "a denial recorded after the load was dropped: {written:?}"
+        );
+        assert!(
+            written.watcher.degraded.contains(&watch_failure),
+            "an in-memory watch failure was replaced: {written:?}"
+        );
+
+        // a later capture cleared it: the stale in-memory copy must not return
+        let mut cleared = crate::history::health::Health::default();
+        cleared.watcher.degraded = vec![];
+        crate::history::health::write(&state_dir, &mut cleared).unwrap();
+        capture.write_health();
+        let after = crate::history::health::read(&state_dir).unwrap();
+        assert!(
+            after
+                .watcher
+                .degraded
+                .iter()
+                .all(|line| crate::history::health::permission_report_path(line).is_none()),
+            "a cleared denial returned from memory: {after:?}"
+        );
+        assert!(
+            after.watcher.degraded.contains(&watch_failure),
+            "an in-memory watch failure was lost: {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_refused_wait_keeps_its_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let text = sync_run::contended(temp.path(), Some(Duration::from_secs(30))).to_string();
+        assert!(
+            text.contains("waited 30s and gave up"),
+            "the waited refusal changed: {text}"
+        );
+        assert!(
+            !text.contains("pass `--wait <duration>`"),
+            "a waited refusal must not offer the immediate command: {text}"
+        );
+    }
+
+    #[test]
+    fn the_immediate_refusal_text_is_unchanged() {
+        let temp = tempfile::tempdir().unwrap();
+        let text = sync_run::contended(temp.path(), None).to_string();
+        assert!(
+            text.starts_with("another setup sync or pull is running: "),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("; pass `--wait <duration>` to queue behind it, or stop the holder"),
+            "{text}"
+        );
     }
 }

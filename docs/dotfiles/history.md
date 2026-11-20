@@ -139,6 +139,8 @@ latest checkpoint, which `mise dot save` would record:
 
 Finding them reads every tracked file, like `mise dot history diff`.
 
+A tracked path the operating system refuses to read (`EPERM` or `EACCES`, on the file or on a directory during the walk or the content read) does not stop the other files from being saved. The refused path keeps the version from the previous checkpoint, and a path that was never saved is left out rather than stored empty. `mise dot status`, including `--json`, names that path with the operating-system error under the watcher's degraded report, and on macOS says to grant this mise binary access to the folder in Privacy & Security. The report clears once a capture can read the path, and it leaves any other degraded reason in place. Any other read error is unchanged: a plain file is left out of that snapshot, and an encrypted file still stops the save.
+
 Both commands also report a watcher service that runs an outdated mise, or
 that watches another store because it uses a different `MISE_STATE_DIR`. Run
 `mise bootstrap services apply` to restart it.

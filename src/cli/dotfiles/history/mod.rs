@@ -3,7 +3,7 @@
 
 use eyre::Result;
 
-pub(crate) use crate::system::history::{open, resolve, short};
+pub(crate) use crate::system::history::{open, open_store, resolve, short};
 
 mod describe;
 mod diff;
