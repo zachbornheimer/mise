@@ -2036,6 +2036,8 @@ fn unsaved_paths(
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+    use crate::history::shadow::HistoryRepo;
+    use crate::history::tracked::TrackedEntry;
 
     #[test]
     fn publication_checks_live_variant_encryption_even_without_a_new_capture() -> Result<()> {
@@ -2063,6 +2065,195 @@ mod capture_tests {
         };
         assert!(audit_publication(repo, &head, &tracked).is_err());
         Ok(())
+    }
+
+    struct Replay {
+        _temp: tempfile::TempDir,
+        repo: HistoryRepo,
+        regions: String,
+        other: String,
+        tree: String,
+        held: Vec<String>,
+    }
+
+    /// Two commits from one base, then the repository merge the sync adopts.
+    fn replay(base: &str, local: &str, remote: &str, other_remote: &str) -> Replay {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(temp.path()).unwrap().unwrap();
+        let roots = Roots::current();
+        let regions = roots
+            .branch_path(&roots.home.join(".agents/sync-probe/4b-regions.txt"), None)
+            .unwrap();
+        let other = roots
+            .branch_path(&roots.home.join(".agents/sync-probe/other.txt"), None)
+            .unwrap();
+        let tree_of = |regions_text: &str, other_text: &str| {
+            repo.write_tree(&[
+                (
+                    "100644".into(),
+                    repo.hash_blob(regions_text.as_bytes()).unwrap(),
+                    regions.clone(),
+                ),
+                (
+                    "100644".into(),
+                    repo.hash_blob(other_text.as_bytes()).unwrap(),
+                    other.clone(),
+                ),
+            ])
+            .unwrap()
+        };
+        let base_commit = repo
+            .commit_tree(&tree_of(base, "shared\n"), vec![], "base")
+            .unwrap();
+        let local_commit = repo
+            .commit_tree(&tree_of(local, "shared\n"), vec![&base_commit], "local")
+            .unwrap();
+        let remote_commit = repo
+            .commit_tree(&tree_of(remote, other_remote), vec![&base_commit], "remote")
+            .unwrap();
+        repo.update_ref(HistoryRepo::HISTORY_REF, &local_commit, None)
+            .unwrap();
+        repo.update_ref(UPSTREAM_REF, &remote_commit, None).unwrap();
+        let tracked = TrackedSet {
+            entries: vec![TrackedEntry::new(
+                roots.home.join(".agents/sync-probe"),
+                "track",
+                crate::files::FilePolicy::for_mode(crate::files::FileMode::Track),
+            )],
+            ..Default::default()
+        };
+        let heads = crate::history::sync::graph::Heads::read(&repo).unwrap();
+        let (git_tree, conflicts) = repo
+            .merge_tree(
+                heads.local.as_deref().unwrap(),
+                heads.remote.as_deref().unwrap(),
+            )
+            .unwrap();
+        let (settled, held) = settle_conflicts(
+            &repo,
+            heads.base.as_deref(),
+            heads.local.as_deref().unwrap(),
+            heads.remote.as_deref().unwrap(),
+            &git_tree,
+            conflicts,
+        )
+        .unwrap();
+        let tree = incoming_repository_tree(&repo, &tracked)
+            .expect("a plaintext replay must not pause the repository")
+            .unwrap_or(settled);
+        Replay {
+            _temp: temp,
+            repo,
+            regions,
+            other,
+            tree,
+            held,
+        }
+    }
+
+    impl Replay {
+        fn text(&self, path: &str) -> String {
+            let object = self.repo.object_at(&self.tree, path).unwrap().unwrap();
+            String::from_utf8(self.repo.cat_object(&object.1).unwrap()).unwrap()
+        }
+    }
+
+    /// Two machines edit different regions of one plaintext file from a known
+    /// base. Both edits land, and the other path keeps syncing.
+    #[test]
+    fn non_overlapping_edits_to_one_plaintext_file_merge() {
+        let base = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n";
+        let seen = replay(
+            base,
+            "MAC-LINE\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n",
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nVPS-LINE\n",
+            "remote-only\n",
+        );
+        assert_eq!(
+            seen.text(&seen.regions),
+            "MAC-LINE\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nVPS-LINE\n"
+        );
+        assert_eq!(seen.text(&seen.other), "remote-only\n");
+        assert!(!seen.text(&seen.regions).contains("<<<<<<<"));
+    }
+    /// The same edit on both machines converges without a conflict.
+    #[test]
+    fn identical_edits_to_one_plaintext_file_converge() {
+        let same = "SAME\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n";
+        let seen = replay(
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n",
+            same,
+            same,
+            "shared\n",
+        );
+        assert_eq!(seen.text(&seen.regions), same);
+        assert!(!seen.held.iter().any(|path| path == &seen.regions));
+    }
+
+    /// An edit of the same line stays a conflict, and only that path is held.
+    #[test]
+    fn same_line_edits_conflict_only_that_path() {
+        let seen = replay(
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n",
+            "MAC-VERSION\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n",
+            "VPS-VERSION\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n",
+            "remote-only\n",
+        );
+        assert_eq!(seen.held, vec![seen.regions.clone()]);
+        assert_eq!(seen.text(&seen.other), "remote-only\n");
+        assert!(!seen.text(&seen.regions).contains("<<<<<<<"));
+    }
+    /// An encrypted path is not text-merged, even when its plaintext edits
+    /// would not overlap.
+    #[test]
+    fn an_encrypted_path_is_not_text_merged() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(temp.path()).unwrap().unwrap();
+        let roots = Roots::current();
+        let path = roots
+            .branch_path(&roots.home.join(".agents/sync-probe/secret.txt"), None)
+            .unwrap();
+        let key = age::x25519::Identity::generate();
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        let seal = |text: &str| {
+            crate::history::sync::files::encode(
+                &path,
+                "100644",
+                text.as_bytes(),
+                "test",
+                &recipients,
+            )
+            .unwrap()
+        };
+        let tree_of = |text: &str| {
+            repo.write_tree(&[(
+                "100644".into(),
+                repo.hash_blob(&seal(text)).unwrap(),
+                path.clone(),
+            )])
+            .unwrap()
+        };
+        let base = repo
+            .commit_tree(&tree_of("base\n"), vec![], "base")
+            .unwrap();
+        let local = repo
+            .commit_tree(&tree_of("local line\n"), vec![&base], "local")
+            .unwrap();
+        let remote = repo
+            .commit_tree(&tree_of("remote line\n"), vec![&base], "remote")
+            .unwrap();
+        repo.update_ref(HistoryRepo::HISTORY_REF, &local, None)
+            .unwrap();
+        repo.update_ref(UPSTREAM_REF, &remote, None).unwrap();
+        let (merged, conflicts) = repo.merge_tree(&local, &remote).unwrap();
+        assert!(
+            conflicts.iter().any(|conflict| conflict == &path),
+            "{conflicts:?}"
+        );
+        let object = repo.object_at(&merged, &path).unwrap().unwrap();
+        let bytes = repo.cat_object(&object.1).unwrap();
+        assert!(!bytes.windows(7).any(|window| window == b"<<<<<<<"));
+        assert_eq!(object.1, repo.object_at(&local, &path).unwrap().unwrap().1);
     }
 
     /// The decision a sync makes before it publishes: has a checkpoint been
