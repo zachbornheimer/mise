@@ -1839,6 +1839,9 @@ pub(super) fn settle_conflicts(
 ) -> Result<(String, Vec<String>)> {
     let mut overlays = vec![];
     let mut settled = std::collections::BTreeSet::new();
+    // The manifest that lists an encrypted path's recipients lives in the local
+    // tree, and a re-seal reads them from there.
+    let local_tree = repo.output_tree_of(local)?;
     for path in &conflicts {
         if path == crate::history::manifest::PATH {
             continue;
@@ -1925,8 +1928,8 @@ pub(super) fn settle_conflicts(
                         continue;
                     }
                     let object = if local_encrypted {
-                        let tree = repo.output_tree_of(local)?;
-                        let recipients = super::files::recipients_of(repo, &tree, path, &saved)?;
+                        let recipients =
+                            super::files::recipients_of(repo, &local_tree, path, &saved)?;
                         let scheme = super::files::scheme_of(repo, &saved)?;
                         super::files::seal(repo, path, &mode, &text, &scheme, &recipients)?
                     } else {
@@ -1947,40 +1950,25 @@ pub(super) fn settle_conflicts(
         }
         // A symlink, a binary file, and a mode change are not text to merge.
         // A regular file whose sides changed different lines is merged here
-        // exactly as Git used to, before -merge kept one side instead.
-        // An envelope is valid UTF-8, so the text check below would merge it.
-        // It is never text: its comparison happened above, after decryption.
-        let encrypted = repo.blob_starts_with(&saved.1, super::files::MAGIC)?
-            || repo.blob_starts_with(&theirs.1, super::files::MAGIC)?;
-        let merged_text = if !encrypted
-            && saved.0 == theirs.0
-            && saved.0 != "120000"
-            && let Some(base) = base
-            && let Some(base) = repo.object_at(base, path)?
-            && base.0 == saved.0
-            && !repo.blob_starts_with(&base.1, super::files::MAGIC)?
+        // exactly as Git used to, before -merge kept one side instead. An
+        // envelope is decrypted first and sealed again: this is the merge for
+        // every text path, and a structured path has already merged by key.
+        if let Some(base) = base
+            && let Some(base_object) = repo.object_at(base, path)?
+            && let Some(object) = super::files::merge_lines(
+                repo,
+                path,
+                &base_object,
+                &saved,
+                &theirs,
+                false,
+                &local_tree,
+            )?
         {
-            let (base_bytes, saved_bytes, remote_bytes) = (
-                repo.cat_object(&base.1)?,
-                repo.cat_object(&saved.1)?,
-                repo.cat_object(&theirs.1)?,
-            );
-            if super::files::utf8_text(&base_bytes)
-                && super::files::utf8_text(&saved_bytes)
-                && super::files::utf8_text(&remote_bytes)
-            {
-                repo.merge3(&base_bytes, &saved_bytes, &remote_bytes)?
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some(text) = merged_text {
             settled.insert(path.clone());
             overlays.push(crate::history::shadow::Overlay {
                 path: path.clone(),
-                object: Some((saved.0.clone(), repo.store_blob(&text)?)),
+                object: Some(object),
             });
         }
     }
