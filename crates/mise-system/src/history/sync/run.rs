@@ -17,6 +17,7 @@ use super::format::{self, RepoState};
 use super::layout::{Located, Roots, is_configuration};
 use super::network::{PushOutcome, Remote, UPSTREAM_REF};
 use super::reconcile::{self, Conflict, Object, PathPlan};
+use super::publish_skip_reason::PublishSkip;
 use super::{publish, share, state};
 use crate::history::checkpoint::Store;
 use crate::history::config::OriginTomlConfig;
@@ -110,6 +111,11 @@ pub struct SyncStatus {
     pub validation_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_publish: Option<String>,
+    /// Why the latest sync did not publish, when something blocked it. A
+    /// skip is not an error: `last_error` stays empty. Absent when the
+    /// sync published or had nothing to publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_skipped: Option<PublishSkip>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fetch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -224,6 +230,8 @@ mod status_read_tests {
 #[derive(Debug, Default)]
 pub struct SyncOutcome {
     pub published: Option<String>,
+    /// What blocked publication before anything was built.
+    pub publish_skipped: Option<PublishSkip>,
     /// Incoming changes waiting for `mise dot pull`, counting the
     /// repository's own changes as one.
     pub pending: usize,
@@ -612,16 +620,18 @@ fn sync_locked_waiting(
             if observed != sync_state {
                 state::save(repo, &observed, "observed identical versions")?;
             }
-            if !publish
-                || status.pending_repository
-                || status.application_failure.is_some()
-                || status.validation_error.is_some()
-                // Publication must wait for the entire incoming setup, not
-                // just configuration or encrypted paths. A merge cannot be
-                // acknowledged while its live application is still pending.
-                || plans.iter().any(|plan| plan.apply.is_some())
-                || plans.iter().any(|plan| plan.conflict.is_some())
-            {
+            let gate = if request.offline {
+                Some(PublishSkip::Offline)
+            } else if !publish {
+                Some(PublishSkip::FetchOnly)
+            } else {
+                None
+            };
+            // Publication must wait for the entire incoming setup, not
+            // just configuration or encrypted paths. A merge cannot be
+            // acknowledged while its live application is still pending.
+            if let Some(skip) = PublishSkip::detect(gate, &status, &plans) {
+                outcome.publish_skipped = Some(skip);
                 break;
             }
             let accepted = plans
@@ -695,6 +705,7 @@ fn sync_locked_waiting(
             }
         }
         status.upstream_commit = upstream_commit.clone();
+        status.publish_skipped = outcome.publish_skipped.clone();
         record_pending(&mut status, &plans, &Roots::current(), &shared.objects());
         outcome.pending =
             status.pending_applications.len() + usize::from(status.pending_repository);
@@ -1086,6 +1097,19 @@ pub fn refresh_with_interaction(
     )?;
     status.upstream_commit = upstream.commit;
     record_pending(status, &plans, &Roots::current(), &shared.objects());
+    // a refresh that finds nothing left to wait for clears a reason recorded
+    // by an earlier sync; the next sync records a new one if it is blocked
+    if let Some(skip) = &status.publish_skipped {
+        let still_blocked = match skip {
+            PublishSkip::PendingApplications { .. } => !status.pending_applications.is_empty(),
+            PublishSkip::PendingRepository => status.pending_repository,
+            PublishSkip::Conflicts { .. } => !status.conflicts.is_empty(),
+            _ => true,
+        };
+        if !still_blocked {
+            status.publish_skipped = None;
+        }
+    }
     Ok(())
 }
 
