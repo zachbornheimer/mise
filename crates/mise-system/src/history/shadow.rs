@@ -2588,6 +2588,7 @@ impl HistoryRepo {
         let output = self.git.output_unchecked(PlumbingCall::new([
             "merge-file",
             "-p",
+            "--diff3",
             "-L",
             "local",
             "-L",
@@ -2601,12 +2602,41 @@ impl HistoryRepo {
         // exit status is the number of conflicts; negative on error
         match output.status.code() {
             Some(0) => Ok(Some(output.stdout)),
-            Some(code) if code > 0 => Ok(None),
+            Some(code) if code > 0 => Ok(Self::keep_disjoint_additions(&output.stdout)),
             _ => bail!(
                 "git merge-file failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ),
         }
+    }
+
+    /// Two machines appended different lines at the same spot. `git merge-file`
+    /// reports a conflict whose base side is empty, which is not a clash: neither
+    /// side deleted or changed anything the other kept. Both additions stand, in
+    /// local-then-remote order. A conflict whose base side holds text is a real
+    /// clash and stays one.
+    fn keep_disjoint_additions(merged: &[u8]) -> Option<Vec<u8>> {
+        let text = std::str::from_utf8(merged).ok()?;
+        if !text.contains("<<<<<<< local\n") {
+            return None;
+        }
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(start) = rest.find("<<<<<<< local\n") {
+            out.push_str(&rest[..start]);
+            let body = &rest[start + "<<<<<<< local\n".len()..];
+            let (local, after_local) = body.split_once("||||||| base\n")?;
+            let (base, after_base) = after_local.split_once("=======\n")?;
+            let (remote, after) = after_base.split_once(">>>>>>> remote\n")?;
+            if !base.is_empty() {
+                return None;
+            }
+            out.push_str(local);
+            out.push_str(remote);
+            rest = after;
+        }
+        out.push_str(rest);
+        Some(out.into_bytes())
     }
 
     /// Runs a network command with the user's git configuration, bounded
