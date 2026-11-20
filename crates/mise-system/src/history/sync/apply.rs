@@ -1214,6 +1214,13 @@ pub(crate) async fn apply_locked_with_scope(
     }
     if !status.conflicts.is_empty() {
         return pull.pause_for_conflicts(&status, &decisions);
+    // the recorded choices were not in the plan the preflight read, so the
+    // complete tree is planned again before anything is written
+    if let run::RepositoryTree::Clean(tree) =
+        run::repository_tree_plan(repo, tracked, &status.resolutions)?
+    {
+        inventory_tree = tree;
+    }
     }
 
     if let Some(tree) = &inventory_tree {

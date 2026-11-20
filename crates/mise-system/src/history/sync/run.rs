@@ -1283,6 +1283,10 @@ pub(super) fn repository_tree_plan(
     }
     Ok(RepositoryTree::Clean(Some(tree)))
 }
+
+/// A bootstrap finished: the declarations that arrived through sync are
+/// applied now, so `status` stops asking for one.
+}
 pub fn bootstrap_completed() {
     let state_dir: &Path = &super::super::local::root();
     let status = match read_status(state_dir) {
@@ -1483,6 +1487,56 @@ mod capture_tests {
 }
 
 #[cfg(test)]
+#[cfg(test)]
+mod repository_conflict_tests {
+    use super::*;
+
+    fn paths(status: &SyncStatus) -> Vec<&str> {
+        status
+            .conflicts
+            .iter()
+            .filter(|conflict| matches!(conflict.kind, reconcile::ConflictKind::Repository))
+            .map(|conflict| conflict.branch_path.as_str())
+            .collect()
+    }
+
+    /// The pause names paths, so a resolver that names a path has to find one:
+    /// one opaque entry is what left every recovery verb unable to address
+    /// what the refusal listed.
+    #[test]
+    fn an_unresolved_tree_conflict_is_one_conflict_per_path() {
+        let mut status = SyncStatus {
+            conflicts: vec![Conflict {
+                branch_path: crate::history::manifest::PATH.into(),
+                kind: reconcile::ConflictKind::Repository,
+                local: None,
+                remote: None,
+                base: None,
+            }],
+            ..Default::default()
+        };
+        record_repository_conflicts(
+            &mut status,
+            &["tracked/home/.a".to_string(), "tracked/home/.b".to_string()],
+        );
+        assert_eq!(paths(&status), ["tracked/home/.a", "tracked/home/.b"]);
+        assert!(status.pending_repository);
+        let error = status.validation_error.as_deref().unwrap();
+        assert!(error.contains("tracked/home/.a") && error.contains("tracked/home/.b"));
+    }
+
+    /// A refresh records the same conflict again; the list must not grow.
+    #[test]
+    fn recording_the_same_conflicts_twice_leaves_one_of_each() {
+        let mut status = SyncStatus::default();
+        let conflicts = ["tracked/home/.a".to_string()];
+        record_repository_conflicts(&mut status, &conflicts);
+        record_repository_conflicts(&mut status, &conflicts);
+        assert_eq!(paths(&status), ["tracked/home/.a"]);
+        assert_eq!(status.conflicts.len(), 1);
+    }
+}
+
 mod notification_tests {
     use super::*;
 
