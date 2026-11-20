@@ -1173,8 +1173,15 @@ pub(crate) async fn apply_locked_with_scope(
     let tracked = &incoming;
     // Metadata changes must advance the same complete Git tree after live
     // application. They cannot be reduced to this machine's selected paths.
-    let mut inventory_tree = run::incoming_repository_tree(repo, tracked)?;
     let mut status = run::read_status(state_dir)?;
+    // **A pull is how a paused setup is cleared.** Its own preflight reports an
+    // unresolved complete-tree conflict as a conflict below, instead of
+    // refusing here, so a resolution named on the command line still reaches
+    // the recording step and can clear its path.
+    let mut inventory_tree = match run::repository_tree_plan(repo, tracked, &status.resolutions)? {
+        run::RepositoryTree::Clean(tree) => tree,
+        run::RepositoryTree::Conflicted(_) => None,
+    };
     if req.automatic && status.application_failure.is_some() {
         return Ok(ApplyOutcome {
             held: status.pending_applications.len().max(1),

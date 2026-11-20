@@ -704,6 +704,7 @@ pub fn refresh_with_interaction(
         repo.ref_oid(UPSTREAM_REF)?.as_deref(),
         interactive,
     )?;
+    let mut repository_conflicts = vec![];
     let plans = prepare(
         repo,
         store.state_dir(),
@@ -712,11 +713,15 @@ pub fn refresh_with_interaction(
         &upstream,
         &unsaved_paths(repo, tracked, &shared)?,
         status,
+        &mut repository_conflicts,
     )?;
     status.upstream_commit = upstream.commit;
     record_pending(status, &plans, &Roots::current(), &shared.objects());
-    // a refresh that finds nothing left to wait for clears a reason recorded
-    // by an earlier sync; the next sync records a new one if it is blocked
+    // recorded after the plans rebuild the list, so an unresolved complete-tree
+    // conflict survives this refresh as a conflict per path
+    if !repository_conflicts.is_empty() {
+        record_repository_conflicts(status, &repository_conflicts);
+    }
     if let Some(skip) = &status.publish_skipped {
         let still_blocked = match skip {
             PublishSkip::PendingApplications { .. } => !status.pending_applications.is_empty(),
@@ -741,6 +746,7 @@ fn prepare(
     upstream: &reconcile::Upstream,
     unsaved: &BTreeSet<String>,
     status: &mut SyncStatus,
+    repository_conflicts: &mut Vec<String>,
 ) -> Result<Vec<PathPlan>> {
     let shared = &report.objects();
     let incoming =
@@ -770,8 +776,19 @@ fn prepare(
         }
         None => heads.remote.is_some(),
     };
-    let repository_tree = incoming_repository_tree(repo, tracked)
-        .inspect_err(|error| repository_conflict(status, error))?;
+    // **A paused setup still plans.** The verbs that clear a pause (conflict
+    // inspection, and a pull that names a resolution) used to fail on the pause
+    // itself, so the refusal named a recovery path it had just made unreachable.
+    // Record the unresolved paths as conflicts instead: publication stays paused
+    // through the recorded validation error, and every resolution verb can now
+    // address them.
+    let repository_tree = match repository_tree_plan(repo, tracked, &status.resolutions)? {
+        RepositoryTree::Conflicted(conflicts) => {
+            *repository_conflicts = conflicts;
+            None
+        }
+        RepositoryTree::Clean(tree) => tree,
+    };
     status.pending_repository |= repository_tree.is_some();
     status.pending_directories = 0;
     if let Some(tree) = repository_tree.as_deref().or(heads.remote.as_deref()) {
@@ -906,6 +923,28 @@ fn holds_incoming(
         return false;
     };
     super::apply::live_object(repo, path).is_ok_and(|live| live.as_ref() == Some(incoming))
+}
+
+/// An unresolved complete-tree conflict is a conflict per path, not one opaque
+/// refusal: a resolution names a path, so each path has to stay addressable.
+fn record_repository_conflicts(status: &mut SyncStatus, conflicts: &[String]) {
+    status.pending_repository = true;
+    status.validation_error = Some(format!(
+        "repository application paused: reconcile repository conflicts first: {}",
+        conflicts.join(", ")
+    ));
+    status
+        .conflicts
+        .retain(|conflict| !matches!(conflict.kind, reconcile::ConflictKind::Repository));
+    for branch_path in conflicts {
+        status.conflicts.push(Conflict {
+            branch_path: branch_path.clone(),
+            kind: reconcile::ConflictKind::Repository,
+            local: None,
+            remote: None,
+            base: None,
+        });
+    }
 }
 
 fn repository_conflict(status: &mut SyncStatus, error: &eyre::Report) {
@@ -1193,37 +1232,57 @@ pub(super) fn incoming_repository_tree(
     repo: &crate::history::shadow::HistoryRepo,
     tracked: &TrackedSet,
 ) -> Result<Option<String>> {
+    match repository_tree_plan(repo, tracked, &BTreeMap::new())? {
+        RepositoryTree::Clean(tree) => Ok(tree),
+        RepositoryTree::Conflicted(unresolved) => bail!(
+            "repository application paused: reconcile repository conflicts first: {}",
+            unresolved.join(", ")
+        ),
+    }
+}
+
+/// The complete incoming tree, or the conflicts that keep it from applying.
+/// A caller that only reports, or that records a resolution, needs the second
+/// answer instead of an error: those are the verbs a pause is cleared with.
+pub(super) enum RepositoryTree {
+    Clean(Option<String>),
+    Conflicted(Vec<String>),
+}
+
+pub(super) fn repository_tree_plan(
+    repo: &crate::history::shadow::HistoryRepo,
+    tracked: &TrackedSet,
+    resolved: &BTreeMap<String, Resolution>,
+) -> Result<RepositoryTree> {
     let heads = super::graph::Heads::read(repo)?;
     let (Some(local), Some(remote)) = (&heads.local, &heads.remote) else {
-        return Ok(None);
+        return Ok(RepositoryTree::Clean(None));
     };
     if heads.base.as_ref() == Some(remote) {
-        return Ok(None);
+        return Ok(RepositoryTree::Clean(None));
     }
     let (merged, conflicts) = repo.merge_tree(local, remote)?;
     let tree = tracked.manifest.write(repo, &merged)?;
     let roots = Roots::current();
     let exclude = tracked.exclude_set()?;
     if repo.output_tree_of(local)? == tree && conflicts.is_empty() {
-        return Ok(None);
+        return Ok(RepositoryTree::Clean(None));
     }
-    let unresolved: Vec<_> = conflicts
+    let unresolved: Vec<String> = conflicts
         .into_iter()
         .filter(|path| {
-            path != crate::history::manifest::PATH && !eligible(&roots, tracked, &exclude, path)
+            path != crate::history::manifest::PATH
+                && !eligible(&roots, tracked, &exclude, path)
+                // a recorded choice clears its own path: the overlay writes
+                // that side into the tree, so Git's conflict object is gone
+                && !resolved.contains_key(path)
         })
         .collect();
     if !unresolved.is_empty() {
-        bail!(
-            "repository application paused: reconcile repository conflicts first: {}",
-            unresolved.join(", ")
-        );
+        return Ok(RepositoryTree::Conflicted(unresolved));
     }
-    Ok(Some(tree))
+    Ok(RepositoryTree::Clean(Some(tree)))
 }
-
-/// A bootstrap finished: the declarations that arrived through sync are
-/// applied now, so `status` stops asking for one.
 pub fn bootstrap_completed() {
     let state_dir: &Path = &super::super::local::root();
     let status = match read_status(state_dir) {
