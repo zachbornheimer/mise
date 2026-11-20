@@ -366,6 +366,7 @@ pub(crate) fn sync_locked(
                 request.capture && console::user_attended_stderr(),
             )?;
             let sync_state = state::load(repo)?;
+            let mut repository_conflicts = vec![];
             plans = prepare(
                 repo,
                 state_dir,
@@ -374,7 +375,11 @@ pub(crate) fn sync_locked(
                 &upstream,
                 &unsaved,
                 &mut status,
+                &mut repository_conflicts,
             )?;
+            if !repository_conflicts.is_empty() {
+                record_repository_conflicts(&mut status, &repository_conflicts);
+            }
             // Observing identical versions establishes a baseline even when
             // there is no publication (including fetch-only connections).
             let mut observed = sync_state.clone();
@@ -445,6 +450,7 @@ pub(crate) fn sync_locked(
                         upstream_commit.as_deref(),
                         request.capture && console::user_attended_stderr(),
                     )?;
+                    let mut repository_conflicts = vec![];
                     plans = prepare(
                         repo,
                         state_dir,
@@ -453,7 +459,11 @@ pub(crate) fn sync_locked(
                         &upstream,
                         &unsaved,
                         &mut status,
+                        &mut repository_conflicts,
                     )?;
+                    if !repository_conflicts.is_empty() {
+                        record_repository_conflicts(&mut status, &repository_conflicts);
+                    }
                     break;
                 }
                 PushOutcome::Rejected(reason) if attempts < PUSH_RETRIES => {
@@ -1224,21 +1234,6 @@ pub(super) fn incoming_tracking(
     incoming.local = tracked.local.clone();
     incoming.keep_local_out();
     Ok(incoming)
-}
-
-/// Complete-tree changes outside active native files still need adoption:
-/// enrollment, inactive variants, and ordinary repository documentation.
-pub(super) fn incoming_repository_tree(
-    repo: &crate::history::shadow::HistoryRepo,
-    tracked: &TrackedSet,
-) -> Result<Option<String>> {
-    match repository_tree_plan(repo, tracked, &BTreeMap::new())? {
-        RepositoryTree::Clean(tree) => Ok(tree),
-        RepositoryTree::Conflicted(unresolved) => bail!(
-            "repository application paused: reconcile repository conflicts first: {}",
-            unresolved.join(", ")
-        ),
-    }
 }
 
 /// The complete incoming tree, or the conflicts that keep it from applying.
