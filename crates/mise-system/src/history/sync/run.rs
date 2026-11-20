@@ -1529,8 +1529,71 @@ mod repository_conflict_tests {
         assert_eq!(paths(&status), ["tracked/home/.a"]);
         assert_eq!(status.conflicts.len(), 1);
     }
+
+    fn tree_z(entries: &[(&str, &str)]) -> Vec<u8> {
+        let mut listing = vec![];
+        for (path, oid) in entries {
+            listing.extend_from_slice(format!("100644 blob {oid}\t{path}\0").as_bytes());
+        }
+        listing
+    }
+
+    /// The state this ticket reports: a path no stream here selects changed on
+    /// both sides. It has to arrive as a conflict a resolver can name, never as
+    /// an error the resolver cannot get past, and a recorded choice clears it.
+    #[test]
+    fn a_conflicting_complete_tree_is_reported_and_a_choice_clears_it() -> Result<()> {
+        if mise_util::git::plumbing_binary().is_none() {
+            return Ok(());
+        }
+        let tmp = tempfile::tempdir()?;
+        let store = tmp.path().join("store");
+        let Some(repo) = crate::history::shadow::HistoryRepo::open_or_init_in(&store)? else {
+            return Ok(());
+        };
+        let tracked = TrackedSet::default();
+        let blob = |text: &str| repo.hash_blob(text.as_bytes());
+        let base = repo.mktree_z(&tree_z(&[("home/.a", &blob("base")?)]))?;
+        let base = repo.commit_tree(&base, vec![], "base")?;
+        let local = repo.mktree_z(&tree_z(&[("home/.a", &blob("local")?)]))?;
+        let local = repo.commit_tree(&local, vec![&base], "local")?;
+        let remote = repo.mktree_z(&tree_z(&[("home/.a", &blob("remote")?)]))?;
+        let remote = repo.commit_tree(&remote, vec![&base], "remote")?;
+        repo.update_ref(
+            crate::history::shadow::HistoryRepo::HISTORY_REF,
+            &local,
+            None,
+        )?;
+        repo.update_ref(UPSTREAM_REF, &remote, None)?;
+
+        let planned = repository_tree_plan(&repo, &tracked, &BTreeMap::new())?;
+        let RepositoryTree::Conflicted(paths) = planned else {
+            panic!("a divergent path outside every stream is not planned silently");
+        };
+        assert_eq!(paths, ["home/.a"]);
+
+        let mut resolutions = BTreeMap::new();
+        resolutions.insert(
+            "home/.a".to_string(),
+            Resolution {
+                local: None,
+                remote: None,
+                live: None,
+                take_remote: true,
+                local_mode: None,
+                remote_mode: None,
+                live_mode: None,
+            },
+        );
+        assert!(matches!(
+            repository_tree_plan(&repo, &tracked, &resolutions)?,
+            RepositoryTree::Clean(Some(_))
+        ));
+        Ok(())
+    }
 }
 
+#[cfg(test)]
 mod notification_tests {
     use super::*;
 
