@@ -51,20 +51,25 @@ pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareR
     let roots = Roots::current();
     let record = crate::history::held::Held::load(repo)?;
     let mut holds: BTreeMap<String, bool> = BTreeMap::new();
+    // One open for the walk. Opening this repository scans every pack index,
+    // so restoring or looking up each file through it opened it once per
+    // file, and a sync of a few thousand files spent seconds scanning
+    // indexes before it read a byte.
+    let objects = repo.gix()?;
     // one listing and one manifest read for the walk: looking each file up
     // again by path, and reading the manifest per file, made a sync of a
     // few thousand files spend seconds here
-    let listing = repo.ls_tree(&head)?;
+    let listing = repo.ls_tree_in(&objects, &head)?;
     let saved: BTreeMap<&str, (String, String)> = listing
         .iter()
         .map(|entry| (entry.path.as_str(), (entry.mode.clone(), entry.oid.clone())))
         .collect();
-    let encrypted_paths = repo.encrypted_paths_of(&head)?;
+    let encrypted_paths = repo.encrypted_paths_of_in(&objects, &head)?;
     let restored = |path: &str| -> Result<Option<(String, String)>> {
         saved
             .get(path)
             .cloned()
-            .map(|object| repo.restored(&encrypted_paths, path, object))
+            .map(|object| repo.restored_in(&objects, &encrypted_paths, path, object))
             .transpose()
     };
     for file in &listing {
@@ -88,7 +93,7 @@ pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareR
                         &stream,
                         match saved.get(stream.as_str()) {
                             Some(object) => Some(object.clone()),
-                            None => repo.object_at(&head, &stream)?,
+                            None => repo.object_at_in(&objects, &head, &stream)?,
                         }
                         .as_ref(),
                     );
@@ -105,7 +110,7 @@ pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareR
             // a deletion this machine made: without a base, the pull
             // applies the saved version
             let base = match &live {
-                Some(_) => held_base(repo, &head, &record, &stream, &file.path)?,
+                Some(_) => held_base_in(repo, &objects, &head, &record, &stream, &file.path)?,
                 None => None,
             };
             report.unheld.insert(file.path.clone(), base);
@@ -130,8 +135,11 @@ pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareR
 /// version, to compare the live file with. An encrypted version is
 /// compared by what it decrypts to, like the live file; one that cannot be
 /// decrypted here gives no baseline, so the pull asks rather than guesses.
-fn held_base(
+/// The caller's open repository is passed through, so a walk over many files
+/// opens it once rather than once per file.
+fn held_base_in(
     repo: &HistoryRepo,
+    objects: &gix::Repository,
     head: &str,
     held: &crate::history::held::Held,
     stream: &str,
@@ -147,25 +155,35 @@ fn held_base(
             .strip_prefix(stream)
             .and_then(|rest| rest.strip_prefix('/'))
         {
-            Some(relative) if frozen.0 == "040000" => repo.object_at(&frozen.1, relative)?,
+            Some(relative) if frozen.0 == "040000" => {
+                repo.object_at_in(objects, &frozen.1, relative)?
+            }
             _ => None,
         }
     };
     let Some(object) = object else {
         return Ok(None);
     };
-    let encrypted = crate::history::manifest::Manifest::read(repo, head)?.is_some_and(|manifest| {
-        manifest.encrypted_paths().iter().any(|prefix| {
-            path == prefix
-                || path
-                    .strip_prefix(prefix.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })
-    });
+    let encrypted =
+        crate::history::manifest::Manifest::read_in(objects, head)?.is_some_and(|manifest| {
+            manifest.encrypted_paths().iter().any(|prefix| {
+                path == prefix
+                    || path
+                        .strip_prefix(prefix.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+        });
     if !encrypted {
         return Ok(Some(object));
     }
-    Ok(super::files::decrypt(repo, path, &object, console::user_attended_stderr()).ok())
+    Ok(super::files::decrypt_in(
+        repo,
+        objects,
+        path,
+        &object,
+        console::user_attended_stderr(),
+    )
+    .ok())
 }
 
 /// The live object at `path`, or `None` when the path itself cannot stand
@@ -198,5 +216,89 @@ mod tests {
             ..Default::default()
         };
         assert!(current(repo, &tracked).is_err());
+    }
+
+    /// A walk of the saved files opens the repository once, not once per
+    /// file. Opening this repository scans every pack index, so a decryption
+    /// per file made a sync of a few thousand files spend seconds scanning
+    /// indexes before it compared a single live file.
+    #[test]
+    fn a_saved_file_walk_opens_the_repository_once() {
+        use crate::history::manifest::{Enrollment, Manifest};
+        use crate::history::shadow::{gix_opens, reset_gix_opens};
+        use crate::history::tracked::TrackedEntry;
+        use age::secrecy::ExposeSecret;
+
+        const FILES: usize = 40;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let roots = Roots::current();
+        let dir = roots.home.join("dot-walk-open-count");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = age::x25519::Identity::generate();
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        let entries: Vec<(String, String, String)> = (0..FILES)
+            .map(|index| {
+                let path = roots
+                    .branch_path(&dir.join(format!("file-{index}")), None)
+                    .unwrap();
+                let contents = format!("contents {index}");
+                std::fs::write(dir.join(format!("file-{index}")), &contents).unwrap();
+                let encoded = super::super::files::encode(
+                    &path,
+                    "100644",
+                    contents.as_bytes(),
+                    "test",
+                    &recipients,
+                )
+                .unwrap();
+                ("100644".into(), repo.hash_blob(&encoded).unwrap(), path)
+            })
+            .collect();
+        let tree = repo.write_tree(&entries).unwrap();
+        let tree = Manifest {
+            enrollment: vec![Enrollment {
+                path: roots.branch_path(&dir, None).unwrap(),
+                autosave: true,
+                encrypt: true,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            }],
+            recipients: vec![key.to_public().to_string()],
+            ..Default::default()
+        }
+        .write(&repo, &tree)
+        .unwrap();
+        let commit = repo.commit_tree(&tree, vec![], "encrypted files").unwrap();
+        repo.update_history_head(&commit, None).unwrap();
+
+        let mut environment = mise_util::testing::EnvVarGuard::new();
+        environment.set("MISE_AGE_KEY", key.to_string().expose_secret());
+
+        let mut policy = crate::files::FilePolicy::for_mode(crate::files::FileMode::Track);
+        policy.encrypt = true;
+        let tracked = TrackedSet {
+            entries: vec![TrackedEntry::new(dir.clone(), "track", policy)],
+            ..Default::default()
+        };
+
+        reset_gix_opens();
+        let report = current(&repo, &tracked).unwrap();
+        let opens = gix_opens();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            report.files.len(),
+            FILES,
+            "the walk did not read every saved file: {:?}",
+            report.files.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            opens <= 8,
+            "a walk of {FILES} saved files opened the repository {opens} times"
+        );
     }
 }

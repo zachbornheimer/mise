@@ -1960,26 +1960,45 @@ impl HistoryRepo {
 
     /// The object at `path` inside `tree_ish`: its mode and oid.
     pub fn object_at(&self, tree_ish: &str, path: &str) -> Result<Option<(String, String)>> {
-        if let Some(id) = Self::object_id(tree_ish) {
-            let repo = self.gix()?;
-            // a missing object holds nothing, as `ls-tree` reports it
-            let Some(object) = repo.try_find_object(id)? else {
-                return Ok(None);
-            };
-            // a blob holds no paths; any other failure to reach a tree is
-            // the repository's, not an absence
-            if object.kind == gix::object::Kind::Blob {
-                return Ok(None);
-            }
-            let tree = object.peel_to_tree()?;
-            // as `ls-tree` prints it: six octal digits, so a tree is 040000
-            return Ok(tree.lookup_entry_by_path(path)?.map(|entry| {
-                (
-                    format!("{:06o}", entry.mode().value()),
-                    entry.object_id().to_string(),
-                )
-            }));
+        if Self::object_id(tree_ish).is_some() {
+            return self.object_at_in(&self.gix()?, tree_ish, path);
         }
+        self.object_at_by_git(tree_ish, path)
+    }
+
+    /// [`Self::object_at`] through an already open repository. Opening this
+    /// repository scans every pack index, so a walk that looks up many paths
+    /// opens it once and passes it here, not once per path.
+    pub(crate) fn object_at_in(
+        &self,
+        objects: &gix::Repository,
+        tree_ish: &str,
+        path: &str,
+    ) -> Result<Option<(String, String)>> {
+        let Some(id) = Self::object_id(tree_ish) else {
+            return self.object_at_by_git(tree_ish, path);
+        };
+        // a missing object holds nothing, as `ls-tree` reports it
+        let Some(object) = objects.try_find_object(id)? else {
+            return Ok(None);
+        };
+        // a blob holds no paths; any other failure to reach a tree is
+        // the repository's, not an absence
+        if object.kind == gix::object::Kind::Blob {
+            return Ok(None);
+        }
+        let tree = object.peel_to_tree()?;
+        // as `ls-tree` prints it: six octal digits, so a tree is 040000
+        Ok(tree.lookup_entry_by_path(path)?.map(|entry| {
+            (
+                format!("{:06o}", entry.mode().value()),
+                entry.object_id().to_string(),
+            )
+        }))
+    }
+
+    /// [`Self::object_at`] for a revision only Git resolves.
+    fn object_at_by_git(&self, tree_ish: &str, path: &str) -> Result<Option<(String, String)>> {
         let output = self
             .git
             .output_unchecked(PlumbingCall::new(["ls-tree", "-z", tree_ish, "--", path]))?;
@@ -2059,7 +2078,16 @@ impl HistoryRepo {
     /// The encrypted streams `tree` declares, read once for a walk over its
     /// files ([`Self::restored`]) instead of once per file.
     pub(crate) fn encrypted_paths_of(&self, tree: &str) -> Result<BTreeSet<String>> {
-        Ok(super::manifest::Manifest::read(self, tree)?
+        self.encrypted_paths_of_in(&self.gix()?, tree)
+    }
+
+    /// [`Self::encrypted_paths_of`] through an already open repository.
+    pub(crate) fn encrypted_paths_of_in(
+        &self,
+        objects: &gix::Repository,
+        tree: &str,
+    ) -> Result<BTreeSet<String>> {
+        Ok(super::manifest::Manifest::read_in(objects, tree)?
             .map(|manifest| manifest.encrypted_paths())
             .unwrap_or_default())
     }
@@ -2069,6 +2097,24 @@ impl HistoryRepo {
     /// every saved file then reads the manifest once, not once per file.
     pub(crate) fn restored(
         &self,
+        encrypted_paths: &BTreeSet<String>,
+        path: &str,
+        object: (String, String),
+    ) -> Result<(String, String)> {
+        // a tree or a gitlink is not a file to restore, so this never opens
+        // the repository to answer it
+        if matches!(object.0.as_str(), "040000" | "160000") {
+            return Ok(object);
+        }
+        self.restored_in(&self.gix()?, encrypted_paths, path, object)
+    }
+
+    /// [`Self::restored`] through an already open repository. A walk that
+    /// restores many saved files decrypts them through one open repository
+    /// instead of opening it again for each file.
+    pub(crate) fn restored_in(
+        &self,
+        objects: &gix::Repository,
         encrypted_paths: &BTreeSet<String>,
         path: &str,
         object: (String, String),
@@ -2083,8 +2129,9 @@ impl HistoryRepo {
                     .is_some_and(|rest| rest.starts_with('/'))
         });
         if encrypted {
-            return super::sync::files::decrypt(
+            return super::sync::files::decrypt_in(
                 self,
+                objects,
                 path,
                 &object,
                 console::user_attended_stderr(),
@@ -2467,17 +2514,23 @@ impl HistoryRepo {
         conflicts: &mut Vec<String>,
     ) -> Result<String> {
         let magic: &[u8] = b"mise-encrypted-file-v1\n";
+        // One open for the whole walk. Opening this repository scans every
+        // pack index, so the per-entry `blob_starts_with` and `object_at` this
+        // loop used to call opened it once per entry, and a merge of a few
+        // thousand saved files spent seconds scanning indexes.
+        let objects = self.gix()?;
         let mut overlays = Vec::new();
-        for entry in self.ls_tree(tree)? {
-            if !self.blob_starts_with(&entry.oid, magic)? {
+        for entry in self.ls_tree_in(&objects, tree)? {
+            if !self.blob_starts_with_in(&objects, &entry.oid, magic)? {
                 continue;
             }
-            let ours = self.object_at(local, &entry.path)?;
-            let theirs = self.object_at(remote, &entry.path)?;
+            let ours = self.object_at_in(&objects, local, &entry.path)?;
+            let theirs = self.object_at_in(&objects, remote, &entry.path)?;
             let is_envelope = |object: &Option<(String, String)>| {
-                object
-                    .as_ref()
-                    .is_some_and(|object| self.blob_starts_with(&object.1, magic).unwrap_or(false))
+                object.as_ref().is_some_and(|object| {
+                    self.blob_starts_with_in(&objects, &object.1, magic)
+                        .unwrap_or(false)
+                })
             };
             if !is_envelope(&ours) && !is_envelope(&theirs) {
                 continue;
@@ -4147,6 +4200,48 @@ mod tests {
         assert_eq!(
             object.1,
             repo.object_at(&local, "home/secret").unwrap().unwrap().1
+        );
+    }
+
+    /// Merging a tree that holds many encrypted files opens the repository
+    /// once, not once per entry: the per-entry magic check and the per-entry
+    /// parent lookups each opened it, so one incoming merge scanned every
+    /// pack index thousands of times.
+    #[test]
+    fn merging_encrypted_files_opens_the_repository_once() {
+        const FILES: usize = 40;
+        let temp = tempfile::tempdir().unwrap();
+        let repo = super::HistoryRepo::open_or_init_in(temp.path())
+            .unwrap()
+            .unwrap();
+        let blobs = |side: &str| -> Vec<(String, String, String)> {
+            (0..FILES)
+                .map(|index| {
+                    let path = format!("home/encrypted/file-{index}"); // portable-home-ok
+                    let bytes = format!("mise-encrypted-file-v1\n{side} {index}");
+                    (
+                        "100644".to_string(),
+                        repo.hash_blob(bytes.as_bytes()).unwrap(),
+                        path,
+                    )
+                })
+                .collect()
+        };
+        let commit = |side: &str, parents: Vec<&str>| {
+            let tree = repo.write_tree(&blobs(side)).unwrap();
+            repo.commit_tree(&tree, parents, side).unwrap()
+        };
+        let base = commit("base", vec![]);
+        let local = commit("local", vec![&base]);
+        let remote = commit("remote", vec![&base]);
+
+        super::reset_gix_opens();
+        let (_tree, conflicts) = repo.merge_tree(&local, &remote).unwrap();
+        let opens = super::gix_opens();
+        assert_eq!(conflicts.len(), FILES, "{conflicts:?}");
+        assert!(
+            opens <= 8,
+            "merging {FILES} encrypted files opened the repository {opens} times"
         );
     }
 }
