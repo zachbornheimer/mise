@@ -2723,6 +2723,19 @@ pub(crate) fn mode_from(
     Some(permissions.get(&key).copied().unwrap_or(0o755))
 }
 
+/// The mode a manifest records for a directory, `None` when it records
+/// none. Differs from `mode_from` only in the missing record: a caller that
+/// guards a live mode has to know the record is absent, not defaulted.
+pub(crate) fn recorded_mode_from(
+    roots: &super::sync::layout::Roots,
+    entries: &[TrackedEntry],
+    permissions: &BTreeMap<String, u32>,
+    path: &Path,
+) -> Option<u32> {
+    let key = governing_key(roots, entries, path)?;
+    permissions.get(&key).copied()
+}
+
 pub fn ensure_portable_ancestors(path: &Path) -> Result<()> {
     eyre::ensure!(
         path.to_str().is_some(),

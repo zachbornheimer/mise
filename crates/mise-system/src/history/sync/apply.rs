@@ -529,7 +529,9 @@ impl Pull<'_> {
             .or(status.upstream_commit.as_deref())
             .or(self.planned_head.as_deref());
         Ok(directory_tree
-            .map(|tree| super::directories::plan(self.repo, self.tracked, tree))
+            .map(|tree| {
+                super::directories::plan(self.repo, self.tracked, tree).map(|plan| plan.steps)
+            })
             .transpose()?
             .unwrap_or_default())
     }
