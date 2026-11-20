@@ -1286,7 +1286,6 @@ pub(super) fn repository_tree_plan(
 
 /// A bootstrap finished: the declarations that arrived through sync are
 /// applied now, so `status` stops asking for one.
-}
 pub fn bootstrap_completed() {
     let state_dir: &Path = &super::super::local::root();
     let status = match read_status(state_dir) {
