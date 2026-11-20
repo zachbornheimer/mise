@@ -751,9 +751,12 @@ fn prepare(
     status.pending_repository |= repository_tree.is_some();
     status.pending_directories = 0;
     if let Some(tree) = repository_tree.as_deref().or(heads.remote.as_deref()) {
-        status.pending_directories = super::directories::plan(repo, tracked, tree)
-            .inspect_err(|error| repository_conflict(status, error))?
-            .len();
+        let permissions = super::directories::plan(repo, tracked, tree)
+            .inspect_err(|error| repository_conflict(status, error))?;
+        status.pending_directories = permissions.steps.len();
+        // A directory whose live mode is unsaved is left alone and reported
+        // here, never a reason to stop the rest of the pull.
+        status.skipped.extend(permissions.skipped);
     }
     if heads.remote != upstream.commit {
         bail!("origin changed while planning; reconcile again");
