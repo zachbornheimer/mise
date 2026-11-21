@@ -40,6 +40,95 @@ struct VerifiedAncestry {
 static AUDITS: LazyLock<Mutex<BTreeMap<PathBuf, VerifiedAncestry>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
+/// What the publish audit decided about one blob for one path. The object id
+/// hashes the blob's bytes, so the verdict for a (blob, path, mode) never goes
+/// stale. It holds no blob bytes, plaintext, or ciphertext.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct EnvelopeVerdict {
+    path: String,
+    mode: String,
+    accepted: bool,
+}
+
+type Verdicts = BTreeMap<String, EnvelopeVerdict>;
+
+/// The blob-size memo's cap: a file with more entries is not one this code wrote.
+const MAX_VERDICTS: usize = 1_048_576;
+const VERDICT_FILE: &str = "index/envelope-verdicts.json";
+
+// Verdicts per repository, so a second audit in this process reads neither
+// the file nor the blobs. Bounded like AUDITS.
+static VERDICTS: LazyLock<Mutex<BTreeMap<PathBuf, Verdicts>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+#[cfg(test)]
+thread_local! {
+    static BLOB_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Where this repository's verdicts persist; none when the repository has no
+/// parent store directory.
+fn verdict_file(repo: &HistoryRepo) -> Option<PathBuf> {
+    Some(repo.dir().parent()?.join(VERDICT_FILE))
+}
+
+/// The verdicts this process or an earlier one recorded. A missing,
+/// unreadable, oversized, or corrupt file is no verdicts; an entry that does
+/// not parse is dropped.
+fn load_verdicts(repo: &HistoryRepo) -> Verdicts {
+    if let Some(known) = VERDICTS
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(repo.dir()).cloned())
+    {
+        return known;
+    }
+    let read = || -> Option<Verdicts> {
+        let bytes = std::fs::read(verdict_file(repo)?).ok()?;
+        let raw: BTreeMap<String, serde_json::Value> = serde_json::from_slice(&bytes).ok()?;
+        if raw.len() > MAX_VERDICTS {
+            return None;
+        }
+        Some(
+            raw.into_iter()
+                .filter_map(|(oid, value)| Some((oid, serde_json::from_value(value).ok()?)))
+                .collect(),
+        )
+    };
+    let known = read().unwrap_or_default();
+    remember_verdicts(repo, &known);
+    known
+}
+
+fn remember_verdicts(repo: &HistoryRepo, known: &Verdicts) {
+    if let Ok(mut cache) = VERDICTS.lock() {
+        if cache.len() >= 64 && !cache.contains_key(repo.dir()) {
+            cache.pop_first();
+        }
+        cache.insert(repo.dir().to_path_buf(), known.clone());
+    }
+}
+
+/// Keep verdicts this process computed. A failed write is ignored: the next
+/// process reads the blobs again.
+fn store_verdicts(repo: &HistoryRepo, known: &Verdicts) {
+    remember_verdicts(repo, known);
+    let _ = write_verdicts(repo, known);
+}
+
+fn write_verdicts(repo: &HistoryRepo, known: &Verdicts) -> Result<()> {
+    let Some(file) = verdict_file(repo) else {
+        return Ok(());
+    };
+    let dir = file.parent().expect("the verdict file has a directory");
+    crate::history::store::create_private_dir(dir)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(dir)?;
+    serde_json::to_writer(temporary.as_file_mut(), known)?;
+    temporary.as_file().sync_all()?;
+    mise_util::file::persist_atomic(temporary, &file)?;
+    Ok(())
+}
+
 /// The audit rules this proof was written under. A different version is not
 /// proof: the history is audited again.
 const AUDIT_RULES_VERSION: u32 = 1;
@@ -172,6 +261,8 @@ fn audit_history_cached(
     }
     let inspected = commits.len();
     let mut checked = BTreeSet::new();
+    let mut verdicts = load_verdicts(repo);
+    let mut computed = false;
     if !protected.is_empty() {
         repo.visit_paths_in_open(&objects, &commits, &protected, |commit, entry| {
             if !checked.insert((entry.path.clone(), entry.mode.clone(), entry.oid.clone())) {
@@ -179,7 +270,29 @@ fn audit_history_cached(
             }
             let path = entry.path;
             let object = (entry.mode, entry.oid);
-            if !valid_envelope(repo, &objects, &path, &object)? {
+            let remembered = verdicts
+                .get(&object.1)
+                .filter(|known| known.path == path && known.mode == object.0)
+                .map(|known| known.accepted);
+            let accepted = match remembered {
+                Some(accepted) => accepted,
+                None => {
+                    let accepted = valid_envelope(repo, &objects, &path, &object)?;
+                    if verdicts.len() < MAX_VERDICTS || verdicts.contains_key(&object.1) {
+                        verdicts.insert(
+                            object.1.clone(),
+                            EnvelopeVerdict {
+                                path: path.clone(),
+                                mode: object.0.clone(),
+                                accepted,
+                            },
+                        );
+                        computed = true;
+                    }
+                    accepted
+                }
+            };
+            if !accepted {
                 found.push(UnpublishedPlaintext {
                     commit: commit.to_string(),
                     path,
@@ -187,6 +300,9 @@ fn audit_history_cached(
             }
             Ok(())
         })?;
+    }
+    if computed {
+        store_verdicts(repo, &verdicts);
     }
     // A walk that found a refused version proves nothing about this head.
     if found.is_empty() {
@@ -487,6 +603,8 @@ fn envelope_in(
         return Ok(None);
     }
     // Only encrypted envelopes have this limit; do not change plaintext sync.
+    #[cfg(test)]
+    BLOB_READS.with(|reads| reads.set(reads.get() + 1));
     let bytes = repo.cat_object_bounded_in(objects, &object.1, limit)?;
     let Some(body) = bytes.strip_prefix(MAGIC) else {
         return Ok(None);
@@ -1452,6 +1570,83 @@ mod tests {
         let protected = BTreeSet::from([path.to_string()]);
         audit_history_cached(&repo, &head, &protected, &mut Vec::new()).unwrap();
         (tmp, repo, head, protected)
+    }
+
+    fn reads() -> usize {
+        BLOB_READS.with(std::cell::Cell::get)
+    }
+
+    /// A fresh process: no proof and no process-local memory of this repository.
+    fn forget_process(repo: &HistoryRepo) {
+        AUDITS.lock().unwrap().remove(repo.dir());
+        VERDICTS.lock().unwrap().remove(repo.dir());
+        let _ = std::fs::remove_file(proof_file(repo.dir()));
+        BLOB_READS.with(|reads| reads.set(0));
+    }
+
+    #[test]
+    fn a_remembered_verdict_spares_the_next_audit_its_blob_reads() {
+        let (_tmp, repo, head, protected) = audited_history();
+        assert!(reads() > 0, "the first audit must read the blob");
+        forget_process(&repo);
+        let mut found = Vec::new();
+        audit_history_cached(&repo, &head, &protected, &mut found).unwrap();
+        assert!(found.is_empty());
+        assert_eq!(reads(), 0, "a recorded verdict must answer without a read");
+    }
+
+    #[test]
+    fn a_verdict_recorded_for_another_path_is_a_miss() {
+        let (_tmp, repo, head, protected) = audited_history();
+        let oid = repo
+            .object_at(&head, "tracked/home/secret")
+            .unwrap()
+            .unwrap()
+            .1;
+        forget_process(&repo);
+        let wrong = Verdicts::from([(
+            oid,
+            EnvelopeVerdict {
+                path: "tracked/home/other".into(),
+                mode: "100644".into(),
+                accepted: true,
+            },
+        )]);
+        write_verdicts(&repo, &wrong).unwrap();
+        audit_history_cached(&repo, &head, &protected, &mut Vec::new()).unwrap();
+        assert!(reads() > 0, "a verdict for another path must not answer");
+    }
+
+    #[test]
+    fn a_corrupt_verdict_file_is_a_miss_not_a_failure() {
+        let (_tmp, repo, head, protected) = audited_history();
+        forget_process(&repo);
+        std::fs::write(verdict_file(&repo).unwrap(), b"not json").unwrap();
+        audit_history_cached(&repo, &head, &protected, &mut Vec::new()).unwrap();
+        assert!(reads() > 0, "a corrupt file must not skip the blob");
+    }
+
+    #[test]
+    fn a_refused_verdict_is_remembered() {
+        let (_tmp, repo, _head, protected) = audited_history();
+        // Merge markers with no envelope behind them: refused, not an error.
+        let refused = repo
+            .hash_blob(b"mise-encrypted-file-v1\n<<<<<<< damaged")
+            .unwrap();
+        let tree = repo
+            .write_tree(&[("100644".into(), refused, "tracked/home/secret".into())])
+            .unwrap();
+        let head = repo.commit_tree(&tree, vec![], "damaged").unwrap();
+        forget_process(&repo);
+        let mut found = Vec::new();
+        audit_history_cached(&repo, &head, &protected, &mut found).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(reads() > 0);
+        forget_process(&repo);
+        found.clear();
+        audit_history_cached(&repo, &head, &protected, &mut found).unwrap();
+        assert_eq!(found.len(), 1, "the refusal must stand");
+        assert_eq!(reads(), 0, "a refused blob must not be read again");
     }
 
     fn forget_and_replace(repo: &HistoryRepo, proof: &[u8]) {
