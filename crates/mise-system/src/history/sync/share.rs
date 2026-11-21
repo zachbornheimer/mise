@@ -37,6 +37,32 @@ impl ShareReport {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Forces the walk's thread count, so a test can compare both paths on a
+    /// fixture too small to reach the threshold on its own.
+    static WALK_THREADS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_walk_threads(threads: Option<usize>) {
+    WALK_THREADS.with(|slot| slot.set(threads));
+}
+
+/// One thread per core, capped at 8: past that the decrypts are allocator
+/// bound and more threads only add contention.
+fn walk_threads() -> usize {
+    #[cfg(test)]
+    if let Some(forced) = WALK_THREADS.with(std::cell::Cell::get) {
+        return forced;
+    }
+    std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1)
+        .min(8)
+}
+
+/// Read committed files, including manually saved files missing on disk.
 /// Read committed files, including manually saved files missing on disk.
 /// Live directory enumeration is never the authority for a saved version.
 pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareReport> {
@@ -50,7 +76,6 @@ pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareR
     report.checkpoint = Some(head.clone());
     let roots = Roots::current();
     let record = crate::history::held::Held::load(repo)?;
-    let mut holds: BTreeMap<String, bool> = BTreeMap::new();
     // One open for the walk. Opening this repository scans every pack index,
     // so restoring or looking up each file through it opened it once per
     // file, and a sync of a few thousand files spent seconds scanning
@@ -65,24 +90,39 @@ pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareR
         .map(|entry| (entry.path.as_str(), (entry.mode.clone(), entry.oid.clone())))
         .collect();
     let encrypted_paths = repo.encrypted_paths_of_in(&objects, &head)?;
-    let restored = |path: &str| -> Result<Option<(String, String)>> {
+    let restored = |objects: &gix::Repository, path: &str| -> Result<Option<(String, String)>> {
         saved
             .get(path)
             .cloned()
-            .map(|object| repo.restored_in(&objects, &encrypted_paths, path, object))
+            .map(|object| repo.restored_in(objects, &encrypted_paths, path, object))
             .transpose()
     };
-    for file in &listing {
+    // One file's share, as the walk finds it. `unheld` records the baseline a
+    // live file was measured against, and is reported even when that file
+    // contributes no object of its own.
+    struct Found {
+        path: String,
+        unheld: Option<Option<(String, String)>>,
+        file: Option<SharedFile>,
+    }
+
+    // One caller waits on each decrypt in turn, so the walk costs 0.226 ms per
+    // file where the same decrypts spread across cores cost 0.088 ms. Small
+    // listings keep the serial loop: a thread costs more than it saves there.
+    let walk = |file: &crate::history::shadow::TreeEntry,
+                objects: &gix::Repository,
+                holds: &mut BTreeMap<String, bool>|
+     -> Result<Option<Found>> {
         let (local, variant) = match roots.locate(&file.path) {
             Located::Config(path) => (path, None),
             Located::Tracked { path, variant } => (path, variant),
-            Located::Marker | Located::Unmapped => continue,
+            Located::Marker | Located::Unmapped => return Ok(None),
         };
         let Some(entry) = tracked.entry_for(&local) else {
-            continue;
+            return Ok(None);
         };
         if entry.variant != variant {
-            continue;
+            return Ok(None);
         }
         let stream = entry.tree_path(&entry.path)?;
         let held = match holds.get(&stream) {
@@ -93,7 +133,7 @@ pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareR
                         &stream,
                         match saved.get(stream.as_str()) {
                             Some(object) => Some(object.clone()),
-                            None => repo.object_at_in(&objects, &head, &stream)?,
+                            None => repo.object_at_in(objects, &head, &stream)?,
                         }
                         .as_ref(),
                     );
@@ -101,32 +141,87 @@ pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareR
                 held
             }
         };
+        let mut found = Found {
+            path: file.path.clone(),
+            unheld: None,
+            file: None,
+        };
         // another machine's version is not this one's to compare against:
         // the live file is what this machine has
         let object = if held {
-            restored(&file.path)?
+            restored(objects, &file.path)?
         } else if let Some(live) = usable_live(repo, &local)? {
             // a file missing here while its stream was not selected is not
             // a deletion this machine made: without a base, the pull
             // applies the saved version
-            let base = match &live {
-                Some(_) => held_base_in(repo, &objects, &head, &record, &stream, &file.path)?,
+            found.unheld = Some(match &live {
+                Some(_) => held_base_in(repo, objects, &head, &record, &stream, &file.path)?,
                 None => None,
-            };
-            report.unheld.insert(file.path.clone(), base);
+            });
             live
         } else {
             // a directory or unreadable path where the file belongs is that
             // path's own conflict, decided when the pull plans it, not a
             // reason to stop every other file
-            restored(&file.path)?
+            restored(objects, &file.path)?
         };
-        let Some((mode, oid)) = object else {
-            continue;
-        };
-        report
-            .files
-            .insert(file.path.clone(), SharedFile { local, mode, oid });
+        if let Some((mode, oid)) = object {
+            found.file = Some(SharedFile { local, mode, oid });
+        }
+        if found.unheld.is_none() && found.file.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(found))
+    };
+    let mut merge = |found: Vec<Found>| {
+        for found in found {
+            if let Some(base) = found.unheld {
+                report.unheld.insert(found.path.clone(), base);
+            }
+            if let Some(file) = found.file {
+                report.files.insert(found.path, file);
+            }
+        }
+    };
+
+    let threads = walk_threads();
+    if threads > 1 && listing.len() > 64 {
+        let chunk = listing.len().div_ceil(threads);
+        let walked: Vec<Result<Vec<Found>>> = std::thread::scope(|scope| {
+            let walk = &walk;
+            let handles: Vec<_> = listing
+                .chunks(chunk)
+                .map(|part| {
+                    scope.spawn(move || {
+                        let objects = repo.gix()?;
+                        let mut holds = BTreeMap::new();
+                        let mut found = Vec::new();
+                        for file in part {
+                            if let Some(one) = walk(file, &objects, &mut holds)? {
+                                found.push(one);
+                            }
+                        }
+                        Ok(found)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("history walk thread"))
+                .collect()
+        });
+        for part in walked {
+            merge(part?);
+        }
+    } else {
+        let mut holds = BTreeMap::new();
+        let mut found = Vec::new();
+        for file in &listing {
+            if let Some(one) = walk(file, &objects, &mut holds)? {
+                found.push(one);
+            }
+        }
+        merge(found);
     }
     Ok(report)
 }
@@ -218,28 +313,30 @@ mod tests {
         assert!(current(repo, &tracked).is_err());
     }
 
-    /// A walk of the saved files opens the repository once, not once per
-    /// file. Opening this repository scans every pack index, so a decryption
-    /// per file made a sync of a few thousand files spend seconds scanning
-    /// indexes before it compared a single live file.
-    #[test]
-    fn a_saved_file_walk_opens_the_repository_once() {
+    /// A store whose saved tree holds `files` encrypted files, every one of
+    /// them present and unchanged on disk.
+    fn encrypted_walk_fixture(
+        name: &str,
+        files: usize,
+    ) -> (
+        tempfile::TempDir,
+        HistoryRepo,
+        std::path::PathBuf,
+        TrackedSet,
+        age::x25519::Identity,
+    ) {
         use crate::history::manifest::{Enrollment, Manifest};
-        use crate::history::shadow::{gix_opens, reset_gix_opens};
         use crate::history::tracked::TrackedEntry;
-        use age::secrecy::ExposeSecret;
-
-        const FILES: usize = 40;
 
         let tmp = tempfile::tempdir().unwrap();
         let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
         let roots = Roots::current();
-        let dir = roots.home.join("dot-walk-open-count");
+        let dir = roots.home.join(name);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let key = age::x25519::Identity::generate();
         let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
-        let entries: Vec<(String, String, String)> = (0..FILES)
+        let entries: Vec<(String, String, String)> = (0..files)
             .map(|index| {
                 let path = roots
                     .branch_path(&dir.join(format!("file-{index}")), None)
@@ -276,16 +373,29 @@ mod tests {
         let commit = repo.commit_tree(&tree, vec![], "encrypted files").unwrap();
         repo.update_history_head(&commit, None).unwrap();
 
-        let mut environment = mise_util::testing::EnvVarGuard::new();
-        environment.set("MISE_AGE_KEY", key.to_string().expose_secret());
-
         let mut policy = crate::files::FilePolicy::for_mode(crate::files::FileMode::Track);
         policy.encrypt = true;
         let tracked = TrackedSet {
             entries: vec![TrackedEntry::new(dir.clone(), "track", policy)],
             ..Default::default()
         };
+        (tmp, repo, dir, tracked, key)
+    }
 
+    /// A walk of the saved files opens the repository once, not once per
+    /// file. Opening this repository scans every pack index, so a decryption
+    /// per file made a sync of a few thousand files spend seconds scanning
+    /// indexes before it compared a single live file.
+    #[test]
+    fn a_saved_file_walk_opens_the_repository_once() {
+        use crate::history::shadow::{gix_opens, reset_gix_opens};
+        use age::secrecy::ExposeSecret;
+
+        const FILES: usize = 40;
+
+        let (_tmp, repo, dir, tracked, key) = encrypted_walk_fixture("dot-walk-open-count", FILES);
+        let mut environment = mise_util::testing::EnvVarGuard::new();
+        environment.set("MISE_AGE_KEY", key.to_string().expose_secret());
         reset_gix_opens();
         let report = current(&repo, &tracked).unwrap();
         let opens = gix_opens();
@@ -300,5 +410,42 @@ mod tests {
             opens <= 8,
             "a walk of {FILES} saved files opened the repository {opens} times"
         );
+    }
+
+    /// The walk answers the same spread across threads as it does on one: same
+    /// objects, same baselines, same checkpoint.
+    #[test]
+    fn the_parallel_walk_agrees_with_the_serial_one() {
+        use age::secrecy::ExposeSecret;
+
+        let (_tmp, repo, dir, tracked, key) = encrypted_walk_fixture("dot-walk-parallel", 130);
+        let mut environment = mise_util::testing::EnvVarGuard::new();
+        environment.set("MISE_AGE_KEY", key.to_string().expose_secret());
+
+        set_walk_threads(Some(1));
+        let serial = current(&repo, &tracked).unwrap();
+        set_walk_threads(Some(4));
+        let parallel = current(&repo, &tracked).unwrap();
+        set_walk_threads(None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let shape = |report: &ShareReport| {
+            report
+                .files
+                .iter()
+                .map(|(path, file)| {
+                    (
+                        path.clone(),
+                        file.mode.clone(),
+                        file.oid.clone(),
+                        file.local.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&serial), shape(&parallel));
+        assert_eq!(serial.unheld, parallel.unheld);
+        assert_eq!(serial.checkpoint, parallel.checkpoint);
+        assert_eq!(serial.files.len(), 130, "the walk lost files");
     }
 }
