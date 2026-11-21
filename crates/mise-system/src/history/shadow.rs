@@ -11,8 +11,9 @@
 //! repositories are untouched, and nested repositories become gitlinks
 //! rather than content. The user's checkouts and indexes are never touched.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Serialize};
@@ -31,6 +32,7 @@ pub(crate) const MAX_BYTES: u64 = 1024 * 1024 * 1024;
 #[cfg(test)]
 thread_local! {
     static READ_META_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BLOB_HEADER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -41,6 +43,15 @@ pub(crate) fn reset_read_meta_calls() {
 #[cfg(test)]
 pub(crate) fn read_meta_calls() -> usize {
     READ_META_CALLS.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+pub(crate) fn reset_blob_header_reads() {
+    BLOB_HEADER_READS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn blob_header_reads() -> usize {
+    BLOB_HEADER_READS.with(std::cell::Cell::get)
 }
 
 /// One top-level root of a snapshot tree and the files to add under it,
@@ -1049,7 +1060,7 @@ impl HistoryRepo {
                     let mut bytes = [0; 6];
                     let size = mode
                         .is_blob_or_symlink()
-                        .then(|| repo.find_header(entry.object_id()).map(|h| h.size()))
+                        .then(|| Self::blob_size_in(repo, entry.object_id()))
                         .transpose()?;
                     visit(
                         commit,
@@ -1306,6 +1317,30 @@ impl HistoryRepo {
         Ok(record)
     }
 
+    /// The size of a blob, read from its header at most once per process.
+    ///
+    /// An object id is its content, so a size never changes and nothing has to
+    /// invalidate this. A published tree repeats the same blobs in every commit,
+    /// and the publish audit asks for each one's size in every commit it walks.
+    fn blob_size_in(repo: &gix::Repository, oid: gix::ObjectId) -> Result<u64> {
+        static SIZES: LazyLock<Mutex<HashMap<gix::ObjectId, u64>>> =
+            LazyLock::new(|| Mutex::new(HashMap::new()));
+        // A cap keeps a long-lived process (the watcher) from growing without
+        // bound. Past it the cache stops filling; lookups fall through to a
+        // header read, which is the behavior without a cache.
+        const MAX_ENTRIES: usize = 1 << 20;
+        if let Some(size) = SIZES.lock().expect("blob size cache").get(&oid).copied() {
+            return Ok(size);
+        }
+        #[cfg(test)]
+        BLOB_HEADER_READS.with(|count| count.set(count.get() + 1));
+        let size = repo.find_header(oid)?.size();
+        let mut sizes = SIZES.lock().expect("blob size cache");
+        if sizes.len() < MAX_ENTRIES {
+            sizes.insert(oid, size);
+        }
+        Ok(size)
+    }
     fn gix_tree_entries(repo: &gix::Repository, tree: &gix::Tree<'_>) -> Result<Vec<TreeEntry>> {
         let mut entries = tree
             .traverse()
@@ -1322,7 +1357,7 @@ impl HistoryRepo {
                 let size = entry
                     .mode
                     .is_blob_or_symlink()
-                    .then(|| repo.find_header(entry.oid).map(|header| header.size()))
+                    .then(|| Self::blob_size_in(repo, entry.oid))
                     .transpose()?;
                 Ok(TreeEntry {
                     mode,
@@ -3321,6 +3356,57 @@ mod tests {
     }
 
     #[test]
+    /// The count that matters is on the second walk: the cache is per process,
+    /// so the content is unique to this test and no other test's blob can answer
+    /// for it.
+    #[test]
+    fn a_second_walk_of_the_same_tree_reads_no_blob_header_again() {
+        if mise_util::git::plumbing_binary().is_none() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = repo(tmp.path());
+        let content: &[u8] = b"a second walk reads no header: at-zjqnqd";
+        let oid = repo.hash_blob(content).unwrap();
+        let tree = repo
+            .compose(
+                &repo.empty_object("tree").unwrap(),
+                &[Overlay {
+                    path: "home/memo".into(),
+                    object: Some(("100644".into(), oid.clone())),
+                }],
+            )
+            .unwrap();
+        let gix = gix::open_opts(repo.dir(), gix::open::Options::isolated()).unwrap();
+        let tree = gix
+            .find_tree(gix::ObjectId::from_hex(tree.as_bytes()).unwrap())
+            .unwrap();
+
+        reset_blob_header_reads();
+        let first = HistoryRepo::gix_tree_entries(&gix, &tree).unwrap();
+        assert_eq!(
+            first,
+            vec![TreeEntry {
+                mode: "100644".into(),
+                oid,
+                size: Some(content.len() as u64),
+                path: "home/memo".into(),
+            }]
+        );
+        assert!(
+            blob_header_reads() >= 1,
+            "the first walk must read the header"
+        );
+
+        reset_blob_header_reads();
+        let second = HistoryRepo::gix_tree_entries(&gix, &tree).unwrap();
+        assert_eq!(second, first);
+        assert_eq!(
+            blob_header_reads(),
+            0,
+            "the second walk read a header it already had"
+        );
+    }
     fn gix_tree_entries_report_large_blob_size() {
         if mise_util::git::plumbing_binary().is_none() {
             return;
