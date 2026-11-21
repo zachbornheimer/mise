@@ -48,6 +48,16 @@ pub(crate) fn build(
                 conflicts.retain(|path| path != crate::history::manifest::PATH);
             }
         }
+        let settled = super::files::settle_text_conflicts(
+            repo,
+            heads.base.as_deref(),
+            local,
+            remote,
+            &merged,
+            conflicts,
+        )?;
+        merged = settled.0;
+        conflicts = settled.1;
         let unresolved: Vec<_> = conflicts
             .iter()
             .filter(|path| !accepted.contains(*path))

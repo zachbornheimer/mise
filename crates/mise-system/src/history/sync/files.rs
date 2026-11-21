@@ -10,7 +10,7 @@ use super::{layout, reconcile::Object};
 use crate::history::shadow::HistoryRepo;
 use mise_util::agecrypt;
 
-const MAGIC: &[u8] = b"mise-encrypted-file-v1\n";
+pub(crate) const MAGIC: &[u8] = b"mise-encrypted-file-v1\n";
 
 #[derive(Clone)]
 struct VerifiedAncestry {
@@ -332,6 +332,161 @@ fn encrypt(
     Ok(encrypted)
 }
 
+/// The saved mode and bytes, or `None` when the object is not a readable
+/// blob within the plaintext limit. An envelope is decrypted first.
+fn bounded_body(
+    repo: &HistoryRepo,
+    path: &str,
+    object: &Object,
+    interactive: bool,
+) -> Result<(String, Option<Vec<u8>>)> {
+    if repo.blob_starts_with(&object.1, MAGIC)? {
+        let decrypted = decrypt(repo, path, object, interactive)?;
+        return Ok((decrypted.0, bounded_blob(repo, &decrypted.1)?));
+    }
+    Ok((object.0.clone(), bounded_blob(repo, &object.1)?))
+}
+
+fn bounded_blob(repo: &HistoryRepo, oid: &str) -> Result<Option<Vec<u8>>> {
+    match repo.cat_object_bounded(oid, agecrypt::MAX_PLAINTEXT_BYTES) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.to_string().contains("exceeds") => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn utf8_text(bytes: &[u8]) -> bool {
+    !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok()
+}
+
+/// Three-way merge of the decrypted text of three sides, sealed again when
+/// the sides are envelopes.
+///
+/// An envelope must never reach `merge3`: a line merge of ciphertext commits
+/// conflict markers inside it. `None` means the sides are not mergeable text,
+/// and the caller keeps the conflict.
+pub(crate) fn merge_lines(
+    repo: &HistoryRepo,
+    path: &str,
+    base: &Object,
+    local: &Object,
+    remote: &Object,
+    interactive: bool,
+    manifest_tree: &str,
+) -> Result<Option<Object>> {
+    let (base_mode, Some(base_bytes)) = bounded_body(repo, path, base, interactive)? else {
+        return Ok(None);
+    };
+    let (local_mode, Some(local_bytes)) = bounded_body(repo, path, local, interactive)? else {
+        return Ok(None);
+    };
+    let (remote_mode, Some(remote_bytes)) = bounded_body(repo, path, remote, interactive)? else {
+        return Ok(None);
+    };
+    if base_mode != local_mode || local_mode != remote_mode {
+        return Ok(None);
+    }
+    if !matches!(local_mode.as_str(), "100644" | "100755") {
+        return Ok(None);
+    }
+    if !utf8_text(&base_bytes) || !utf8_text(&local_bytes) || !utf8_text(&remote_bytes) {
+        return Ok(None);
+    }
+    let encrypted = repo.blob_starts_with(&local.1, MAGIC)?;
+    if encrypted != repo.blob_starts_with(&remote.1, MAGIC)?
+        || encrypted != repo.blob_starts_with(&base.1, MAGIC)?
+    {
+        return Ok(None);
+    }
+    let Some(merged) = repo.merge3(&base_bytes, &local_bytes, &remote_bytes)? else {
+        return Ok(None);
+    };
+    if !encrypted {
+        return Ok(Some((local_mode, repo.hash_blob(&merged)?)));
+    }
+    let scheme = scheme_of(repo, local)?;
+    let recipients = recipients_of(repo, manifest_tree, path, local)?;
+    seal(repo, path, &local_mode, &merged, &scheme, &recipients).map(Some)
+}
+
+pub(crate) fn seal(
+    repo: &HistoryRepo,
+    path: &str,
+    mode: &str,
+    content: &[u8],
+    scheme: &str,
+    recipients: &[Box<dyn age::Recipient + Send>],
+) -> Result<Object> {
+    let plain = (mode.to_string(), repo.hash_blob(content)?);
+    encrypt(repo, path, &plain, scheme, recipients)
+}
+
+pub(crate) fn scheme_of(repo: &HistoryRepo, object: &Object) -> Result<String> {
+    envelope(repo, object, agecrypt::MAX_ENCRYPTED_BYTES)?
+        .map(|outer| outer.scheme)
+        .ok_or_else(|| eyre::eyre!("saved object is not an encrypted envelope"))
+}
+
+pub(crate) fn recipients_of(
+    repo: &HistoryRepo,
+    tree: &str,
+    path: &str,
+    object: &Object,
+) -> Result<Vec<Box<dyn age::Recipient + Send>>> {
+    let _ = envelope(repo, object, agecrypt::MAX_ENCRYPTED_BYTES)?
+        .ok_or_else(|| eyre::eyre!("{path} is not an encrypted envelope"))?;
+    let manifest = crate::history::manifest::Manifest::read(repo, tree)?
+        .ok_or_else(|| eyre::eyre!("{path} has no encryption recipients"))?;
+    let (strings, _) = scheme(&manifest.recipients);
+    parse_recipients(&strings, false)
+}
+
+/// Replace a Git conflict on an encrypted text file with the line merge of
+/// its decrypted sides. Git only sees ciphertext, so two machines editing
+/// different lines otherwise pause every pull.
+pub(crate) fn settle_text_conflicts(
+    repo: &HistoryRepo,
+    base: Option<&str>,
+    local: &str,
+    remote: &str,
+    merged: &str,
+    conflicts: Vec<String>,
+) -> Result<(String, Vec<String>)> {
+    let mut overlays = vec![];
+    let mut settled = BTreeSet::new();
+    for path in &conflicts {
+        if path == crate::history::manifest::PATH {
+            continue;
+        }
+        let Some(base) = base else {
+            continue;
+        };
+        let (Some(base_object), Some(saved), Some(theirs)) = (
+            repo.object_at(base, path)?,
+            repo.object_at(local, path)?,
+            repo.object_at(remote, path)?,
+        ) else {
+            continue;
+        };
+        let Some(object) = merge_lines(repo, path, &base_object, &saved, &theirs, false, local)?
+        else {
+            continue;
+        };
+        settled.insert(path.clone());
+        overlays.push(crate::history::shadow::Overlay {
+            path: path.clone(),
+            object: Some(object),
+        });
+    }
+    let remaining = conflicts
+        .into_iter()
+        .filter(|path| !settled.contains(path))
+        .collect();
+    if overlays.is_empty() {
+        return Ok((merged.to_string(), remaining));
+    }
+    Ok((repo.compose(merged, &overlays)?, remaining))
+}
 /// Turn a reconciled process-local object into its committed representation.
 /// Reuse an unchanged envelope; a merged plaintext is encrypted before hashing.
 pub(super) fn commit_object(

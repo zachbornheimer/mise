@@ -227,6 +227,10 @@ latest checkpoint, unsaved changes), Repository (the origin, branch, mode, and
 sync times), Conflicts, Automatic capture, and Bootstrap. A Next steps list
 names the commands that clear whatever needs attention.
 
+An encrypted text file both machines edited is merged after decryption and
+saved as one envelope. A mode change, a symlink, a binary body, or an edit of
+the same line stays a conflict.
+
 | State                                              | Meaning                                                                                      | What to do                                                            |
 | -------------------------------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
 | `applied`                                          | The target matches its entry.                                                                | Nothing.                                                              |

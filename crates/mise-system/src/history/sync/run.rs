@@ -1177,6 +1177,14 @@ pub(super) fn incoming_repository_tree(
         return Ok(None);
     }
     let (merged, conflicts) = repo.merge_tree(local, remote)?;
+    let (merged, conflicts) = super::files::settle_text_conflicts(
+        repo,
+        heads.base.as_deref(),
+        local,
+        remote,
+        &merged,
+        conflicts,
+    )?;
     let tree = tracked.manifest.write(repo, &merged)?;
     let roots = Roots::current();
     let exclude = tracked.exclude_set()?;
@@ -1646,5 +1654,84 @@ mod tests {
             &exclude,
             "home/.sample/nested/leave"
         ));
+    }
+
+    #[test]
+    fn non_overlapping_edits_to_one_encrypted_text_file_do_not_pause() {
+        use super::super::network::UPSTREAM_REF;
+        use crate::history::manifest::{Enrollment, Manifest};
+        use crate::history::shadow::{HistoryRepo, Overlay};
+        use age::secrecy::ExposeSecret;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(temporary.path())
+            .unwrap()
+            .unwrap();
+        let key = age::x25519::Identity::generate();
+        let mut environment = mise_util::testing::EnvVarGuard::new();
+        environment.set("MISE_AGE_KEY", key.to_string().expose_secret());
+        let path = "home/.agents/sync-probe/4b-regions.txt";
+        let seal = |text: &str| {
+            let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+            let encoded =
+                super::super::files::encode(path, "100644", text.as_bytes(), "test", &recipients)
+                    .unwrap();
+            ("100644".into(), repo.hash_blob(&encoded).unwrap())
+        };
+        let base = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n";
+        let local = "MAC-LINE\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n";
+        let remote = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nVPS-LINE\n";
+        let commit_side = |parent: Option<&str>, text: &str, message: &str| {
+            let empty = repo.empty_object("tree").unwrap();
+            let tree = repo
+                .compose(
+                    &empty,
+                    &[Overlay {
+                        path: path.into(),
+                        object: Some(seal(text)),
+                    }],
+                )
+                .unwrap();
+            let tree = Manifest {
+                enrollment: vec![Enrollment {
+                    path: path.into(),
+                    autosave: true,
+                    encrypt: true,
+                    allow_plaintext: None,
+                    variants: vec![],
+                    exclude: None,
+                    include: None,
+                }],
+                recipients: vec![key.to_public().to_string()],
+                ..Default::default()
+            }
+            .write(&repo, &tree)
+            .unwrap();
+            repo.commit_tree(&tree, parent.into_iter().collect(), message)
+                .unwrap()
+        };
+        let base_commit = commit_side(None, base, "saved encrypted");
+        let local_commit = commit_side(Some(&base_commit), local, "local encrypted");
+        let remote_commit = commit_side(Some(&base_commit), remote, "remote encrypted");
+        repo.update_ref(HistoryRepo::HISTORY_REF, &local_commit, None)
+            .unwrap();
+        repo.update_ref(UPSTREAM_REF, &remote_commit, None).unwrap();
+
+        let tree = incoming_repository_tree(&repo, &TrackedSet::default())
+            .unwrap()
+            .expect("the merged tree is adopted instead of pausing");
+        let saved = repo.object_at(&tree, path).unwrap().unwrap();
+        assert!(
+            repo.blob_starts_with(&saved.1, crate::history::sync::files::MAGIC)
+                .unwrap(),
+            "the settled object must stay an encrypted envelope"
+        );
+        let plain = super::super::files::decrypt(&repo, path, &saved, false).unwrap();
+        let text = String::from_utf8(repo.cat_object(&plain.1).unwrap()).unwrap();
+        assert_eq!(
+            text,
+            "MAC-LINE\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nVPS-LINE\n"
+        );
+        assert!(!text.contains("<<<<<<<"));
     }
 }
