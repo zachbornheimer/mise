@@ -49,8 +49,14 @@ pub(crate) fn set_walk_threads(threads: Option<usize>) {
     WALK_THREADS.with(|slot| slot.set(threads));
 }
 
-/// One thread per core, capped at 8: past that the decrypts are allocator
-/// bound and more threads only add contention.
+/// Files a listing must hold before the walk spreads over threads: below it
+/// the handoff costs more than the decrypts it saves.
+const WALK_FILES_MIN: usize = 64;
+
+/// Most threads the walk uses. Each worker opens its own repository handle, so
+/// a thread is not free, and past this the per-file decrypts stop gaining.
+const WALK_THREADS_MAX: usize = 8;
+/// One thread per core, capped at [`WALK_THREADS_MAX`].
 fn walk_threads() -> usize {
     #[cfg(test)]
     if let Some(forced) = WALK_THREADS.with(std::cell::Cell::get) {
@@ -59,10 +65,9 @@ fn walk_threads() -> usize {
     std::thread::available_parallelism()
         .map(|cores| cores.get())
         .unwrap_or(1)
-        .min(8)
+        .min(WALK_THREADS_MAX)
 }
 
-/// Read committed files, including manually saved files missing on disk.
 /// Read committed files, including manually saved files missing on disk.
 /// Live directory enumeration is never the authority for a saved version.
 pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareReport> {
@@ -185,7 +190,7 @@ pub(crate) fn current(repo: &HistoryRepo, tracked: &TrackedSet) -> Result<ShareR
     };
 
     let threads = walk_threads();
-    if threads > 1 && listing.len() > 64 {
+    if threads > 1 && listing.len() > WALK_FILES_MIN {
         let chunk = listing.len().div_ceil(threads);
         let walked: Vec<Result<Vec<Found>>> = std::thread::scope(|scope| {
             let walk = &walk;
