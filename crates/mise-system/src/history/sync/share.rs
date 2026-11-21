@@ -50,7 +50,8 @@ pub(crate) fn set_walk_threads(threads: Option<usize>) {
 }
 
 /// Files a listing must hold before the walk spreads over threads: below it
-/// the handoff costs more than the decrypts it saves.
+/// the handoff costs more than the decrypts it saves. Measured with
+/// `dot_health/realsize_ab.sh`; the numbers are in PERF.md.
 const WALK_FILES_MIN: usize = 64;
 
 /// Most threads the walk uses. Each worker opens its own repository handle, so
