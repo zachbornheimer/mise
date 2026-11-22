@@ -30,7 +30,11 @@ fn blob(repo: &HistoryRepo, bytes: &[u8]) -> Object {
     ("100644".into(), repo.hash_blob(bytes).unwrap())
 }
 
-fn commit(repo: &HistoryRepo, parent: Option<&str>, files: &[(&str, &Object)]) -> String {
+pub(super) fn commit(
+    repo: &HistoryRepo,
+    parent: Option<&str>,
+    files: &[(&str, &Object)],
+) -> String {
     let empty = repo.empty_object("tree").unwrap();
     let tree = repo
         .compose(
@@ -48,13 +52,18 @@ fn commit(repo: &HistoryRepo, parent: Option<&str>, files: &[(&str, &Object)]) -
         .unwrap()
 }
 
-fn seal(repo: &HistoryRepo, path: &str, bytes: &[u8], key: &age::x25519::Identity) -> Object {
+pub(super) fn seal(
+    repo: &HistoryRepo,
+    path: &str,
+    bytes: &[u8],
+    key: &age::x25519::Identity,
+) -> Object {
     let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
     let encoded = encode(path, "100644", bytes, "test", &recipients).unwrap();
     ("100644".into(), repo.hash_blob(&encoded).unwrap())
 }
 
-fn manifest_tree(
+pub(super) fn manifest_tree(
     repo: &HistoryRepo,
     tree: &str,
     path: &str,
@@ -793,7 +802,7 @@ fn non_overlapping_edits_to_one_encrypted_text_file_settle() {
     assert!(!text.contains("<<<<<<<"));
 }
 
-fn age_key() -> (mise_util::testing::EnvVarGuard, age::x25519::Identity) {
+pub(super) fn age_key() -> (mise_util::testing::EnvVarGuard, age::x25519::Identity) {
     use age::secrecy::ExposeSecret;
     let key = age::x25519::Identity::generate();
     let mut environment = mise_util::testing::EnvVarGuard::new();
