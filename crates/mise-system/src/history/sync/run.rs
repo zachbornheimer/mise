@@ -16,8 +16,8 @@ use super::SyncMode;
 use super::format::{self, RepoState};
 use super::layout::{Located, Roots, is_configuration};
 use super::network::{PushOutcome, Remote, UPSTREAM_REF};
-use super::reconcile::{self, Conflict, Object, PathPlan};
 use super::publish_skip_reason::PublishSkip;
+use super::reconcile::{self, Conflict, Object, PathPlan};
 use super::{publish, share, state};
 use crate::history::checkpoint::Store;
 use crate::history::config::OriginTomlConfig;
@@ -354,7 +354,7 @@ pub(crate) fn sync_locked(
             && !allow_plaintext_history
             && let Some(head) = repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)?
         {
-            audit_publication(repo, &head, tracked)?;
+            audit_publication(repo, &head, upstream_commit.as_deref(), tracked)?;
         }
         let mut plans;
         let mut attempts = 0;
@@ -510,6 +510,7 @@ const STATUS_LOCK_POLL: Duration = Duration::from_millis(100);
 fn audit_publication(
     repo: &crate::history::shadow::HistoryRepo,
     head: &str,
+    published: Option<&str>,
     tracked: &TrackedSet,
 ) -> Result<()> {
     let protected = tracked
@@ -518,7 +519,7 @@ fn audit_publication(
         .filter(|entry| entry.policy.encrypt)
         .map(|entry| entry.tree_path(&entry.path))
         .collect::<Result<_>>()?;
-    super::files::audit_history(repo, head, &protected)
+    super::files::audit_history(repo, head, published, &protected)
 }
 
 fn lock_path(state_dir: &Path) -> PathBuf {
@@ -1313,7 +1314,7 @@ mod capture_tests {
             entries: vec![entry],
             ..Default::default()
         };
-        assert!(audit_publication(repo, &head, &tracked).is_err());
+        assert!(audit_publication(repo, &head, None, &tracked).is_err());
         Ok(())
     }
 

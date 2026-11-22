@@ -53,14 +53,43 @@ impl<'de> Deserialize<'de> for Bytes {
     }
 }
 
-/// Audit the complete proposed ancestry, not just the latest tree. A newly
-/// encrypted path cannot make its previously committed plaintext safe to push.
+/// Audit every version the origin does not hold yet, not just the latest
+/// tree: a newly encrypted path cannot make its earlier plaintext safe to push.
+/// `published` is the origin's head. History the origin already holds is out
+/// and no sync can take it back, so refusing to publish over it only stops
+/// every machine for good (a path encrypted after a plaintext version was
+/// published). Removing that plaintext is a history rewrite, not a sync.
 pub(crate) fn audit_history(
     repo: &HistoryRepo,
     head: &str,
+    published: Option<&str>,
     protected: &BTreeSet<String>,
 ) -> Result<()> {
-    audit_history_cached(repo, head, protected).map(|_| ())
+    match published {
+        Some(published) => audit_unpublished_history(repo, head, published, protected),
+        None => audit_history_cached(repo, head, protected).map(|_| ()),
+    }
+}
+
+fn audit_unpublished_history(
+    repo: &HistoryRepo,
+    head: &str,
+    published: &str,
+    protected: &BTreeSet<String>,
+) -> Result<()> {
+    let commits = repo.rev_list_after(head, published)?;
+    if commits.is_empty() {
+        return Ok(());
+    }
+    let mut protected = protected.clone();
+    // A path the origin left in plaintext but a new commit encrypts is
+    // protected from that commit on; a merge parent the origin lacks is
+    // walked like any other unpublished commit.
+    crate::history::manifest::Manifest::read_distinct(repo, &commits, |manifest| {
+        protected.extend(manifest.encrypted_paths());
+        std::ops::ControlFlow::Continue(())
+    })?;
+    check_versions(repo, &commits, &protected)
 }
 
 fn audit_history_cached(
@@ -107,28 +136,7 @@ fn audit_history_cached(
         commits = repo.rev_list(head, usize::MAX)?;
     }
     let inspected = commits.len();
-    let mut checked = BTreeSet::new();
-    if !protected.is_empty() {
-        repo.visit_paths_in(&commits, &protected, |commit, entry| {
-            if !checked.insert((entry.path.clone(), entry.mode.clone(), entry.oid.clone())) {
-                return Ok(());
-            }
-            let path = entry.path;
-            let object = (entry.mode, entry.oid);
-            let valid =
-                envelope(repo, &object, agecrypt::MAX_ENCRYPTED_BYTES)?.is_some_and(|outer| {
-                    outer.path == path
-                        && matches!(outer.mode.as_str(), "100644" | "100755" | "120000")
-                        && outer.ciphertext.0.starts_with(b"age-encryption.org/v1\n")
-                });
-            if !valid {
-                bail!(
-                    "cannot publish: encrypted path {path} has an unencrypted or invalid version in commit {commit}; encrypting the latest version does not erase earlier plaintext. Remove that history before pushing, or use `mise dot sync --allow-plaintext-history` to publish it anyway",
-                );
-            }
-            Ok(())
-        })?;
-    }
+    check_versions(repo, &commits, &protected)?;
     if let Ok(mut cache) = AUDITS.lock() {
         // One watcher normally uses one repository. Bound temporary onboarding
         // probes without adding another durable history or state file.
@@ -146,6 +154,36 @@ fn audit_history_cached(
     Ok(inspected)
 }
 
+/// Fail on the first version of a protected path in `commits` that is not a
+/// valid encrypted envelope of that path.
+fn check_versions(
+    repo: &HistoryRepo,
+    commits: &[String],
+    protected: &BTreeSet<String>,
+) -> Result<()> {
+    if protected.is_empty() {
+        return Ok(());
+    }
+    let mut checked = BTreeSet::new();
+    repo.visit_paths_in(commits, protected, |commit, entry| {
+        if !checked.insert((entry.path.clone(), entry.mode.clone(), entry.oid.clone())) {
+            return Ok(());
+        }
+        let path = entry.path;
+        let object = (entry.mode, entry.oid);
+        let valid = envelope(repo, &object, agecrypt::MAX_ENCRYPTED_BYTES)?.is_some_and(|outer| {
+            outer.path == path
+                && matches!(outer.mode.as_str(), "100644" | "100755" | "120000")
+                && outer.ciphertext.0.starts_with(b"age-encryption.org/v1\n")
+        });
+        if !valid {
+            bail!(
+                "cannot publish: encrypted path {path} has an unencrypted or invalid version in commit {commit}; encrypting the latest version does not erase earlier plaintext. Remove that history before pushing, or use `mise dot sync --allow-plaintext-history` to publish it anyway",
+            );
+        }
+        Ok(())
+    })
+}
 /// Resolve encrypted files from the same committed enrollment metadata.
 pub(crate) fn encrypted_paths(
     repo: &HistoryRepo,
@@ -595,15 +633,67 @@ mod tests {
             .commit_tree(&encrypted_tree, vec![&exposed], "encrypted now")
             .unwrap();
         let protected = BTreeSet::from([path.into()]);
-        assert!(audit_history(&repo, &encrypted, &protected).is_err());
+        assert!(audit_history(&repo, &encrypted, None, &protected).is_err());
         let clean = repo
             .commit_tree(&encrypted_tree, vec![], "encrypted from first commit")
             .unwrap();
-        audit_history(&repo, &clean, &protected).unwrap();
+        audit_history(&repo, &clean, None, &protected).unwrap();
         let merge = repo
             .commit_tree(&encrypted_tree, vec![&clean, &exposed], "merge")
             .unwrap();
-        assert!(audit_history(&repo, &merge, &protected).is_err());
+        assert!(audit_history(&repo, &merge, None, &protected).is_err());
+    }
+
+    #[test]
+    fn plaintext_the_origin_already_holds_does_not_block_publishing_over_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let key = age::x25519::Identity::generate();
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        let path = "home/secret";
+        let tree = |oid: String| {
+            let empty = repo.empty_object("tree").unwrap();
+            repo.compose(
+                &empty,
+                &[crate::history::shadow::Overlay {
+                    path: path.into(),
+                    object: Some(("100644".into(), oid)),
+                }],
+            )
+            .unwrap()
+        };
+        let plain = tree(repo.hash_blob(b"private").unwrap());
+        let cipher = tree(
+            repo.hash_blob(&encode(path, "100644", b"private", "test", &recipients).unwrap())
+                .unwrap(),
+        );
+        let protected = BTreeSet::from([path.into()]);
+        // The origin published the plaintext before the path was encrypted.
+        let published = repo
+            .commit_tree(&plain, vec![], "published plaintext")
+            .unwrap();
+        let encrypted = repo
+            .commit_tree(&cipher, vec![&published], "encrypted now")
+            .unwrap();
+        audit_history(&repo, &encrypted, Some(&published), &protected).unwrap();
+        // Without an origin, the whole ancestry is still this machine's to publish.
+        assert!(audit_history(&repo, &encrypted, None, &protected).is_err());
+        // Plaintext this machine adds on top of the origin is still refused,
+        // on the line or on a merge parent the origin lacks.
+        let leaked = repo
+            .commit_tree(&plain, vec![&encrypted], "plaintext again")
+            .unwrap();
+        let after = repo
+            .commit_tree(&cipher, vec![&leaked], "re-encrypted")
+            .unwrap();
+        assert!(audit_history(&repo, &after, Some(&published), &protected).is_err());
+        let side = repo
+            .commit_tree(&plain, vec![], "unpublished side")
+            .unwrap();
+        let merge = repo
+            .commit_tree(&cipher, vec![&encrypted, &side], "merge")
+            .unwrap();
+        assert!(audit_history(&repo, &merge, Some(&published), &protected).is_err());
     }
 
     #[test]

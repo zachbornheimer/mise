@@ -786,7 +786,7 @@ impl Applying<'_> {
             let candidate = heads
                 .candidate(repo, tree)?
                 .ok_or_else(|| eyre::eyre!("setup branch disappeared"))?;
-            audit_incoming_history(repo, &candidate.commit)?;
+            audit_incoming_history(repo, &candidate.commit, heads.remote.as_deref())?;
         }
         Ok(())
     }
@@ -846,7 +846,6 @@ impl Applying<'_> {
                 .remote
                 .as_deref()
                 .ok_or_else(|| eyre::eyre!("setup branch disappeared during adoption"))?;
-            audit_incoming_history(repo, remote)?;
             repo.update_history_head(remote, None)?;
             self.adopted_head = Some(remote.to_owned());
             // every path this pull writes, the ones it creates included,
@@ -950,7 +949,6 @@ impl Applying<'_> {
                 bail!("setup history changed during adoption; retry pull");
             }
             let remote = heads.remote.as_deref().unwrap();
-            audit_incoming_history(repo, remote)?;
             let tree = self
                 .inventory_tree
                 .clone()
@@ -1314,14 +1312,20 @@ pub(crate) async fn apply_locked_with_scope(
     }
 }
 
-fn audit_incoming_history(repo: &crate::history::shadow::HistoryRepo, head: &str) -> Result<()> {
+/// The origin's own history needs no audit to be adopted: it is already out.
+/// Only what this machine adds on top of it does.
+fn audit_incoming_history(
+    repo: &crate::history::shadow::HistoryRepo,
+    head: &str,
+    published: Option<&str>,
+) -> Result<()> {
     if mise_settings::Settings::get()
         .history
         .allow_plaintext_history
     {
         return Ok(());
     }
-    super::files::audit_history(repo, head, &Default::default())
+    super::files::audit_history(repo, head, published, &Default::default())
 }
 
 fn recover_step(repo: &crate::history::shadow::HistoryRepo, step: &Step) -> Result<()> {
