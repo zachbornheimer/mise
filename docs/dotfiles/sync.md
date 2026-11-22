@@ -298,6 +298,12 @@ the path. A history whose bases share no ancestry cannot be merged; `mise
 dot status` then prints the manual reconciliation. `mise dot conflicts`
 cannot recover that case, because it plans through the same merge.
 
+An encrypted file that both machines changed in the same place is one
+conflict on that file, not a paused repository: `mise dot conflicts PATH`
+shows both decrypted sides, and `mise dot pull --keep-local PATH` or
+`--take-remote PATH` settles it to that machine's or the origin's saved
+version.
+
 ### Conflict notifications {#conflict-notifications}
 
 mise shows a desktop notification when a sync conflict pauses sharing, and
