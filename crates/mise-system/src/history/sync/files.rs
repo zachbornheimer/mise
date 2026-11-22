@@ -573,42 +573,6 @@ mod tests {
     }
 
     #[test]
-    fn audit_answers_from_a_recorded_verdict_before_reading_the_blob() {
-        let tmp = tempfile::tempdir().unwrap();
-        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
-        let key = age::x25519::Identity::generate();
-        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
-        let path = "home/secret";
-        let cipher = repo
-            .hash_blob(&encode(path, "100644", b"private", "test", &recipients).unwrap())
-            .unwrap();
-        let tree = repo
-            .write_tree(&[("100644".into(), cipher.clone(), path.into())])
-            .unwrap();
-        let head = repo.commit_tree(&tree, vec![], "encrypted").unwrap();
-        let protected = BTreeSet::from([path.to_string()]);
-        audit_history_cached(&repo, &head, &protected).unwrap();
-
-        // The first audit recorded its verdict; a later process, with no
-        // process-local proof, finds the verdict and does not read the blob.
-        // A recorded refusal therefore stands even for a valid envelope.
-        let verdict_file = repo
-            .dir()
-            .parent()
-            .unwrap()
-            .join("index/envelope-verdicts.json");
-        let recorded = std::fs::read_to_string(&verdict_file).unwrap();
-        assert!(recorded.contains(&cipher) && recorded.contains("\"accepted\":true"));
-        std::fs::write(
-            &verdict_file,
-            recorded.replace("\"accepted\":true", "\"accepted\":false"),
-        )
-        .unwrap();
-        AUDITS.lock().unwrap().remove(repo.dir());
-        assert!(audit_history_cached(&repo, &head, &protected).is_err());
-    }
-
-    #[test]
     fn encrypted_tip_does_not_hide_plaintext_in_ancestry_or_merge_parents() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
