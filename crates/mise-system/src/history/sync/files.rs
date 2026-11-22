@@ -6,6 +6,7 @@ use std::sync::{LazyLock, Mutex};
 use eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Serialize};
 
+use super::envelope_verdicts::EnvelopeVerdicts;
 use super::{layout, reconcile::Object};
 use crate::history::shadow::HistoryRepo;
 use mise_util::agecrypt;
@@ -108,6 +109,7 @@ fn audit_history_cached(
     }
     let inspected = commits.len();
     let mut checked = BTreeSet::new();
+    let mut verdicts = EnvelopeVerdicts::load(repo);
     if !protected.is_empty() {
         repo.visit_paths_in(&commits, &protected, |commit, entry| {
             if !checked.insert((entry.path.clone(), entry.mode.clone(), entry.oid.clone())) {
@@ -115,12 +117,15 @@ fn audit_history_cached(
             }
             let path = entry.path;
             let object = (entry.mode, entry.oid);
-            let valid =
-                envelope(repo, &object, agecrypt::MAX_ENCRYPTED_BYTES)?.is_some_and(|outer| {
-                    outer.path == path
-                        && matches!(outer.mode.as_str(), "100644" | "100755" | "120000")
-                        && outer.ciphertext.0.starts_with(b"age-encryption.org/v1\n")
-                });
+            let valid = verdicts.accepted(&path, &object.0, &object.1, || {
+                Ok(
+                    envelope(repo, &object, agecrypt::MAX_ENCRYPTED_BYTES)?.is_some_and(|outer| {
+                        outer.path == path
+                            && matches!(outer.mode.as_str(), "100644" | "100755" | "120000")
+                            && outer.ciphertext.0.starts_with(b"age-encryption.org/v1\n")
+                    }),
+                )
+            })?;
             if !valid {
                 bail!(
                     "cannot publish: encrypted path {path} has an unencrypted or invalid version in commit {commit}; encrypting the latest version does not erase earlier plaintext. Remove that history before pushing, or use `mise dot sync --allow-plaintext-history` to publish it anyway",
@@ -129,6 +134,7 @@ fn audit_history_cached(
             Ok(())
         })?;
     }
+    verdicts.save();
     if let Ok(mut cache) = AUDITS.lock() {
         // One watcher normally uses one repository. Bound temporary onboarding
         // probes without adding another durable history or state file.
@@ -564,6 +570,42 @@ mod tests {
         assert!(
             audit_history_cached(&repo, &other, &BTreeSet::from(["home/secret".into()])).is_err()
         );
+    }
+
+    #[test]
+    fn audit_answers_from_a_recorded_verdict_before_reading_the_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(tmp.path()).unwrap().unwrap();
+        let key = age::x25519::Identity::generate();
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        let path = "home/secret";
+        let cipher = repo
+            .hash_blob(&encode(path, "100644", b"private", "test", &recipients).unwrap())
+            .unwrap();
+        let tree = repo
+            .write_tree(&[("100644".into(), cipher.clone(), path.into())])
+            .unwrap();
+        let head = repo.commit_tree(&tree, vec![], "encrypted").unwrap();
+        let protected = BTreeSet::from([path.to_string()]);
+        audit_history_cached(&repo, &head, &protected).unwrap();
+
+        // The first audit recorded its verdict; a later process, with no
+        // process-local proof, finds the verdict and does not read the blob.
+        // A recorded refusal therefore stands even for a valid envelope.
+        let verdict_file = repo
+            .dir()
+            .parent()
+            .unwrap()
+            .join("index/envelope-verdicts.json");
+        let recorded = std::fs::read_to_string(&verdict_file).unwrap();
+        assert!(recorded.contains(&cipher) && recorded.contains("\"accepted\":true"));
+        std::fs::write(
+            &verdict_file,
+            recorded.replace("\"accepted\":true", "\"accepted\":false"),
+        )
+        .unwrap();
+        AUDITS.lock().unwrap().remove(repo.dir());
+        assert!(audit_history_cached(&repo, &head, &protected).is_err());
     }
 
     #[test]
