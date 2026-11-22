@@ -3157,6 +3157,20 @@ mod rejection_backoff_tests {
                 ("100644".into(), plain, PLAINTEXT_PATH.into()),
             ])
             .unwrap();
+        // The checkpoint enrolls the path unencrypted, as the origin held it.
+        let mut plain_manifest = Manifest::default();
+        plain_manifest
+            .enrollment
+            .push(crate::history::manifest::Enrollment {
+                path: PLAINTEXT_PATH.into(),
+                autosave: true,
+                encrypt: false,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            });
+        let plain_tree = plain_manifest.write(repo, &plain_tree).unwrap();
         let plaintext_commit = repo
             .commit_tree(&plain_tree, vec![&base], "plaintext checkpoint")
             .unwrap();
@@ -3306,24 +3320,28 @@ mod rejection_backoff_tests {
     }
 
     /// A refused version the origin already has is published history: it is
-    /// never rewritten, so the audit keeps refusing it as before.
+    /// never rewritten and never re-audited, so it does not block publishing
+    /// the encrypted version that follows it.
     #[test]
-    fn published_plaintext_is_still_refused() {
+    fn published_plaintext_does_not_block_the_encrypted_version_after_it() {
         let fixture = plaintext_history("published-plaintext", true);
         let repo = fixture.store.repo().unwrap();
-        let error = sync_locked(
+        let published = sync_locked(
             &fixture.store,
             &fixture.tracked,
             &publishing_strict(&fixture.origin),
         )
-        .expect_err("plaintext the origin already holds must still be refused");
-        assert!(format!("{error:#}").contains("cannot publish"), "{error:#}");
+        .expect("plaintext the origin already holds must not block publishing")
+        .published
+        .expect("the encrypted version was not published");
         assert_eq!(
-            repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)
+            published, fixture.tip,
+            "published history is kept, not rewritten"
+        );
+        assert!(
+            repo.rev_list(&published, usize::MAX)
                 .unwrap()
-                .as_deref(),
-            Some(fixture.tip.as_str()),
-            "a refused history is left as it was"
+                .contains(&fixture.plaintext_commit)
         );
         assert!(
             repo.list_refs("refs/mise/unpublishable/")
