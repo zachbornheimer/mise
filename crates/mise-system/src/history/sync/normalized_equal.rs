@@ -570,6 +570,45 @@ fn an_encrypted_content_change_stays_a_conflict() {
 }
 
 #[test]
+#[test]
+fn both_machines_appending_different_lines_keeps_both() {
+    let (_dir, repo) = open();
+    let (_environment, key) = age_key();
+    let path = "home/secret";
+    let (base_commit, _) = encrypted_commit(&repo, None, path, b"shared\n", &key);
+    let (local_commit, _) =
+        encrypted_commit(&repo, Some(&base_commit), path, b"shared\nfrom-mac\n", &key);
+    let (remote_commit, _) = encrypted_commit(
+        &repo,
+        Some(&base_commit),
+        path,
+        b"shared\nfrom-vps\n",
+        &key,
+    );
+    let (merged, conflicts) = repo.merge_tree(&local_commit, &remote_commit).unwrap();
+    let (tree, remaining) = settle_conflicts(
+        &repo,
+        Some(&base_commit),
+        &local_commit,
+        &remote_commit,
+        &merged,
+        conflicts,
+    )
+    .unwrap();
+    assert!(
+        remaining.is_empty(),
+        "disjoint additions must not pause the setup: {remaining:?}"
+    );
+    let object = object_of(&repo, &tree, path);
+    let decrypted = files::decrypt(&repo, path, &object, false).unwrap();
+    assert_eq!(
+        bytes_of(&repo, &decrypted),
+        b"shared\nfrom-mac\nfrom-vps\n",
+        "both appended lines stand, local then remote"
+    );
+}
+
+#[test]
 fn a_reencrypted_unchanged_origin_keeps_the_local_change() {
     // Another machine saved the same content again, which writes a new
     // envelope. This machine edited the file. Only one side changed it.
