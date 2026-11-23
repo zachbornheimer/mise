@@ -1066,8 +1066,13 @@ fn acquire_operation_lock(store: &Store, wait: std::time::Duration) -> Result<fs
 /// How long an operation waits for a running one (`history.lock_wait`), and
 /// how often it looks. An unreadable value falls back to the default rather
 /// than failing a command that only wanted to save.
+///
+/// Saves queue on one lock rather than running at once, so the default has to
+/// outlast a batch: ten saves at real size are ten saves back to back, and a
+/// wait that expires mid-batch is an exit 1 for a command that had nothing
+/// wrong with it.
 pub(crate) fn operation_lock_wait() -> std::time::Duration {
-    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
+    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
     match parse_lock_wait(&Settings::get().history.lock_wait) {
         Ok(wait) => wait,
         Err(err) => {

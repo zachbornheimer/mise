@@ -2377,8 +2377,8 @@
               "type": "string"
             },
             "lock_wait": {
-              "default": "30s",
-              "description": "How long a command waits for another history operation before failing.",
+              "default": "5m",
+              "description": "How long a command waits for another history operation before failing. Concurrent saves queue on one lock, so a batch of them needs longer than a single save.",
               "type": "string"
             },
             "network_timeout": {
