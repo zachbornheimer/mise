@@ -1087,6 +1087,37 @@ fn commit_meta_cache_path_in(state_dir: &Path, commit: &str) -> PathBuf {
 }
 
 /// Reads metadata derived directly from a commit, before annotations.
+/// Records the local context the index beside it was derived under. Its
+/// entries carry metadata localized to that context, so an index from another
+/// HOME or configuration is replayed rather than extended in place.
+pub(crate) fn write_index_context_in(state_dir: &Path) -> Result<()> {
+    write_json(
+        &index_context_path_in(state_dir),
+        &CommitMetaContext::current(),
+    )
+}
+
+/// Whether the index was derived under the current local context. A missing
+/// or unreadable stamp is not a claim that it was.
+pub(crate) fn index_context_matches_in(state_dir: &Path) -> Result<bool> {
+    let Ok(text) = file::read_to_string(&index_context_path_in(state_dir)) else {
+        return Ok(false);
+    };
+    let Ok(context) = serde_json::from_str::<CommitMetaContext>(&text) else {
+        return Ok(false);
+    };
+    Ok(context == CommitMetaContext::current())
+}
+
+fn index_context_path_in(state_dir: &Path) -> PathBuf {
+    index_dir_in(state_dir).join("context.json")
+}
+
+#[cfg(test)]
+pub(crate) fn index_context_file_in(state_dir: &Path) -> PathBuf {
+    index_context_path_in(state_dir)
+}
+
 pub(crate) fn read_commit_meta_cache_in(
     state_dir: &Path,
     commit: &str,

@@ -215,12 +215,39 @@ impl OperationScope {
     }
 
     pub async fn begin_kind(kind: OperationKind, command: &str, dry_run: bool) -> Result<Self> {
-        Self::begin_with_wait(kind, command, dry_run, operation_lock_wait(), false).await
+        Self::begin_with_wait(
+            super::local::root(),
+            kind,
+            command,
+            dry_run,
+            operation_lock_wait(),
+            false,
+        )
+        .await
+    }
+
+    /// Opens the operation on the history store the caller already planned
+    /// against, so the record and its plan cannot land in different stores.
+    pub(crate) async fn begin_restoring_in(
+        state_dir: &std::path::Path,
+        kind: OperationKind,
+        command: &str,
+    ) -> Result<Self> {
+        Self::begin_with_wait(
+            state_dir.to_path_buf(),
+            kind,
+            command,
+            false,
+            operation_lock_wait(),
+            false,
+        )
+        .await
     }
 
     /// The watcher retries contention later rather than delaying its event loop.
     pub(crate) async fn begin_automatic_apply() -> Result<Self> {
         Self::begin_with_wait(
+            super::local::root(),
             OperationKind::Apply,
             "dotfiles pull",
             false,
@@ -235,6 +262,7 @@ impl OperationScope {
     /// be created before the old branch is detached.
     pub(crate) async fn begin_replacement_apply() -> Result<Self> {
         Self::begin_with_wait(
+            super::local::root(),
             OperationKind::Apply,
             "bootstrap --adopt --replace-history",
             false,
@@ -245,6 +273,7 @@ impl OperationScope {
     }
 
     async fn begin_with_wait(
+        state_dir: std::path::PathBuf,
         kind: OperationKind,
         command: &str,
         dry_run: bool,
@@ -287,14 +316,7 @@ impl OperationScope {
             });
         }
         let writer = tokio::task::spawn_blocking(move || {
-            Writer::begin(
-                &super::local::root(),
-                kind,
-                &command,
-                tracked,
-                wait,
-                fresh_adoption,
-            )
+            Writer::begin(&state_dir, kind, &command, tracked, wait, fresh_adoption)
         })
         .await??;
         let uuid = writer.pending.checkpoint.uuid.clone();

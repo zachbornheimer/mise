@@ -302,10 +302,17 @@ impl Store {
             return Ok(Outcome::Unchanged);
         }
         let mut index = store::load_index_in(&self.state_dir)?;
-        if let Some(repo) = &self.repo
-            && repo.ref_oid(HistoryRepo::HISTORY_REF)?.as_deref()
-                != index.entries.last().map(|entry| entry.commit.as_str())
-        {
+        // Append only to an index current in both senses: the branch head it
+        // ends at, and the local context that localized its entries. Otherwise
+        // the capture would stamp the current context onto stale views.
+        let head_matches = match &self.repo {
+            Some(repo) => {
+                repo.ref_oid(HistoryRepo::HISTORY_REF)?.as_deref()
+                    == index.entries.last().map(|entry| entry.commit.as_str())
+            }
+            None => true,
+        };
+        if !head_matches || !store::index_context_matches_in(&self.state_dir)? {
             index = self.rebuild_index_locked()?;
         }
         // Metadata-only records (for example an operation while git was
@@ -946,6 +953,7 @@ impl Store {
             index.next_id = id + 1;
         }
         store::write_index_in(&self.state_dir, &index)?;
+        store::write_index_context_in(&self.state_dir)?;
         debug!(
             "history: recorded checkpoint {id} ({}): {}",
             checkpoint.trigger.as_str(),
@@ -1085,11 +1093,52 @@ impl Store {
         self.rebuild_index_locked()
     }
 
+    /// Brings the local index up to the branch head.
+    ///
+    /// When the index already covers an ancestor of the head, only the commits
+    /// above it are read: a pulled checkpoint or an annotation must not replay
+    /// and re-derive every historical commit before a capture.
     pub(crate) fn rebuild_index_locked(&self) -> Result<Index> {
         let Some(repo) = &self.repo else {
             return store::load_index_in(&self.state_dir);
         };
-        let existing = store::load_index_in(&self.state_dir)?;
+        let mut existing = store::load_index_in(&self.state_dir)?;
+        // The index's entries carry metadata localized to the context that
+        // derived it, so an index from another HOME or configuration must be
+        // replayed, not extended. The newest baseline's view must also still
+        // hold the snapshot a capture composes against.
+        let extend = match existing.entries.last() {
+            Some(last) => {
+                repo.ref_oid(HistoryRepo::HISTORY_REF)?.as_deref() != Some(last.commit.as_str())
+                    && store::index_context_matches_in(&self.state_dir)?
+                    && store::read_meta_cache_in(&self.state_dir, &last.uuid)?
+                        .is_some_and(|checkpoint| checkpoint.tree.snapshot.is_some())
+            }
+            None => false,
+        };
+        if extend {
+            let last = existing
+                .entries
+                .last()
+                .expect("checked above")
+                .commit
+                .clone();
+            if let Some(fresh) = fresh_history(repo, &last)?
+                && self.append_index_locked(repo, &mut existing, fresh)?
+            {
+                return Ok(existing);
+            }
+        }
+        self.rebuild_full_index_locked(repo, existing)
+    }
+
+    /// Recomputes the index from ordinary ancestry, re-deriving a checkpoint's
+    /// metadata whenever its cache is absent.
+    fn rebuild_full_index_locked(
+        &self,
+        repo: &HistoryRepo,
+        existing: store::Index,
+    ) -> Result<Index> {
         let mut entries = vec![];
         let messages = repo.history_messages()?;
         // A fresh adoption's protective snapshot is not an ancestor of the
@@ -1168,7 +1217,137 @@ impl Store {
         }
         index.next_id = next_id.max(index.entries.iter().map(|e| e.id + 1).max().unwrap_or(1));
         store::write_index_in(&self.state_dir, &index)?;
+        store::write_index_context_in(&self.state_dir)?;
         Ok(index)
+    }
+
+    /// Extends an index that already covers `last` with only the commits above
+    /// it. Existing checkpoint ids are kept; new checkpoints and annotations
+    /// apply in ancestry order, as a full rebuild would have ordered them.
+    fn append_index_locked(
+        &self,
+        repo: &HistoryRepo,
+        index: &mut store::Index,
+        commits: Vec<(String, String)>,
+    ) -> Result<bool> {
+        let gix = repo.gix()?;
+        let mut parsed = Vec::with_capacity(commits.len());
+        let mut annotations: BTreeMap<String, Vec<Annotation>> = BTreeMap::new();
+        for (commit, message) in commits {
+            let annotation = HistoryRepo::annotation_from_message(&message)?;
+            if let Some((target, annotation)) = &annotation {
+                annotations
+                    .entry(target.clone())
+                    .or_default()
+                    .push(annotation.clone());
+            }
+            parsed.push((commit, annotation));
+        }
+        let mut caches = store::CacheBatch::new(&self.state_dir);
+        // An annotation names a checkpoint that may already be indexed: its
+        // index row (id, commit, time, trigger) does not change, and the
+        // commit cache must stay annotation-free so removing the annotation
+        // restores the derived metadata. Only the view is refreshed.
+        //
+        // A view derived here would have to re-apply every annotation this
+        // commit already carried above the loaded view; the full rebuild
+        // applies them in ancestry order. Load every view before touching
+        // anything, so a missing one leaves the index whole for that rebuild.
+        let mut views = BTreeMap::new();
+        for target in annotations.keys() {
+            let Some(entry) = index.entries.iter().find(|entry| &entry.commit == target) else {
+                continue;
+            };
+            let Some(checkpoint) = store::read_meta_cache_in(&self.state_dir, &entry.uuid)? else {
+                return Ok(false);
+            };
+            views.insert(target.clone(), checkpoint);
+        }
+        for (target, annotations) in &annotations {
+            let Some(mut checkpoint) = views.remove(target) else {
+                continue;
+            };
+            for annotation in annotations {
+                annotation.apply_to(&mut checkpoint);
+            }
+            caches.write_meta(&checkpoint)?;
+        }
+        let mut next_id = index.next_id.max(1);
+        for (commit, annotation) in parsed {
+            if annotation.is_some() {
+                continue;
+            }
+            let mut checkpoint = match store::read_commit_meta_cache_in(&self.state_dir, &commit)? {
+                Some(checkpoint) => checkpoint,
+                None => {
+                    let checkpoint = HistoryRepo::read_meta_in(&gix, &commit)?;
+                    caches.write_commit_meta(&commit, &checkpoint)?;
+                    checkpoint
+                }
+            };
+            if let Some(annotations) = annotations.get(&commit) {
+                for annotation in annotations {
+                    annotation.apply_to(&mut checkpoint);
+                }
+            }
+            caches.write_meta(&checkpoint)?;
+            index.entries.push(IndexEntry {
+                id: next_id,
+                uuid: checkpoint.uuid,
+                commit,
+                created_at: checkpoint.created_at,
+                trigger: checkpoint.trigger,
+            });
+            next_id += 1;
+        }
+        caches.finish()?;
+        index.next_id = next_id.max(
+            index
+                .entries
+                .iter()
+                .map(|entry| entry.id + 1)
+                .max()
+                .unwrap_or(1),
+        );
+        store::write_index_in(&self.state_dir, &index)?;
+        store::write_index_context_in(&self.state_dir)?;
+        Ok(true)
+    }
+}
+
+/// The commits above `last` on a linear branch, oldest first, or `None` when
+/// the head is not a linear descendant of `last`.
+///
+/// Only a linear suffix can be appended safely: a merge carries side ancestry
+/// that an index built from the first-parent walk would silently omit, and a
+/// topological walk of the whole branch can reach `last` before that side
+/// ancestry. Any commit with other than one parent therefore sends the caller
+/// back to the full rebuild.
+fn fresh_history(repo: &HistoryRepo, last: &str) -> Result<Option<Vec<(String, String)>>> {
+    let gix = repo.gix()?;
+    let Some(mut head) = gix.try_find_reference(HistoryRepo::HISTORY_REF)? else {
+        return Ok(None);
+    };
+    let mut commit = head.peel_to_id()?.detach();
+    let mut fresh = vec![];
+    loop {
+        let id = commit.to_string();
+        if id == last {
+            fresh.reverse();
+            return Ok(Some(fresh));
+        }
+        let object = gix.find_commit(commit)?;
+        let mut parents = object.parent_ids();
+        let Some(parent) = parents.next() else {
+            return Ok(None);
+        };
+        if parents.next().is_some() {
+            return Ok(None);
+        }
+        let message = object.message_raw()?;
+        let message = String::from_utf8_lossy(message.as_ref()).trim().to_string();
+        fresh.push((id, message));
+        commit = parent.detach();
     }
 }
 
@@ -2867,5 +3046,527 @@ mod tests {
             entries: tracked_entries,
             ..Default::default()
         })
+    }
+
+    /// A capture after history moved on (a pulled checkpoint, or an
+    /// annotation) extends the index with only the new commits: it does not
+    /// replay and re-derive every historical checkpoint. The snapshot is still
+    /// the whole live tree, the restored path's encrypted preimage is exact,
+    /// undo returns it, and no plaintext version is stored.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scoped_rollback_refreshes_a_stale_index_without_recapturing_history() -> Result<()> {
+        use super::super::manifest::{Enrollment, Manifest};
+        use super::super::sync::layout::Roots;
+        use super::super::tracked::normalize;
+        use crate::files::{FileMode, FilePolicy};
+
+        let (_key, recipient) = encryption_identity();
+        let state = tempfile::tempdir()?;
+        let store = Store::open_in(state.path())?;
+        let Some(repo) = store.repo() else {
+            return Ok(());
+        };
+        let home = tempfile::Builder::new()
+            .prefix(".history-stale-index-")
+            .tempdir_in(&Roots::current().home)?;
+        let base = normalize(home.path());
+        let target = base.join("config.yml");
+        let unrelated = base.join("other.yml");
+        std::fs::write(&target, "target one\n")?;
+        std::fs::write(&unrelated, "other one\n")?;
+        let enroll = |path: &Path| -> Result<(TrackedEntry, Enrollment)> {
+            let mut policy = FilePolicy::for_mode(FileMode::Track);
+            policy.encrypt = true;
+            let entry = TrackedEntry::new(path.to_path_buf(), "track", policy);
+            let enrollment = Enrollment {
+                path: entry.tree_path(path)?,
+                autosave: true,
+                encrypt: true,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            };
+            Ok((entry, enrollment))
+        };
+        let (target_entry, target_enrollment) = enroll(&target)?;
+        let (unrelated_entry, unrelated_enrollment) = enroll(&unrelated)?;
+        let tracked = TrackedSet {
+            manifest: Manifest {
+                enrollment: vec![target_enrollment, unrelated_enrollment],
+                recipients: vec![recipient],
+                ..Default::default()
+            },
+            entries: vec![target_entry, unrelated_entry],
+            ..Default::default()
+        };
+        let target_path = tracked.entries[0].tree_path(&target)?;
+
+        // two checkpoints the index already covers
+        let mut draft = Draft::new(Trigger::Save);
+        draft.explicit_paths = vec![target.clone(), unrelated.clone()];
+        let Outcome::Created(_) = store.attempt(&tracked, draft)? else {
+            panic!("no baseline checkpoint")
+        };
+        std::fs::write(&target, "target saved\n")?;
+        let mut draft = Draft::new(Trigger::Save);
+        draft.explicit_paths = vec![target.clone()];
+        let Outcome::Created(_) = store.attempt(&tracked, draft)? else {
+            panic!("no second checkpoint")
+        };
+        let before_index = store::load_index_in(state.path())?;
+        let before_ids: Vec<u64> = before_index.entries.iter().map(|entry| entry.id).collect();
+        assert_eq!(before_ids.len(), 2);
+        // a cold historical metadata cache must not be re-derived either:
+        // drop every cached commit except the newest baseline
+        let commits_dir = ["history/index/commits", "index/commits"]
+            .iter()
+            .map(|relative| state.path().join(relative))
+            .find(|dir| dir.is_dir())
+            .expect("commit metadata cache directory");
+        let keep = format!("{}.json", before_index.entries[1].commit);
+        for entry in std::fs::read_dir(commits_dir)? {
+            let entry = entry?;
+            if entry.file_name() != keep.as_str() {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+
+        // history moves on without the index: an annotation at the tip
+        let tip = before_index.entries.last().unwrap().commit.clone();
+        repo.write_annotation(
+            &tip,
+            &Annotation {
+                description: Some("stale advance".into()),
+                description_source: None,
+                labels: None,
+                updated_at: store::now_rfc3339(),
+            },
+        )?;
+        assert_ne!(
+            repo.ref_oid(HistoryRepo::HISTORY_REF)?.as_deref(),
+            Some(tip.as_str())
+        );
+
+        // a rollback's protective capture: the whole live tree is still
+        // recorded, but no historical metadata is re-derived
+        std::fs::write(&target, "target live\n")?;
+        std::fs::write(&unrelated, "other live\n")?;
+        super::super::shadow::reset_read_meta_calls();
+        let mut draft = Draft::new(Trigger::RollbackBefore);
+        draft.protective = true;
+        draft.explicit_paths = vec![target.clone()];
+        let Outcome::Created(before) = store.attempt(&tracked, draft)? else {
+            panic!("no protective checkpoint")
+        };
+        // the missing historical cache would force a full replay; the
+        // incremental refresh reads only the checkpoint it appends
+        assert_eq!(
+            super::super::shadow::read_meta_calls(),
+            1,
+            "a stale index is extended, not replayed"
+        );
+        let after_ids: Vec<u64> = store::load_index_in(state.path())?
+            .entries
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(&after_ids[..before_ids.len()], before_ids.as_slice());
+        assert!(after_ids[before_ids.len()] > before_ids[1]);
+        assert_eq!(
+            before.checkpoint.changes.modified,
+            vec![display_path(&target), display_path(&unrelated)],
+            "the protective checkpoint still records the whole live tree"
+        );
+
+        // the restored path's preimage is exact and encrypted at rest, and no
+        // plaintext version was stored
+        let tree = before.checkpoint.tree.snapshot.clone().unwrap();
+        let target_object = repo
+            .object_at(&tree, &target_path)?
+            .expect("the checkpoint holds the restored path");
+        assert!(
+            repo.cat_object(&target_object.1)?
+                .starts_with(b"mise-encrypted-file-v1\n")
+        );
+        for plaintext in [
+            b"target one\n".as_slice(),
+            b"target saved\n".as_slice(),
+            b"target live\n".as_slice(),
+            b"other live\n".as_slice(),
+        ] {
+            let oid = gix::objs::compute_hash(
+                repo.gix()?.object_hash(),
+                gix::object::Kind::Blob,
+                plaintext,
+            )?;
+            assert!(
+                repo.gix()?.find_header(oid).is_err(),
+                "no plaintext version may be stored: {}",
+                String::from_utf8_lossy(plaintext)
+            );
+        }
+        let saved = super::super::sync::files::decrypt(repo, &target_path, &target_object, false)?;
+        let preimage = repo.cat_object(&saved.1)?;
+        assert_eq!(preimage, b"target live\n");
+
+        // the production rollback plans, captures its own protective
+        // checkpoint, and restores the saved version
+        let entries = store.list()?;
+        super::super::replay::rollback_with(
+            &store,
+            &tracked,
+            &entries,
+            super::super::replay::RollbackRequest {
+                paths: vec![target.clone()],
+                to: Some(before_index.entries[0].id.to_string()),
+                all: false,
+                dry_run: false,
+                yes: true,
+                force: false,
+            },
+        )
+        .await?;
+        assert_eq!(std::fs::read(&target)?, b"target one\n");
+        assert_eq!(
+            std::fs::read(&unrelated)?,
+            b"other live\n",
+            "an unrelated live edit survives a path rollback"
+        );
+
+        // the operation's protective checkpoint is where undo reads from:
+        // its target blob is encrypted and decrypts to the live preimage
+        let after_rollback = store.list()?;
+        let operation = after_rollback
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.checkpoint.operation.as_ref().is_some_and(|op| {
+                    op.undoes.is_none() && op.before.is_some() && !op.affected.is_empty()
+                })
+            })
+            .expect("the rollback recorded an operation");
+        let op = operation.checkpoint.operation.clone().unwrap();
+        let before_uuid = op.before.clone().unwrap();
+        let before = after_rollback
+            .iter()
+            .find(|entry| entry.checkpoint.uuid == before_uuid)
+            .expect("the protective checkpoint is listed");
+        let tree = before.checkpoint.tree.snapshot.clone().unwrap();
+        let object = repo
+            .object_at(&tree, &target_path)?
+            .expect("the protective checkpoint holds the restored path");
+        assert!(
+            repo.cat_object(&object.1)?
+                .starts_with(b"mise-encrypted-file-v1\n"),
+            "a protective preimage stays encrypted at rest"
+        );
+        let saved = super::super::sync::files::decrypt(repo, &target_path, &object, false)?;
+        assert_eq!(repo.cat_object(&saved.1)?, b"target live\n");
+
+        // production undo restores that exact preimage; the unrelated edit
+        // is still untouched and nothing this test wrote stands in for undo
+        let entries = store.list()?;
+        super::super::replay::undo_with(
+            &store,
+            &tracked,
+            &entries,
+            super::super::replay::UndoRequest {
+                reference: None,
+                dry_run: false,
+                yes: true,
+            },
+        )
+        .await?;
+        assert_eq!(std::fs::read(&target)?, b"target live\n");
+        assert_eq!(std::fs::read(&unrelated)?, b"other live\n");
+        Ok(())
+    }
+
+    /// A merge in the fresh suffix must never be walked by first parent: its
+    /// side ancestry can precede the indexed tip in any topological order, so
+    /// an appended index would omit it. The incremental result is compared
+    /// against a full rebuild.
+    #[cfg(unix)]
+    #[test]
+    fn scoped_rollback_merge_suffix_matches_a_full_rebuild() -> Result<()> {
+        use super::super::sync::layout::Roots;
+        use super::super::tracked::normalize;
+        use crate::files::{FileMode, FilePolicy};
+
+        let state = tempfile::tempdir()?;
+        let store = Store::open_in(state.path())?;
+        let Some(repo) = store.repo() else {
+            return Ok(());
+        };
+        let home = tempfile::Builder::new()
+            .prefix(".history-merge-index-")
+            .tempdir_in(&Roots::current().home)?;
+        let (_key, recipient) = encryption_identity();
+        let target = normalize(home.path()).join("config.yml");
+        std::fs::write(&target, "one\n")?;
+        let mut policy = FilePolicy::for_mode(FileMode::Track);
+        policy.encrypt = true;
+        let entry = TrackedEntry::new(target.clone(), "track", policy);
+        let enrollment = super::super::manifest::Enrollment {
+            path: entry.tree_path(&target)?,
+            autosave: true,
+            encrypt: true,
+            allow_plaintext: None,
+            variants: vec![],
+            exclude: None,
+            include: None,
+        };
+        let tracked = TrackedSet {
+            manifest: super::super::manifest::Manifest {
+                enrollment: vec![enrollment],
+                recipients: vec![recipient],
+                ..Default::default()
+            },
+            entries: vec![entry],
+            ..Default::default()
+        };
+        let mut draft = Draft::new(Trigger::Save);
+        draft.explicit_paths = vec![target.clone()];
+        let Outcome::Created(_) = store.attempt(&tracked, draft)? else {
+            panic!("no baseline checkpoint")
+        };
+        std::fs::write(&target, "two\n")?;
+        let mut draft = Draft::new(Trigger::Save);
+        draft.explicit_paths = vec![target.clone()];
+        let Outcome::Created(_) = store.attempt(&tracked, draft)? else {
+            panic!("no second checkpoint")
+        };
+        let index = store::load_index_in(state.path())?;
+        let first = index.entries[0].commit.clone();
+        let last = index.entries[1].commit.clone();
+        let tree = repo.output_tree_of(&last)?;
+
+        // a side checkpoint branched below the indexed tip; a first-parent
+        // walk from the merge reaches `last` without ever seeing it
+        repo.update_history_head(&first, Some(&last))?;
+        let side = test_checkpoint("side-checkpoint", Some(&tree));
+        let side_commit = repo.write_checkpoint(Some(&tree), &side)?;
+        let merge = test_checkpoint("merge-checkpoint", Some(&tree));
+        let message = format!(
+            "{}\n\n{}{}",
+            merge.description,
+            HistoryRepo::RECORD_TRAILER,
+            serde_json::to_string(&merge.for_commit())?
+        );
+        let merge_commit = repo.commit_tree(&tree, vec![&last, &side_commit], &message)?;
+        repo.update_history_head(&merge_commit, Some(&side_commit))?;
+
+        let rows = |index: &store::Index| -> Vec<(u64, String, String, String, String)> {
+            index
+                .entries
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.id,
+                        entry.uuid.clone(),
+                        entry.commit.clone(),
+                        entry.created_at.clone(),
+                        format!("{:?}", entry.trigger),
+                    )
+                })
+                .collect()
+        };
+        let incremental = store.rebuild_index_locked()?;
+        let incremental = rows(&incremental);
+        let existing = store::load_index_in(state.path())?;
+        let full = rows(&store.rebuild_full_index_locked(repo, existing)?);
+        assert_eq!(
+            incremental, full,
+            "an incremental index must equal a full rebuild"
+        );
+        assert!(
+            incremental.iter().any(|row| row.2 == side_commit),
+            "the merge's side ancestry is not omitted"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn encryption_identity() -> (mise_util::testing::EnvVarGuard, String) {
+        use age::secrecy::ExposeSecret;
+        let identity = age::x25519::Identity::generate();
+        let mut guard = mise_util::testing::EnvVarGuard::new();
+        guard.set("MISE_AGE_KEY", identity.to_string().expose_secret());
+        (guard, identity.to_public().to_string())
+    }
+
+    /// Two encrypted save checkpoints and the index covering both.
+    #[cfg(unix)]
+    fn two_checkpoint_fixture(
+        recipient: &str,
+    ) -> Result<(
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Store,
+        TrackedSet,
+        PathBuf,
+        PathBuf,
+        store::Index,
+    )> {
+        use super::super::manifest::{Enrollment, Manifest};
+        use super::super::sync::layout::Roots;
+        use super::super::tracked::normalize;
+        use crate::files::{FileMode, FilePolicy};
+
+        let state = tempfile::tempdir()?;
+        let store = Store::open_in(state.path())?;
+        let home = tempfile::Builder::new()
+            .prefix(".history-eligibility-")
+            .tempdir_in(&Roots::current().home)?;
+        let base = normalize(home.path());
+        let target = base.join("config.yml");
+        let unrelated = base.join("other.yml");
+        std::fs::write(&target, "target one\n")?;
+        std::fs::write(&unrelated, "other one\n")?;
+        let enroll = |path: &Path| -> Result<(TrackedEntry, Enrollment)> {
+            let mut policy = FilePolicy::for_mode(FileMode::Track);
+            policy.encrypt = true;
+            let entry = TrackedEntry::new(path.to_path_buf(), "track", policy);
+            let enrollment = Enrollment {
+                path: entry.tree_path(path)?,
+                autosave: true,
+                encrypt: true,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            };
+            Ok((entry, enrollment))
+        };
+        let (target_entry, target_enrollment) = enroll(&target)?;
+        let (unrelated_entry, unrelated_enrollment) = enroll(&unrelated)?;
+        let tracked = TrackedSet {
+            manifest: Manifest {
+                enrollment: vec![target_enrollment, unrelated_enrollment],
+                recipients: vec![recipient.into()],
+                ..Default::default()
+            },
+            entries: vec![target_entry, unrelated_entry],
+            ..Default::default()
+        };
+        let mut draft = Draft::new(Trigger::Save);
+        draft.explicit_paths = vec![target.clone(), unrelated.clone()];
+        let Outcome::Created(_) = store.attempt(&tracked, draft)? else {
+            panic!("no baseline checkpoint")
+        };
+        std::fs::write(&target, "target saved\n")?;
+        let mut draft = Draft::new(Trigger::Save);
+        draft.explicit_paths = vec![target.clone()];
+        let Outcome::Created(_) = store.attempt(&tracked, draft)? else {
+            panic!("no second checkpoint")
+        };
+        let index = store::load_index_in(state.path())?;
+        Ok((state, home, store, tracked, target, unrelated, index))
+    }
+
+    fn index_rows(index: &store::Index) -> Vec<(u64, String, String)> {
+        index
+            .entries
+            .iter()
+            .map(|entry| (entry.id, entry.uuid.clone(), entry.commit.clone()))
+            .collect()
+    }
+
+    /// A baseline view written under another machine context is not a
+    /// baseline: the fast path must replay, as a full rebuild would.
+    #[cfg(unix)]
+    #[test]
+    fn scoped_rollback_fast_path_requires_current_metadata_context() -> Result<()> {
+        let (_key, recipient) = encryption_identity();
+        let (state, _home, store, tracked, target, _unrelated, index) =
+            two_checkpoint_fixture(&recipient)?;
+        let Some(repo) = store.repo() else {
+            return Ok(());
+        };
+        let last = &index.entries[1];
+        let mut sentinel =
+            store::read_meta_cache_in(state.path(), &last.uuid)?.expect("the baseline is cached");
+        sentinel.description = "stale-context view".into();
+        store::write_meta_cache_in(state.path(), &sentinel)?;
+        let context = store::index_context_file_in(state.path());
+        let mut stamp: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&context)?)?;
+        stamp["home"] = serde_json::Value::String("/some/other/home".into());
+        std::fs::write(&context, serde_json::to_string(&stamp)?)?;
+
+        std::fs::write(&target, "target live\n")?;
+        super::super::shadow::reset_read_meta_calls();
+        let mut draft = Draft::new(Trigger::RollbackBefore);
+        draft.protective = true;
+        draft.explicit_paths = vec![target.clone()];
+        let Outcome::Created(_) = store.attempt(&tracked, draft)? else {
+            panic!("no protective checkpoint")
+        };
+        assert!(
+            super::super::shadow::read_meta_calls() > 1,
+            "an index from another context is replayed, not trusted"
+        );
+        assert!(
+            store::index_context_matches_in(state.path())?,
+            "the replay restamps the index with this context"
+        );
+        let view =
+            store::read_meta_cache_in(state.path(), &last.uuid)?.expect("the view is rebuilt");
+        assert_ne!(
+            view.description, "stale-context view",
+            "the rebuild replaces a view from another context"
+        );
+        let incremental = index_rows(&store::load_index_in(state.path())?);
+        let existing = store::load_index_in(state.path())?;
+        let full = index_rows(&store.rebuild_full_index_locked(repo, existing)?);
+        assert_eq!(incremental, full, "the result must equal a full rebuild");
+        Ok(())
+    }
+
+    /// An annotation targeting an indexed commit whose view is gone cannot be
+    /// applied in place without its earlier annotations: the rebuild derives
+    /// it and applies every annotation in ancestry order.
+    #[cfg(unix)]
+    #[test]
+    fn scoped_rollback_fast_path_derives_missing_annotated_metadata() -> Result<()> {
+        let (_key, recipient) = encryption_identity();
+        let (state, _home, store, tracked, target, _unrelated, index) =
+            two_checkpoint_fixture(&recipient)?;
+        let Some(repo) = store.repo() else {
+            return Ok(());
+        };
+        let first = &index.entries[0];
+        std::fs::remove_file(store::meta_cache_path_in(state.path(), &first.uuid))?;
+        repo.write_annotation(
+            &first.commit,
+            &Annotation {
+                description: Some("side note".into()),
+                description_source: None,
+                labels: None,
+                updated_at: store::now_rfc3339(),
+            },
+        )?;
+        std::fs::write(&target, "target live\n")?;
+        super::super::shadow::reset_read_meta_calls();
+        let mut draft = Draft::new(Trigger::RollbackBefore);
+        draft.protective = true;
+        draft.explicit_paths = vec![target.clone()];
+        let Outcome::Created(_) = store.attempt(&tracked, draft)? else {
+            panic!("no protective checkpoint")
+        };
+        assert!(
+            super::super::shadow::read_meta_calls() > 1,
+            "a missing annotated view is derived by the rebuild"
+        );
+        let view =
+            store::read_meta_cache_in(state.path(), &first.uuid)?.expect("the view is derived");
+        assert_eq!(view.description, "side note");
+        let incremental = index_rows(&store::load_index_in(state.path())?);
+        let existing = store::load_index_in(state.path())?;
+        let full = index_rows(&store.rebuild_full_index_locked(repo, existing)?);
+        assert_eq!(incremental, full, "the result must equal a full rebuild");
+        Ok(())
     }
 }
