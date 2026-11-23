@@ -1268,9 +1268,36 @@ fn prepare(
         }
         None => heads.remote.is_some(),
     };
-    let repository_tree = incoming_repository_tree_with(repo, tracked, &heads)
-        .inspect_err(|error| repository_conflict(status, error))?;
-    status.pending_repository |= repository_tree.is_some();
+    // A path both machines changed that no rule settled does not stop the
+    // plan: it is one conflict of its own, reported below with its real path
+    // so that it can be inspected and decided like any other.
+    let (repository_tree, unsettled) =
+        match incoming_repository_tree_with(repo, tracked, &heads, &status.resolutions) {
+            Ok(tree) => (tree, vec![]),
+            Err(error) => match error.downcast::<UnsettledPaths>() {
+                // Only a path with a place on this machine can be decided
+                // with `--take-remote` or `--keep-local`; the rest of the
+                // repository is reconciled with Git, as before.
+                Ok(unsettled)
+                    if unsettled
+                        .0
+                        .iter()
+                        .all(|path| roots.locate(path).path().is_some()) =>
+                {
+                    (None, unsettled.0)
+                }
+                Ok(unsettled) => {
+                    let error = eyre::Report::new(unsettled);
+                    repository_conflict(status, &error);
+                    return Err(error);
+                }
+                Err(error) => {
+                    repository_conflict(status, &error);
+                    return Err(error);
+                }
+            },
+        };
+    status.pending_repository |= repository_tree.is_some() || !unsettled.is_empty();
     status.pending_directories = 0;
     if let Some(tree) = repository_tree.as_deref().or(heads.remote.as_deref()) {
         let permissions = super::directories::plan(repo, tracked, tree)
@@ -1401,7 +1428,44 @@ fn prepare(
             }
         }
     }
+    report_unsettled(&mut plans, &unsettled, shared, upstream);
     Ok(plans)
+}
+
+/// A tracked path both machines changed that no rule settled, as a conflict
+/// on its real path, decided per file with `--take-remote` or `--keep-local`.
+fn report_unsettled(
+    plans: &mut Vec<PathPlan>,
+    unsettled: &[String],
+    shared: &BTreeMap<String, Object>,
+    upstream: &reconcile::Upstream,
+) {
+    for branch_path in unsettled {
+        let index = match plans
+            .iter()
+            .position(|plan| plan.branch_path == *branch_path)
+        {
+            Some(index) => index,
+            None => {
+                plans.push(PathPlan {
+                    branch_path: branch_path.clone(),
+                    ..Default::default()
+                });
+                plans.len() - 1
+            }
+        };
+        let plan = &mut plans[index];
+        plan.apply = None;
+        plan.publish = None;
+        plan.conflict.get_or_insert_with(|| Conflict {
+            branch_path: branch_path.clone(),
+            kind: reconcile::ConflictKind::SameHunk,
+            local: shared.get(branch_path).cloned(),
+            remote: upstream.files.get(branch_path).cloned(),
+            base: None,
+            detail: None,
+        });
+    }
 }
 
 /// Whether the live file at `branch_path` already is its incoming version.
@@ -1417,6 +1481,23 @@ fn holds_incoming(
     };
     super::apply::live_object(repo, path).is_ok_and(|live| live.as_ref() == Some(incoming))
 }
+
+/// Repository paths both machines changed that neither a per-file rule nor a
+/// choice settled. Taking either side of the path decides it.
+#[derive(Debug)]
+pub(super) struct UnsettledPaths(pub(super) Vec<String>);
+
+impl std::fmt::Display for UnsettledPaths {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "repository application paused: reconcile repository conflicts first: {}",
+            self.0.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for UnsettledPaths {}
 
 fn repository_conflict(status: &mut SyncStatus, error: &eyre::Report) {
     status.pending_repository = true;
@@ -1873,17 +1954,23 @@ fn incoming_tracking_with(
 
 /// Complete-tree changes outside active native files still need adoption:
 /// enrollment, inactive variants, and ordinary repository documentation.
+///
+/// `choices` are the per-path decisions of a pull: a conflicted path with one
+/// takes the chosen side's saved version, so the path no longer pauses the
+/// repository.
 pub(super) fn incoming_repository_tree(
     repo: &crate::history::shadow::HistoryRepo,
     tracked: &TrackedSet,
+    choices: &BTreeMap<String, Resolution>,
 ) -> Result<Option<String>> {
-    incoming_repository_tree_with(repo, tracked, &super::graph::Heads::read(repo)?)
+    incoming_repository_tree_with(repo, tracked, &super::graph::Heads::read(repo)?, choices)
 }
 
 fn incoming_repository_tree_with(
     repo: &crate::history::shadow::HistoryRepo,
     tracked: &TrackedSet,
     heads: &super::graph::Heads,
+    choices: &BTreeMap<String, Resolution>,
 ) -> Result<Option<String>> {
     let (Some(local), Some(remote)) = (&heads.local, &heads.remote) else {
         return Ok(None);
@@ -1904,6 +1991,7 @@ fn incoming_repository_tree_with(
         &merged,
         conflicts,
     )?;
+    let (merged, conflicts) = settle_by_choice(repo, local, remote, &merged, conflicts, choices)?;
     let tree = tracked.manifest.write(repo, &merged)?;
     let roots = Roots::current();
     let exclude = tracked.exclude_set()?;
@@ -1926,12 +2014,38 @@ fn incoming_repository_tree_with(
         })
         .collect();
     if !unresolved.is_empty() {
-        bail!(
-            "repository application paused: reconcile repository conflicts first: {}",
-            unresolved.join(", ")
-        );
+        return Err(eyre::Report::new(UnsettledPaths(unresolved)));
     }
     Ok(Some(tree))
+}
+
+/// A conflicted path the user chose a side for takes that side's saved
+/// version, ciphertext included: a choice is never a merge of the two.
+fn settle_by_choice(
+    repo: &crate::history::shadow::HistoryRepo,
+    local: &str,
+    remote: &str,
+    merged: &str,
+    conflicts: Vec<String>,
+    choices: &BTreeMap<String, Resolution>,
+) -> Result<(String, Vec<String>)> {
+    let mut overlays = vec![];
+    let mut remaining = vec![];
+    for path in conflicts {
+        let Some(choice) = choices.get(&path) else {
+            remaining.push(path);
+            continue;
+        };
+        let side = if choice.take_remote { remote } else { local };
+        overlays.push(crate::history::shadow::Overlay {
+            object: repo.object_at(side, &path)?,
+            path,
+        });
+    }
+    if overlays.is_empty() {
+        return Ok((merged.to_string(), remaining));
+    }
+    Ok((repo.compose(merged, &overlays)?, remaining))
 }
 
 /// Git merged the saved envelopes as text. Whatever it wrote for a conflicted
@@ -2259,7 +2373,7 @@ mod capture_tests {
             conflicts,
         )
         .unwrap();
-        let tree = incoming_repository_tree(&repo, &tracked)
+        let tree = incoming_repository_tree(&repo, &tracked, &BTreeMap::new())
             .expect("a plaintext replay must not pause the repository")
             .unwrap_or(settled);
         Replay {
@@ -3550,7 +3664,7 @@ mod enrollment_base_tests {
             "independent additions survive; the base is false, the local tip changed it to true, and the remote tip left the base value, so the result is true"
         );
         assert!(
-            incoming_repository_tree(&repo, &incoming)?.is_some(),
+            incoming_repository_tree(&repo, &incoming, &BTreeMap::new())?.is_some(),
             "several bases are not a fast-forward, so the repository tree is still merged"
         );
         assert!(

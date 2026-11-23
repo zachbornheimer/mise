@@ -198,6 +198,19 @@ impl Pull<'_> {
         }
     }
 
+    /// The pull's choices, recorded and planned against: what remains in
+    /// `status.conflicts` is what no choice decided.
+    fn choose(&self, status: &mut SyncStatus) -> Result<Decisions> {
+        let mut decisions = self.decisions(status);
+        self.record_resolutions(status, &mut decisions)?;
+        self.check_choices_are_conflicts(status, &decisions)?;
+        run::refresh(self.store, self.tracked, status)?;
+        if !self.req.dry_run {
+            run::write_status(self.state_dir, status)?;
+        }
+        Ok(decisions)
+    }
+
     /// Stores choices without publishing or applying any part of the setup.
     fn record_resolutions(&self, status: &mut SyncStatus, decisions: &mut Decisions) -> Result<()> {
         let Self {
@@ -495,6 +508,15 @@ impl Pull<'_> {
             held: status.conflicts.len(),
             ..Default::default()
         })
+    }
+
+    /// The complete tree this pull adopts once the live files are written: the
+    /// repository merge, with every choice's side in place of Git's conflict
+    /// object.
+    fn inventory_tree(&self, status: &SyncStatus) -> Result<Option<String>> {
+        run::incoming_repository_tree(self.repo, self.tracked, &status.resolutions)?
+            .map(|tree| self.overlay_resolutions(status, &tree))
+            .transpose()
     }
 
     /// Only after all version-bound choices are valid may they replace Git's
@@ -1203,9 +1225,6 @@ pub(crate) async fn apply_locked_with_scope(
     let planned_head = repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)?;
     let incoming = run::incoming_tracking(repo, tracked)?;
     let tracked = &incoming;
-    // Metadata changes must advance the same complete Git tree after live
-    // application. They cannot be reduced to this machine's selected paths.
-    let mut inventory_tree = run::incoming_repository_tree(repo, tracked)?;
     let mut status = run::read_status(state_dir)?;
     if req.automatic && status.application_failure.is_some() {
         return Ok(ApplyOutcome {
@@ -1228,22 +1247,17 @@ pub(crate) async fn apply_locked_with_scope(
         state_dir,
         planned_head,
     };
-    let mut decisions = pull.decisions(&status);
-
     let mut sync_state = state::load(repo)?;
-    pull.record_resolutions(&mut status, &mut decisions)?;
-    pull.check_choices_are_conflicts(&status, &decisions)?;
-    run::refresh(store, tracked, &mut status)?;
-    if !req.dry_run {
-        run::write_status(state_dir, &status)?;
-    }
+    let decisions = pull.choose(&mut status)?;
     if !status.conflicts.is_empty() {
         return pull.pause_for_conflicts(&status, &decisions);
     }
 
-    if let Some(tree) = &inventory_tree {
-        inventory_tree = Some(pull.overlay_resolutions(&status, tree)?);
-    }
+    // Metadata changes must advance the same complete Git tree after live
+    // application. They cannot be reduced to this machine's selected paths.
+    // Every conflict is decided by now, so a conflicted path the repository
+    // merge could not settle takes the side its choice names.
+    let mut inventory_tree = pull.inventory_tree(&status)?;
 
     // the write set
     let mut directories = pull.plan_directories(&status, inventory_tree.as_deref())?;
@@ -1692,6 +1706,9 @@ pub fn resolution_advice(path: &str, reason: &str) -> String {
         )
     }
 }
+
+#[cfg(test)]
+mod choice_tests;
 
 #[cfg(test)]
 mod tests {
