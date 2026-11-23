@@ -1302,6 +1302,13 @@ pub fn running_mise_bin() -> PathBuf {
 /// is better than that.
 fn shim_target() -> Result<Option<PathBuf>> {
     let mise_bin = mise_bin_for_shims().absolutize()?.into_owned();
+    if file::canonicalize_cached(&mise_bin).is_none() {
+        warn!(
+            "not writing shims: {} does not resolve to a file (symlink cycle?); fix the link and run `mise reshim`",
+            display_path(&mise_bin)
+        );
+        return Ok(None);
+    }
     if env::is_mise_path(&mise_bin) {
         return Ok(Some(mise_bin));
     }
@@ -1323,7 +1330,44 @@ pub fn mise_bin_for_shims() -> PathBuf {
     env::var_path("SNAP")
         .as_deref()
         .and_then(|snap| snap_mise_bin(&env::MISE_BIN, snap))
-        .unwrap_or_else(|| file::which_no_shims("mise").unwrap_or(env::MISE_BIN.clone()))
+        .unwrap_or_else(|| {
+            let launcher = file::which_no_shims("mise").unwrap_or(env::MISE_BIN.clone());
+            launcher_outside_shims(&launcher, file::is_mise_dispatch_dir)
+        })
+}
+
+/// The path shims should target for `launcher`, the mise found on PATH.
+///
+/// A launcher that links into the shims directory (`~/.local/bin/mise` -> `shims/mise` -> real
+/// mise) cannot be the target: publishing `shims/mise` -> launcher closes a two-node symlink
+/// cycle that breaks every `mise` call and, through it, every shim. Follow the links to the
+/// first mise path past the last shims-directory hop, which stays a stable name across
+/// upgrades. A cycle that already exists has no such hop, so the launcher is returned
+/// unchanged and [`shim_target`] refuses it.
+fn launcher_outside_shims(launcher: &Path, is_dispatch_dir: impl Fn(&Path) -> bool) -> PathBuf {
+    const MAX_HOPS: usize = 40;
+    let mut hops = vec![launcher.to_path_buf()];
+    while hops.len() < MAX_HOPS {
+        let hop = hops.last().expect("hops starts non-empty");
+        let Ok(link) = fs::read_link(hop) else {
+            break;
+        };
+        let next = if link.is_absolute() {
+            link
+        } else {
+            hop.parent().unwrap_or_else(|| Path::new(".")).join(link)
+        };
+        hops.push(next);
+    }
+    let in_dispatch_dir = |hop: &PathBuf| hop.parent().is_some_and(&is_dispatch_dir);
+    match hops.iter().rposition(in_dispatch_dir) {
+        Some(last) => hops
+            .get(last + 1)
+            .filter(|next| !in_dispatch_dir(next) && env::is_mise_path(next))
+            .cloned()
+            .unwrap_or_else(|| launcher.to_path_buf()),
+        None => launcher.to_path_buf(),
+    }
 }
 
 fn snap_mise_bin(mise_bin: &Path, snap: &Path) -> Option<PathBuf> {
@@ -2947,6 +2991,61 @@ mod tests {
             "python3.12"
         );
         assert_eq!(command_name_without_exe_suffix("dummy.cmd"), "dummy.cmd");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_linking_into_shims_dir_targets_real_mise_not_the_launcher() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let shims = temp.path().join("shims");
+        let bin = temp.path().join("bin");
+        let real_dir = temp.path().join("installs/latest");
+        for dir in [&shims, &bin, &real_dir] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let real = real_dir.join("mise");
+        fs::write(&real, "").unwrap();
+        symlink(&real, shims.join("mise")).unwrap();
+        let launcher = bin.join("mise");
+        symlink(shims.join("mise"), &launcher).unwrap();
+        let in_shims = |dir: &Path| dir == shims;
+
+        let target = launcher_outside_shims(&launcher, in_shims);
+        assert_eq!(target, real);
+
+        // The reshim that used to follow: shims/mise -> launcher. The chain must still end at a file.
+        fs::remove_file(shims.join("mise")).unwrap();
+        symlink(&target, shims.join("mise")).unwrap();
+        assert!(file::canonicalize_cached(&launcher).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launcher_outside_shims_dir_is_kept_and_existing_cycle_is_left_unresolved() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let shims = temp.path().join("shims");
+        let bin = temp.path().join("bin");
+        fs::create_dir_all(&shims).unwrap();
+        fs::create_dir_all(&bin).unwrap();
+        let in_shims = |dir: &Path| dir == shims;
+
+        let package_launcher = bin.join("mise");
+        fs::write(&package_launcher, "").unwrap();
+        assert_eq!(
+            launcher_outside_shims(&package_launcher, in_shims),
+            package_launcher
+        );
+
+        fs::remove_file(&package_launcher).unwrap();
+        symlink(shims.join("mise"), &package_launcher).unwrap();
+        symlink(&package_launcher, shims.join("mise")).unwrap();
+        assert_eq!(
+            launcher_outside_shims(&package_launcher, in_shims),
+            package_launcher
+        );
+        assert!(file::canonicalize_cached(&package_launcher).is_none());
     }
 
     #[test]
