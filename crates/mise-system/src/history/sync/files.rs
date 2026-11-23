@@ -6,6 +6,7 @@ use std::sync::{LazyLock, Mutex};
 use eyre::{Result, WrapErr, bail};
 use serde::{Deserialize, Serialize};
 
+use super::envelope_verdicts::EnvelopeVerdicts;
 use super::{layout, reconcile::Object};
 use crate::history::shadow::HistoryRepo;
 use mise_util::agecrypt;
@@ -173,6 +174,7 @@ fn audit_history_cached(
     }
     let inspected = commits.len();
     let mut checked = BTreeSet::new();
+    let mut verdicts = EnvelopeVerdicts::load(repo);
     if !protected.is_empty() {
         repo.visit_paths_in_open(&objects, &commits, &protected, |commit, entry| {
             if !checked.insert((entry.path.clone(), entry.mode.clone(), entry.oid.clone())) {
@@ -180,7 +182,10 @@ fn audit_history_cached(
             }
             let path = entry.path;
             let object = (entry.mode, entry.oid);
-            if !valid_envelope(repo, &objects, &path, &object)? {
+            let valid = verdicts.accepted(&path, &object.0, &object.1, || {
+                valid_envelope(repo, &objects, &path, &object)
+            })?;
+            if !valid {
                 found.push(UnpublishedPlaintext {
                     commit: commit.to_string(),
                     path,
@@ -189,6 +194,7 @@ fn audit_history_cached(
             Ok(())
         })?;
     }
+    verdicts.save();
     // A walk that found a refused version proves nothing about this head.
     if found.is_empty() {
         remember_ancestry(repo, head, protected);

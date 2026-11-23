@@ -11,6 +11,7 @@ use eyre::{Result, bail};
 
 pub mod apply;
 mod directories;
+mod envelope_verdicts;
 pub mod files;
 pub(crate) mod format;
 pub(crate) mod graph;
