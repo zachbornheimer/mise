@@ -428,12 +428,28 @@ impl HistoryRepo {
             transient: Default::default(),
             object_hash: Default::default(),
         };
+        repo.disable_text_merges()?;
         if !repo.list_refs("refs/checkpoints/")?.is_empty() {
             bail!(
                 "this store uses the old unreleased checkpoint format; use a separate MISE_STATE_DIR for the new history format; existing data has not been changed"
             );
         }
         Ok(Some(repo))
+    }
+
+    /// Saved objects are ciphertext or exact file bytes, never text Git may
+    /// combine. A conflicted path keeps the local object; reconciliation
+    /// decides it per file from the decrypted versions.
+    fn disable_text_merges(&self) -> Result<()> {
+        let path = self.dir().join("info").join("attributes");
+        if std::fs::read(&path).is_ok_and(|bytes| bytes == b"* -merge\n") {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, b"* -merge\n")
+            .wrap_err_with(|| format!("writing {}", display_path(&path)))
     }
 
     pub fn dir(&self) -> &Path {
@@ -2941,6 +2957,32 @@ mod tests {
         HistoryRepo::open_or_init_in(&tmp.join("state"))
             .unwrap()
             .expect("git is required for these tests")
+    }
+
+    #[test]
+    fn merge_tree_never_writes_conflict_markers_into_saved_objects() {
+        // Encryption is randomized, so two machines saving the same file hold
+        // different ciphertext. Git sees a conflict; its text merge must not
+        // become a saved version that no envelope parser can read.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = repo(tmp.path());
+        let path = "home/secret";
+        let commit = |bytes: &[u8], parents: Vec<&str>| {
+            let blob = repo.hash_blob(bytes).unwrap();
+            let tree = repo
+                .write_tree(&[("100644".into(), blob, path.into())])
+                .unwrap();
+            repo.commit_tree(&tree, parents, "save").unwrap()
+        };
+        let base = commit(b"mise-encrypted-file-v1\nbase\n", vec![]);
+        let local = commit(b"mise-encrypted-file-v1\nlocal\n", vec![&base]);
+        let remote = commit(b"mise-encrypted-file-v1\nremote\n", vec![&base]);
+        let (merged, conflicts) = repo.merge_tree(&local, &remote).unwrap();
+        assert_eq!(conflicts, vec![path.to_string()]);
+        assert_eq!(
+            repo.object_at(&merged, path).unwrap(),
+            repo.object_at(&local, path).unwrap(),
+        );
     }
 
     fn root(label: &str, path: &Path, files: &[&str]) -> CaptureRoot {
