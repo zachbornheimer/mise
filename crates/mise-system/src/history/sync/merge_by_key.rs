@@ -711,6 +711,88 @@ fn an_encrypted_json_add_is_stored_encrypted() {
     );
 }
 
+/// Two machines edit different regions of one encrypted **text** file. The
+/// path settles: the merge is made on the decrypted sides and stored as one
+/// envelope. A text path has no keys, so `merge_by_key` reports
+/// `Inapplicable`; without a fallback the path stays a repository conflict
+/// and `incoming_repository_tree` pauses every machine at its next sync.
+#[test]
+fn non_overlapping_edits_to_one_encrypted_text_file_settle() {
+    let (_dir, repo) = open();
+    let (_environment, key) = age_key();
+    let path = "home/.agents/sync-probe/4b-regions.txt";
+    let base = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n";
+    let local = "MAC-LINE\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n";
+    let remote = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nVPS-LINE\n";
+    let base_sealed = seal(&repo, path, base.as_bytes(), &key);
+    let local_sealed = seal(&repo, path, local.as_bytes(), &key);
+    let remote_sealed = seal(&repo, path, remote.as_bytes(), &key);
+    let base_commit = {
+        let commit = commit(&repo, None, &[(path, &base_sealed)]);
+        let tree = repo.output_tree_of(&commit).unwrap();
+        let tree = manifest_tree(&repo, &tree, path, &key);
+        repo.commit_tree(&tree, vec![], "saved encrypted").unwrap()
+    };
+    let local_commit = {
+        let parent_tree = repo.output_tree_of(&base_commit).unwrap();
+        let tree = repo
+            .compose(
+                &parent_tree,
+                &[Overlay {
+                    path: path.into(),
+                    object: Some(local_sealed.clone()),
+                }],
+            )
+            .unwrap();
+        repo.commit_tree(&tree, vec![&base_commit], "local encrypted")
+            .unwrap()
+    };
+    let remote_commit = {
+        let parent_tree = repo.output_tree_of(&base_commit).unwrap();
+        let tree = repo
+            .compose(
+                &parent_tree,
+                &[Overlay {
+                    path: path.into(),
+                    object: Some(remote_sealed.clone()),
+                }],
+            )
+            .unwrap();
+        repo.commit_tree(&tree, vec![&base_commit], "remote encrypted")
+            .unwrap()
+    };
+    let (merged, conflicts) = repo.merge_tree(&local_commit, &remote_commit).unwrap();
+    assert!(
+        conflicts.iter().any(|conflict| conflict == path),
+        "two sides of one ciphertext cannot be merged as text by Git: {conflicts:?}"
+    );
+    let (tree, remaining) = settle_conflicts(
+        &repo,
+        Some(&base_commit),
+        &local_commit,
+        &remote_commit,
+        &merged,
+        conflicts,
+    )
+    .unwrap();
+    assert!(
+        remaining.is_empty(),
+        "an encrypted text path must settle, not pause the repository: {remaining:?}"
+    );
+    let saved = repo.object_at(&tree, path).unwrap().unwrap();
+    assert!(
+        repo.blob_starts_with(&saved.1, files::MAGIC).unwrap(),
+        "the settled object must stay an encrypted envelope"
+    );
+    let plain = files::decrypt(&repo, path, &saved, false).unwrap();
+    let text = String::from_utf8(repo.cat_object(&plain.1).unwrap()).unwrap();
+    assert_eq!(
+        text,
+        "MAC-LINE\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nVPS-LINE\n"
+    );
+    assert!(!text.contains("<<<<<<<"));
+}
+
 fn age_key() -> (mise_util::testing::EnvVarGuard, age::x25519::Identity) {
     use age::secrecy::ExposeSecret;
     let key = age::x25519::Identity::generate();

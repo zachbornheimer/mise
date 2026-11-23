@@ -4,11 +4,12 @@ use std::path::PathBuf;
 use eyre::{Result, bail};
 
 use super::layout::{Located, Roots};
+use super::run::SkippedPath;
 use crate::history::{
     journal,
     manifest::Manifest,
     shadow::HistoryRepo,
-    tracked::{ExcludeSet, TrackedEntry, TrackedSet, governing_key, mode_from},
+    tracked::{ExcludeSet, TrackedEntry, TrackedSet, governing_key, mode_from, recorded_mode_from},
 };
 
 #[derive(Clone, Debug)]
@@ -121,9 +122,19 @@ fn present(
     Ok(found)
 }
 
-pub(super) fn plan(repo: &HistoryRepo, tracked: &TrackedSet, tree: &str) -> Result<Vec<Step>> {
+/// What a pull does with directory permissions: the steps it applies, and
+/// the directories it leaves alone because their live mode is a local
+/// change this machine never saved.
+pub(super) struct Plan {
+    pub steps: Vec<Step>,
+    pub skipped: Vec<SkippedPath>,
+}
+pub(super) fn plan(repo: &HistoryRepo, tracked: &TrackedSet, tree: &str) -> Result<Plan> {
     if !cfg!(unix) {
-        return Ok(vec![]);
+        return Ok(Plan {
+            steps: vec![],
+            skipped: vec![],
+        });
     }
     let local = repo.ref_oid(HistoryRepo::HISTORY_REF)?;
     let saved = local
@@ -135,6 +146,7 @@ pub(super) fn plan(repo: &HistoryRepo, tracked: &TrackedSet, tree: &str) -> Resu
     let roots = Roots::current();
     let exclude = tracked.exclude_set()?;
     let mut steps = vec![];
+    let mut skipped = vec![];
     let paths: std::collections::BTreeSet<_> = tracked
         .manifest
         .permissions
@@ -143,18 +155,18 @@ pub(super) fn plan(repo: &HistoryRepo, tracked: &TrackedSet, tree: &str) -> Resu
         .collect();
     // every directory some record names, when this machine's enrollment
     // covers it and the incoming tree holds it in a stream selected here
-    let mut directories: std::collections::BTreeSet<PathBuf> = Default::default();
+    let mut directories: std::collections::BTreeMap<PathBuf, String> = Default::default();
     for portable in paths {
         if claim(&roots, tracked, &exclude, portable).is_none() {
             continue;
         }
         let path = roots.locate(portable).path().unwrap().to_path_buf();
         if present(repo, tree, &roots, &tracked.entries, &path)? {
-            directories.insert(path);
+            directories.entry(path).or_insert_with(|| portable.clone());
         }
     }
     let saved_entries = saved.selected_entries()?;
-    for path in directories {
+    for (path, portable) in directories {
         let before = observe(&path)?;
         let desired = mode_from(
             &roots,
@@ -168,9 +180,9 @@ pub(super) fn plan(repo: &HistoryRepo, tracked: &TrackedSet, tree: &str) -> Resu
             continue;
         }
         // The guard has one purpose: never overwrite a live mode the user has
-        // not saved. The baseline is the mode this planner would have applied
-        // from the saved manifest; a directory it does not cover has none,
-        // and a directory that does not exist live has nothing to guard.
+        // not saved. Only a mode this machine *recorded* can be unsaved: a
+        // directory with no record has nothing to lose, and a directory that
+        // does not exist live has nothing to guard.
         let Some((_, _, live)) = before else {
             steps.push(Step {
                 path,
@@ -180,12 +192,21 @@ pub(super) fn plan(repo: &HistoryRepo, tracked: &TrackedSet, tree: &str) -> Resu
             });
             continue;
         };
-        let baseline = mode_from(&roots, &saved_entries, &saved.permissions, &path);
-        if baseline.is_some_and(|bits| bits != live) {
-            bail!(
-                "{} has unsaved directory permission changes; save them before pulling. Sharing is paused",
-                mise_util::file::display_path(&path)
-            );
+        // A recorded mode the live directory no longer wears is an unsaved
+        // local change. Leave that one directory alone and settle the rest:
+        // pausing the whole pull here would stall every unrelated path for a
+        // decision only this directory needs.
+        if let Some(recorded) =
+            recorded_mode_from(&roots, &saved_entries, &saved.permissions, &path)
+                .filter(|recorded| *recorded != live)
+        {
+            skipped.push(SkippedPath {
+                branch_path: portable,
+                reason: format!(
+                    "unsaved directory permissions: the record says {recorded:#o}, the directory is live as {live:#o}; the incoming mode was left unapplied and every other path settled — `mise dot save` keeps the live mode"
+                ),
+            });
+            continue;
         }
         steps.push(Step {
             path,
@@ -195,7 +216,7 @@ pub(super) fn plan(repo: &HistoryRepo, tracked: &TrackedSet, tree: &str) -> Resu
         });
     }
     steps.sort_by_key(|step| step.path.components().count());
-    Ok(steps)
+    Ok(Plan { steps, skipped })
 }
 
 impl Step {
@@ -391,7 +412,7 @@ mod tests {
             manifest: manifest.clone(),
             ..Default::default()
         };
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].path, private);
         assert_eq!(steps[0].desired, 0o700);
@@ -406,7 +427,7 @@ mod tests {
             manifest: manifest.clone(),
             ..tracked
         };
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].desired, 0o755);
 
@@ -425,7 +446,7 @@ mod tests {
             .insert(own.replace("@linux/", "@macos/"), 0o700);
         let head = local.write(&repo, &files)?;
         repo.write_checkpoint(Some(&head), &test_checkpoint("local", Some(&head)))?;
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].path, private);
         assert_eq!(steps[0].desired, 0o755);
@@ -518,16 +539,20 @@ mod tests {
             manifest: incoming,
             ..Default::default()
         };
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].path, private);
         assert_eq!(steps[0].desired, 0o750);
         // a chmod away from the containing baseline is still unsaved
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o711))?;
-        let err = plan(&repo, &tracked, &tree).unwrap_err();
+        let planned = plan(&repo, &tracked, &tree)?;
         assert!(
-            err.to_string().contains("unsaved directory permission"),
-            "{err}"
+            planned
+                .skipped
+                .iter()
+                .any(|skip| skip.reason.contains("unsaved directory permissions")),
+            "the unsaved directory must be skipped and reported: {:?}",
+            planned.skipped
         );
         Ok(())
     }
@@ -597,7 +622,7 @@ mod tests {
             manifest,
             ..Default::default()
         };
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].path, private);
         assert_eq!(steps[0].desired, 0o700);
@@ -629,7 +654,9 @@ mod tests {
         let configs = normalize(scratch.path()).join("configs");
         let private = configs.join("private");
         std::fs::create_dir_all(&private)?;
-        // the directory was saved at the default; the chmod below is unsaved
+        // the directory was saved at the default, recorded explicitly: an
+        // absent record is not a saved 0755, so the chmod is unsaved only
+        // because this checkpoint wrote the mode
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))?;
         let entry = TrackedEntry::new(
             configs.clone(),
@@ -676,6 +703,7 @@ mod tests {
                     include: None,
                 },
             ],
+            permissions: std::collections::BTreeMap::from([(key.clone(), 0o755)]),
             ..Default::default()
         };
         let head = manifest.write(&repo, &files)?;
@@ -687,14 +715,18 @@ mod tests {
             manifest,
             ..Default::default()
         };
-        let err = plan(&repo, &tracked, &tree).unwrap_err();
+        let planned = plan(&repo, &tracked, &tree)?;
         assert!(
-            err.to_string().contains("unsaved directory permission"),
-            "{err}"
+            planned
+                .skipped
+                .iter()
+                .any(|skip| skip.reason.contains("unsaved directory permissions")),
+            "the unsaved directory must be skipped and reported: {:?}",
+            planned.skipped
         );
         // saved and live agree on the default: the incoming mode is planned
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o755))?;
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].desired, 0o750);
         Ok(())
@@ -780,7 +812,7 @@ mod tests {
             ..Default::default()
         };
         // a fresh machine: no directory step is planned for the file's path
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert!(steps.iter().all(|step| step.path != platform), "{steps:?}");
         Ok(())
     }
@@ -856,7 +888,7 @@ mod tests {
             manifest,
             ..Default::default()
         };
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].path, private);
         assert_eq!(steps[0].desired, 0o700);
@@ -934,7 +966,7 @@ mod tests {
             manifest: adopted.clone(),
             ..Default::default()
         };
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         let applied = steps[0].desired;
         // the planner's own outcome is the live state after adoption
@@ -949,7 +981,7 @@ mod tests {
             manifest: incoming,
             ..tracked
         };
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert!(
             steps.iter().all(|step| step.path != private) || steps[0].desired == applied,
             "an enrolled directory ignores the containing record: {steps:?}"
@@ -981,7 +1013,7 @@ mod tests {
             manifest: adopted.clone(),
             ..Default::default()
         };
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].desired, 0o750);
         std::fs::create_dir(&private)?;
@@ -999,7 +1031,7 @@ mod tests {
             manifest: incoming,
             ..tracked
         };
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].path, private);
         assert_eq!(steps[0].desired, 0o700);
@@ -1085,14 +1117,18 @@ mod tests {
             manifest: incoming,
             ..Default::default()
         };
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].desired, 0o750);
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o711))?;
-        let err = plan(&repo, &tracked, &tree).unwrap_err();
+        let planned = plan(&repo, &tracked, &tree)?;
         assert!(
-            err.to_string().contains("unsaved directory permission"),
-            "{err}"
+            planned
+                .skipped
+                .iter()
+                .any(|skip| skip.reason.contains("unsaved directory permissions")),
+            "the unsaved directory must be skipped and reported: {:?}",
+            planned.skipped
         );
         Ok(())
     }
@@ -1181,17 +1217,21 @@ mod tests {
             manifest,
             ..Default::default()
         };
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].path, private);
         assert_eq!(steps[0].desired, 0o750);
-        // a real unsaved chmod on the enrolled stream is still reported
+        // the enrolled stream's record was dropped, so the chmod is not an
+        // unsaved change against a record: the incoming mode is planned
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o711))?;
-        let err = plan(&repo, &tracked, &tree).unwrap_err();
+        let planned = plan(&repo, &tracked, &tree)?;
         assert!(
-            err.to_string().contains("unsaved directory permission"),
-            "{err}"
+            planned.skipped.is_empty(),
+            "a dropped record must not pause: {:?}",
+            planned.skipped
         );
+        assert_eq!(planned.steps.len(), 1);
+        assert_eq!(planned.steps[0].desired, 0o750);
         Ok(())
     }
 
@@ -1282,15 +1322,19 @@ mod tests {
             ..Default::default()
         };
         // the live mode matches the local record under the old key: applied
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].desired, 0o750);
         // an unsaved chmod is still detected under the old key
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o711))?;
-        let err = plan(&repo, &tracked, &tree).unwrap_err();
+        let planned = plan(&repo, &tracked, &tree)?;
         assert!(
-            err.to_string().contains("unsaved directory permission"),
-            "{err}"
+            planned
+                .skipped
+                .iter()
+                .any(|skip| skip.reason.contains("unsaved directory permissions")),
+            "the unsaved directory must be skipped and reported: {:?}",
+            planned.skipped
         );
         Ok(())
     }
@@ -1357,7 +1401,7 @@ mod tests {
             manifest,
             ..Default::default()
         };
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].path, private);
         assert_eq!(steps[0].desired, 0o700);
@@ -1378,14 +1422,18 @@ mod tests {
             manifest: incoming,
             ..tracked
         };
-        let steps = plan(&repo, &tracked, &tree)?;
+        let steps = plan(&repo, &tracked, &tree)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].desired, 0o750);
         std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o711))?;
-        let err = plan(&repo, &tracked, &tree).unwrap_err();
+        let planned = plan(&repo, &tracked, &tree)?;
         assert!(
-            err.to_string().contains("unsaved directory permission"),
-            "{err}"
+            planned
+                .skipped
+                .iter()
+                .any(|skip| skip.reason.contains("unsaved directory permissions")),
+            "the unsaved directory must be skipped and reported: {:?}",
+            planned.skipped
         );
         Ok(())
     }
@@ -1448,20 +1496,24 @@ mod tests {
             manifest,
             ..Default::default()
         };
-        assert!(plan(&repo, &tracked, &incoming)?.is_empty());
+        assert!(plan(&repo, &tracked, &incoming)?.steps.is_empty());
 
-        // a different unsaved mode still pauses sharing
+        // a missing local record is not an unsaved change, whatever the
+        // live mode: the incoming mode is planned and nothing is skipped
         std::fs::set_permissions(&parent_path, std::fs::Permissions::from_mode(0o710))?;
-        let err = plan(&repo, &tracked, &incoming).unwrap_err();
+        let planned = plan(&repo, &tracked, &incoming)?;
         assert!(
-            err.to_string().contains("unsaved directory permission"),
-            "{err}"
+            planned.skipped.is_empty(),
+            "a missing record must not pause: {:?}",
+            planned.skipped
         );
+        assert_eq!(planned.steps.len(), 1);
+        assert_eq!(planned.steps[0].desired, 0o700);
 
         // the default matches the missing local record: the incoming mode
         // is applied
         std::fs::set_permissions(&parent_path, std::fs::Permissions::from_mode(0o755))?;
-        let steps = plan(&repo, &tracked, &incoming)?;
+        let steps = plan(&repo, &tracked, &incoming)?.steps;
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].path, parent_path);
         assert_eq!(steps[0].desired, 0o700);

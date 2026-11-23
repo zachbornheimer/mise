@@ -16,6 +16,7 @@ use super::SyncMode;
 use super::format::{self, RepoState};
 use super::layout::{Located, Roots, is_configuration};
 use super::network::{PushOutcome, Remote, UPSTREAM_REF};
+use super::publish_skip_reason::PublishSkip;
 use super::reconcile::{self, Conflict, Object, PathPlan};
 use super::{publish, share, state};
 use crate::history::checkpoint::Store;
@@ -110,6 +111,11 @@ pub struct SyncStatus {
     pub validation_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_publish: Option<String>,
+    /// Why the latest sync did not publish, when something blocked it. A
+    /// skip is not an error: `last_error` stays empty. Absent when the
+    /// sync published or had nothing to publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish_skipped: Option<PublishSkip>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_fetch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -224,6 +230,8 @@ mod status_read_tests {
 #[derive(Debug, Default)]
 pub struct SyncOutcome {
     pub published: Option<String>,
+    /// What blocked publication before anything was built.
+    pub publish_skipped: Option<PublishSkip>,
     /// Incoming changes waiting for `mise dot pull`, counting the
     /// repository's own changes as one.
     pub pending: usize,
@@ -612,16 +620,18 @@ fn sync_locked_waiting(
             if observed != sync_state {
                 state::save(repo, &observed, "observed identical versions")?;
             }
-            if !publish
-                || status.pending_repository
-                || status.application_failure.is_some()
-                || status.validation_error.is_some()
-                // Publication must wait for the entire incoming setup, not
-                // just configuration or encrypted paths. A merge cannot be
-                // acknowledged while its live application is still pending.
-                || plans.iter().any(|plan| plan.apply.is_some())
-                || plans.iter().any(|plan| plan.conflict.is_some())
-            {
+            let gate = if request.offline {
+                Some(PublishSkip::Offline)
+            } else if !publish {
+                Some(PublishSkip::FetchOnly)
+            } else {
+                None
+            };
+            // Publication must wait for the entire incoming setup, not
+            // just configuration or encrypted paths. A merge cannot be
+            // acknowledged while its live application is still pending.
+            if let Some(skip) = PublishSkip::detect(gate, &status, &plans) {
+                outcome.publish_skipped = Some(skip);
                 break;
             }
             let accepted = plans
@@ -695,6 +705,7 @@ fn sync_locked_waiting(
             }
         }
         status.upstream_commit = upstream_commit.clone();
+        status.publish_skipped = outcome.publish_skipped.clone();
         record_pending(&mut status, &plans, &Roots::current(), &shared.objects());
         outcome.pending =
             status.pending_applications.len() + usize::from(status.pending_repository);
@@ -1086,6 +1097,19 @@ pub fn refresh_with_interaction(
     )?;
     status.upstream_commit = upstream.commit;
     record_pending(status, &plans, &Roots::current(), &shared.objects());
+    // a refresh that finds nothing left to wait for clears a reason recorded
+    // by an earlier sync; the next sync records a new one if it is blocked
+    if let Some(skip) = &status.publish_skipped {
+        let still_blocked = match skip {
+            PublishSkip::PendingApplications { .. } => !status.pending_applications.is_empty(),
+            PublishSkip::PendingRepository => status.pending_repository,
+            PublishSkip::Conflicts { .. } => !status.conflicts.is_empty(),
+            _ => true,
+        };
+        if !still_blocked {
+            status.publish_skipped = None;
+        }
+    }
     Ok(())
 }
 
@@ -1143,9 +1167,12 @@ fn prepare(
     status.pending_repository |= repository_tree.is_some();
     status.pending_directories = 0;
     if let Some(tree) = repository_tree.as_deref().or(heads.remote.as_deref()) {
-        status.pending_directories = super::directories::plan(repo, tracked, tree)
-            .inspect_err(|error| repository_conflict(status, error))?
-            .len();
+        let permissions = super::directories::plan(repo, tracked, tree)
+            .inspect_err(|error| repository_conflict(status, error))?;
+        status.pending_directories = permissions.steps.len();
+        // A directory whose live mode is unsaved is left alone and reported
+        // here, never a reason to stop the rest of the pull.
+        status.skipped.extend(permissions.skipped);
     }
     if heads.remote != upstream.commit {
         bail!("origin changed while planning; reconcile again");
@@ -1815,6 +1842,9 @@ pub(super) fn settle_conflicts(
 ) -> Result<(String, Vec<String>)> {
     let mut overlays = vec![];
     let mut settled = std::collections::BTreeSet::new();
+    // The manifest that lists an encrypted path's recipients lives in the local
+    // tree, and a re-seal reads them from there.
+    let local_tree = repo.output_tree_of(local)?;
     for path in &conflicts {
         if path == crate::history::manifest::PATH {
             continue;
@@ -1901,8 +1931,8 @@ pub(super) fn settle_conflicts(
                         continue;
                     }
                     let object = if local_encrypted {
-                        let tree = repo.output_tree_of(local)?;
-                        let recipients = super::files::recipients_of(repo, &tree, path, &saved)?;
+                        let recipients =
+                            super::files::recipients_of(repo, &local_tree, path, &saved)?;
                         let scheme = super::files::scheme_of(repo, &saved)?;
                         super::files::seal(repo, path, &mode, &text, &scheme, &recipients)?
                     } else {
@@ -1923,40 +1953,25 @@ pub(super) fn settle_conflicts(
         }
         // A symlink, a binary file, and a mode change are not text to merge.
         // A regular file whose sides changed different lines is merged here
-        // exactly as Git used to, before -merge kept one side instead.
-        // An envelope is valid UTF-8, so the text check below would merge it.
-        // It is never text: its comparison happened above, after decryption.
-        let encrypted = repo.blob_starts_with(&saved.1, super::files::MAGIC)?
-            || repo.blob_starts_with(&theirs.1, super::files::MAGIC)?;
-        let merged_text = if !encrypted
-            && saved.0 == theirs.0
-            && saved.0 != "120000"
-            && let Some(base) = base
-            && let Some(base) = repo.object_at(base, path)?
-            && base.0 == saved.0
-            && !repo.blob_starts_with(&base.1, super::files::MAGIC)?
+        // exactly as Git used to, before -merge kept one side instead. An
+        // envelope is decrypted first and sealed again: this is the merge for
+        // every text path, and a structured path has already merged by key.
+        if let Some(base) = base
+            && let Some(base_object) = repo.object_at(base, path)?
+            && let Some(object) = super::files::merge_lines(
+                repo,
+                path,
+                &base_object,
+                &saved,
+                &theirs,
+                false,
+                &local_tree,
+            )?
         {
-            let (base_bytes, saved_bytes, remote_bytes) = (
-                repo.cat_object(&base.1)?,
-                repo.cat_object(&saved.1)?,
-                repo.cat_object(&theirs.1)?,
-            );
-            if super::files::utf8_text(&base_bytes)
-                && super::files::utf8_text(&saved_bytes)
-                && super::files::utf8_text(&remote_bytes)
-            {
-                repo.merge3(&base_bytes, &saved_bytes, &remote_bytes)?
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some(text) = merged_text {
             settled.insert(path.clone());
             overlays.push(crate::history::shadow::Overlay {
                 path: path.clone(),
-                object: Some((saved.0.clone(), repo.store_blob(&text)?)),
+                object: Some(object),
             });
         }
     }
@@ -2036,6 +2051,8 @@ fn unsaved_paths(
 #[cfg(test)]
 mod capture_tests {
     use super::*;
+    use crate::history::shadow::HistoryRepo;
+    use crate::history::tracked::TrackedEntry;
 
     #[test]
     fn publication_checks_live_variant_encryption_even_without_a_new_capture() -> Result<()> {
@@ -2063,6 +2080,195 @@ mod capture_tests {
         };
         assert!(audit_publication(repo, &head, &tracked).is_err());
         Ok(())
+    }
+
+    struct Replay {
+        _temp: tempfile::TempDir,
+        repo: HistoryRepo,
+        regions: String,
+        other: String,
+        tree: String,
+        held: Vec<String>,
+    }
+
+    /// Two commits from one base, then the repository merge the sync adopts.
+    fn replay(base: &str, local: &str, remote: &str, other_remote: &str) -> Replay {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(temp.path()).unwrap().unwrap();
+        let roots = Roots::current();
+        let regions = roots
+            .branch_path(&roots.home.join(".agents/sync-probe/4b-regions.txt"), None)
+            .unwrap();
+        let other = roots
+            .branch_path(&roots.home.join(".agents/sync-probe/other.txt"), None)
+            .unwrap();
+        let tree_of = |regions_text: &str, other_text: &str| {
+            repo.write_tree(&[
+                (
+                    "100644".into(),
+                    repo.hash_blob(regions_text.as_bytes()).unwrap(),
+                    regions.clone(),
+                ),
+                (
+                    "100644".into(),
+                    repo.hash_blob(other_text.as_bytes()).unwrap(),
+                    other.clone(),
+                ),
+            ])
+            .unwrap()
+        };
+        let base_commit = repo
+            .commit_tree(&tree_of(base, "shared\n"), vec![], "base")
+            .unwrap();
+        let local_commit = repo
+            .commit_tree(&tree_of(local, "shared\n"), vec![&base_commit], "local")
+            .unwrap();
+        let remote_commit = repo
+            .commit_tree(&tree_of(remote, other_remote), vec![&base_commit], "remote")
+            .unwrap();
+        repo.update_ref(HistoryRepo::HISTORY_REF, &local_commit, None)
+            .unwrap();
+        repo.update_ref(UPSTREAM_REF, &remote_commit, None).unwrap();
+        let tracked = TrackedSet {
+            entries: vec![TrackedEntry::new(
+                roots.home.join(".agents/sync-probe"),
+                "track",
+                crate::files::FilePolicy::for_mode(crate::files::FileMode::Track),
+            )],
+            ..Default::default()
+        };
+        let heads = crate::history::sync::graph::Heads::read(&repo).unwrap();
+        let (git_tree, conflicts) = repo
+            .merge_tree(
+                heads.local.as_deref().unwrap(),
+                heads.remote.as_deref().unwrap(),
+            )
+            .unwrap();
+        let (settled, held) = settle_conflicts(
+            &repo,
+            heads.base.as_deref(),
+            heads.local.as_deref().unwrap(),
+            heads.remote.as_deref().unwrap(),
+            &git_tree,
+            conflicts,
+        )
+        .unwrap();
+        let tree = incoming_repository_tree(&repo, &tracked)
+            .expect("a plaintext replay must not pause the repository")
+            .unwrap_or(settled);
+        Replay {
+            _temp: temp,
+            repo,
+            regions,
+            other,
+            tree,
+            held,
+        }
+    }
+
+    impl Replay {
+        fn text(&self, path: &str) -> String {
+            let object = self.repo.object_at(&self.tree, path).unwrap().unwrap();
+            String::from_utf8(self.repo.cat_object(&object.1).unwrap()).unwrap()
+        }
+    }
+
+    /// Two machines edit different regions of one plaintext file from a known
+    /// base. Both edits land, and the other path keeps syncing.
+    #[test]
+    fn non_overlapping_edits_to_one_plaintext_file_merge() {
+        let base = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n";
+        let seen = replay(
+            base,
+            "MAC-LINE\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n",
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nVPS-LINE\n",
+            "remote-only\n",
+        );
+        assert_eq!(
+            seen.text(&seen.regions),
+            "MAC-LINE\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nVPS-LINE\n"
+        );
+        assert_eq!(seen.text(&seen.other), "remote-only\n");
+        assert!(!seen.text(&seen.regions).contains("<<<<<<<"));
+    }
+    /// The same edit on both machines converges without a conflict.
+    #[test]
+    fn identical_edits_to_one_plaintext_file_converge() {
+        let same = "SAME\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n";
+        let seen = replay(
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n",
+            same,
+            same,
+            "shared\n",
+        );
+        assert_eq!(seen.text(&seen.regions), same);
+        assert!(!seen.held.iter().any(|path| path == &seen.regions));
+    }
+
+    /// An edit of the same line stays a conflict, and only that path is held.
+    #[test]
+    fn same_line_edits_conflict_only_that_path() {
+        let seen = replay(
+            "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n",
+            "MAC-VERSION\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n",
+            "VPS-VERSION\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\nline 8\n",
+            "remote-only\n",
+        );
+        assert_eq!(seen.held, vec![seen.regions.clone()]);
+        assert_eq!(seen.text(&seen.other), "remote-only\n");
+        assert!(!seen.text(&seen.regions).contains("<<<<<<<"));
+    }
+    /// An encrypted path is not text-merged, even when its plaintext edits
+    /// would not overlap.
+    #[test]
+    fn an_encrypted_path_is_not_text_merged() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = HistoryRepo::open_or_init_in(temp.path()).unwrap().unwrap();
+        let roots = Roots::current();
+        let path = roots
+            .branch_path(&roots.home.join(".agents/sync-probe/secret.txt"), None)
+            .unwrap();
+        let key = age::x25519::Identity::generate();
+        let recipients: Vec<Box<dyn age::Recipient + Send>> = vec![Box::new(key.to_public())];
+        let seal = |text: &str| {
+            crate::history::sync::files::encode(
+                &path,
+                "100644",
+                text.as_bytes(),
+                "test",
+                &recipients,
+            )
+            .unwrap()
+        };
+        let tree_of = |text: &str| {
+            repo.write_tree(&[(
+                "100644".into(),
+                repo.hash_blob(&seal(text)).unwrap(),
+                path.clone(),
+            )])
+            .unwrap()
+        };
+        let base = repo
+            .commit_tree(&tree_of("base\n"), vec![], "base")
+            .unwrap();
+        let local = repo
+            .commit_tree(&tree_of("local line\n"), vec![&base], "local")
+            .unwrap();
+        let remote = repo
+            .commit_tree(&tree_of("remote line\n"), vec![&base], "remote")
+            .unwrap();
+        repo.update_ref(HistoryRepo::HISTORY_REF, &local, None)
+            .unwrap();
+        repo.update_ref(UPSTREAM_REF, &remote, None).unwrap();
+        let (merged, conflicts) = repo.merge_tree(&local, &remote).unwrap();
+        assert!(
+            conflicts.iter().any(|conflict| conflict == &path),
+            "{conflicts:?}"
+        );
+        let object = repo.object_at(&merged, &path).unwrap().unwrap();
+        let bytes = repo.cat_object(&object.1).unwrap();
+        assert!(!bytes.windows(7).any(|window| window == b"<<<<<<<"));
+        assert_eq!(object.1, repo.object_at(&local, &path).unwrap().unwrap().1);
     }
 
     /// The decision a sync makes before it publishes: has a checkpoint been
