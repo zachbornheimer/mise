@@ -17,14 +17,26 @@ pub(super) fn sealed(repo: &HistoryRepo, object: &Object, path: &str) -> Result<
     let bytes = repo.cat_object_bounded(&object.1, agecrypt::MAX_ENCRYPTED_BYTES)?;
     Ok(bytes
         .strip_prefix(MAGIC)
-        .is_some_and(|body| alternatives(body, path).is_some()))
+        .is_some_and(|body| alternatives(body, path).is_some() || shared_prefix(body, path).is_some()))
 }
 
-fn alternatives(mut body: &[u8], path: &str) -> Option<()> {
+fn alternatives(body: &[u8], path: &str) -> Option<()> {
+    framed(body, b"", path)
+}
+
+/// Git keeps the envelope's leading bytes outside the markers when both
+/// sides share them up to a newline. Each side is that prefix plus its own
+/// bytes; the framing after the prefix is the same as a whole-envelope record.
+fn shared_prefix(body: &[u8], path: &str) -> Option<()> {
+    let start = body.windows(9).position(|bytes| bytes == b"\n<<<<<<< ")? + 1;
+    framed(&body[start..], &body[..start], path)
+}
+
+fn framed(mut body: &[u8], prefix: &[u8], path: &str) -> Option<()> {
     body = marker(body, b"<<<<<<< ")?;
-    body = alternative(body, path)?;
+    body = alternative(body, prefix, path)?;
     body = body.strip_prefix(b"=======\n")?;
-    body = alternative(body, path)?;
+    body = alternative(body, prefix, path)?;
     marker(body, b">>>>>>> ")?.is_empty().then_some(())
 }
 
@@ -37,13 +49,17 @@ fn marker<'a>(body: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     body.get(40..)?.strip_prefix(b"\n")
 }
 
-fn alternative<'a>(body: &'a [u8], path: &str) -> Option<&'a [u8]> {
-    let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(body));
+fn alternative<'a>(body: &'a [u8], prefix: &[u8], path: &str) -> Option<&'a [u8]> {
+    let whole = [prefix, body].concat();
+    let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(whole.as_slice()));
     let envelope = Envelope::deserialize(&mut deserializer).ok()?;
     if !sealed_for(&envelope, path) {
         return None;
     }
-    let consumed = deserializer.get_ref().position() as usize;
+    let consumed = (deserializer.get_ref().position() as usize).checked_sub(prefix.len())?;
+    if consumed == 0 {
+        return None;
+    }
     let remaining = body.get(consumed..)?;
     // Git only inserts a newline when the complete envelope lacks one.
     // The envelope's own trailing LF belongs to MessagePack, not framing.
@@ -112,6 +128,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Both sides share the envelope's bytes up to its first newline, so Git
+    /// leaves that prefix outside the markers.
+    fn shared(left: &[u8], right: &[u8]) -> Vec<u8> {
+        let split = left.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+        assert_eq!(left[..split], right[..split], "fixture sides must share the prefix");
+        [&left[..split], &record(&left[split..], &right[split..])].concat()
+    }
+
+    fn with_ciphertext(tail: &[u8]) -> Vec<u8> {
+        let mut bytes = envelope(false);
+        let end = bytes.len() - 1;
+        bytes.splice(end..end, tail.iter().copied());
+        let bin = bytes.iter().position(|byte| *byte == 0xc4).unwrap();
+        bytes[bin + 1] += tail.len() as u8;
+        bytes
+    }
+
+    #[test]
+    fn accepts_conflict_markers_after_a_shared_envelope_prefix() {
+        let left = with_ciphertext(b"left");
+        let right = with_ciphertext(b"rite");
+        let record = shared(&left, &right);
+        assert!(alternatives(&record, PATH).is_none());
+        assert!(shared_prefix(&record, PATH).is_some());
+    }
+
+    #[test]
+    fn rejects_shared_prefix_records_with_broken_framing() {
+        let left = with_ciphertext(b"left");
+        let right = with_ciphertext(b"rite");
+        let valid = shared(&left, &right);
+        let mut trailing = valid.clone();
+        trailing.extend_from_slice(b"trailing");
+        assert!(shared_prefix(&trailing, PATH).is_none());
+        let separator = valid.windows(8).position(|bytes| bytes == b"=======\n").unwrap();
+        let mut missing = valid;
+        missing.drain(separator..separator + 8);
+        assert!(shared_prefix(&missing, PATH).is_none());
+        let other_path = shared(&left, &right);
+        assert!(shared_prefix(&other_path, "home/other").is_none());
     }
 
     #[test]
