@@ -34,7 +34,7 @@ pub(crate) fn build(
             return Ok(None);
         }
         if !allow_plaintext_history {
-            super::files::audit_history(repo, pinned, &Default::default())?;
+            super::files::audit_history(repo, pinned, upstream, &Default::default())?;
             super::secrets::audit_unpublished(
                 repo,
                 pinned,
