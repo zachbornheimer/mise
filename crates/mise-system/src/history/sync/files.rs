@@ -522,6 +522,43 @@ pub(crate) fn encode(
 
 #[cfg(test)]
 mod tests {
+    /// Scratch only: audit a copied history store. `MISE_AUDIT_STATE` is a
+    /// directory holding `history/repo.git`; `MISE_AUDIT_HEADS` lists refs.
+    #[test]
+    #[ignore]
+    fn scratch_audit_real_history_copy() {
+        if let Ok(list) = std::env::var("MISE_AUDIT_MARKED") {
+            let state = std::env::var("MISE_AUDIT_STATE").unwrap();
+            let repo = HistoryRepo::open_or_init_in(std::path::Path::new(&state))
+                .unwrap()
+                .unwrap();
+            let (mut ok, mut bad) = (0, Vec::new());
+            for line in std::fs::read_to_string(list).unwrap().lines() {
+                let (oid, path) = line.split_once('\t').unwrap();
+                let object = ("100644".to_string(), oid.to_string());
+                match conflicts::sealed(&repo, &object, path) {
+                    Ok(true) => ok += 1,
+                    other => bad.push(format!("{oid} {path} {other:?}")),
+                }
+            }
+            println!("MARKED accepted={ok} rejected={}", bad.len());
+            for line in bad.iter().take(15) {
+                println!("REJECTED {line}");
+            }
+            return;
+        }
+        let state = std::env::var("MISE_AUDIT_STATE").expect("MISE_AUDIT_STATE");
+        let repo = HistoryRepo::open_or_init_in(std::path::Path::new(&state))
+            .unwrap()
+            .unwrap();
+        for head in std::env::var("MISE_AUDIT_HEADS").unwrap().split(',') {
+            let commit = repo.ref_oid(head).unwrap().expect(head);
+            match audit_history(&repo, &commit, &Default::default()) {
+                Ok(()) => println!("AUDIT {head} {commit}: ok"),
+                Err(error) => println!("AUDIT {head} {commit}: FAIL {error:#}"),
+            }
+        }
+    }
     fn encrypted_conflict(left: &[u8], right: &[u8]) -> Vec<u8> {
         let mut bytes = MAGIC.to_vec();
         bytes.extend_from_slice(b"<<<<<<< 1111111111111111111111111111111111111111\n");
