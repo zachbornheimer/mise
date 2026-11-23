@@ -621,6 +621,16 @@ impl Manifest {
         Self::from_bytes(&bytes).map(Some)
     }
 
+    /// [`Self::read`] through an already open repository.
+    pub(crate) fn read_in(objects: &gix::Repository, tree: &str) -> Result<Option<Self>> {
+        let id = gix::ObjectId::from_hex(tree.as_bytes())?;
+        let Some(object) = objects.try_find_object(id)? else {
+            return Ok(None);
+        };
+        let tree = object.peel_to_tree()?;
+        Self::read_gix(&tree)
+    }
+
     pub(crate) fn read_gix(tree: &gix::Tree<'_>) -> Result<Option<Self>> {
         let Some(entry) = tree.lookup_entry_by_path(PATH)? else {
             return Ok(None);
@@ -659,7 +669,7 @@ impl Manifest {
         Ok(())
     }
 
-    fn read_gix_entry(entry: &gix::object::tree::Entry<'_>) -> Result<Self> {
+    pub(crate) fn read_gix_entry(entry: &gix::object::tree::Entry<'_>) -> Result<Self> {
         if entry.mode().value() != 0o100644 {
             bail!("dotfile enrollment metadata must be a regular file");
         }

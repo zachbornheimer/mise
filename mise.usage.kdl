@@ -969,11 +969,26 @@ Runs the command with your terminal and environment and saves a checkpoint befor
             long_help #"""
 Compare both sides of a sync conflict
 
-Prints a unified diff from this machine's saved version to the version fetched from the origin. `--difftool` opens the comparison in Git's configured diff tool; when `diff.tool` is unset, Git falls back to `merge.tool`. This command changes neither side. Resolve a conflict with `mise dot pull --take-remote` or `--keep-local`.
+Prints a unified diff from this machine's saved version to the version fetched from the origin. `--difftool` opens the comparison in Git's configured diff tool; when `diff.tool` is unset, Git falls back to `merge.tool`. `--json` prints one record per conflict, with the commands that resolve it, and writes nothing. `--sides` writes each side's plaintext into a private directory and reports those paths. Encrypted sides are decrypted before a diff, a diff tool, or a side file sees them. This command changes neither saved side. Resolve a conflict with `mise dot pull --take-remote` or `--keep-local`.
 """#
             flag --difftool help="Open the comparison in Git's configured diff or merge tool"
             flag --tool help="Use this Git diff tool instead of the configured default" requires=--difftool {
                 arg <TOOL>
+            }
+            flag --json help="Print one JSON record per conflict, with the commands that resolve it" {
+                long_help #"""
+Print one JSON record per conflict, with the commands that resolve it
+
+Writes nothing on its own. Each record names the live path, the history path, the kind, any detail, whether the saved object is encrypted, and each side's mode. It never includes file content.
+"""#
+            }
+            flag --sides help="Write each side's plaintext into a new directory and report the paths" requires=--json {
+                long_help #"""
+Write each side's plaintext into a new directory and report the paths
+
+`DIR` must not exist. mise creates it at mode 0700 and each side file at mode 0600. An existing path, including a directory or symlink, is refused. Requires `--json`.
+"""#
+                arg <DIR>
             }
             flag "-h --help" help="Print help" action=help builtin=#true
             arg "[PATH]…" help="Only inspect these conflicted paths" required=#false var=#true
@@ -981,6 +996,8 @@ Prints a unified diff from this machine's saved version to the version fetched f
             example "mise dot conflicts ~/.zshrc" help="Show one conflicted file"
             example "mise dot conflicts --difftool ~/.zshrc" help="Open the comparison in Git's diff tool"
             example "mise dot conflicts --difftool --tool meld ~/.zshrc" help="Use a specific diff tool"
+            example "mise dot conflicts --json" help="Print each conflict and the commands that resolve it"
+            example "mise dot conflicts --json --sides /tmp/sides" help="Write each side's plaintext beside the JSON handoff"
         }
         cmd diff help="Show what `mise dot apply` would change" effect=read {
             long_help #"""
@@ -1294,6 +1311,14 @@ Resolve every remaining conflict by keeping this machine's version
 Paths named by `--take-remote` take the origin's version; every other conflict keeps this machine's. Each kept path must already be saved.
 """#
             }
+            flag --wait help="Wait this long for a running sync or pull instead of failing" {
+                long_help #"""
+Wait this long for a running sync or pull instead of failing
+
+Accepts a duration such as `90s`, `5m` or `1h` (at most one hour). Without it the wait is `history.lock_wait`, 30 seconds by default; `0` fails at once. The refusal names the holder either way.
+"""#
+                arg <DURATION>
+            }
             flag "-h --help" help="Print help" action=help builtin=#true
             arg "[PATH]…" help="Not supported; a pull always applies every incoming change" required=#false var=#true hide=#true
             example "mise dot pull --dry-run" help="Show what would be written"
@@ -1405,6 +1430,14 @@ The watcher does this on its own in `sync` and `fetch-only` mode (the `history.s
             flag --fetch-only help="Fetch without pushing"
             flag --allow-plaintext-history help="Allow pushing older unencrypted versions of files that are now encrypted, and versions that look like they contain secrets"
             flag --best-effort help="Warn instead of failing when the origin is unreachable"
+            flag --wait help="Wait this long for a running sync or pull instead of failing" {
+                long_help #"""
+Wait this long for a running sync or pull instead of failing
+
+Accepts a duration such as `90s`, `5m` or `1h` (at most one hour). Without it the wait is `history.lock_wait`, 30 seconds by default; `0` fails at once. The refusal names the holder either way.
+"""#
+                arg <DURATION>
+            }
             flag "-h --help" help="Print help" action=help builtin=#true
             example "mise dot sync" help="Push and fetch now"
             example "mise dot sync --fetch-only" help="Fetch without pushing"
@@ -3186,11 +3219,26 @@ Runs the command with your terminal and environment and saves a checkpoint befor
         long_help #"""
 Compare both sides of a sync conflict
 
-Prints a unified diff from this machine's saved version to the version fetched from the origin. `--difftool` opens the comparison in Git's configured diff tool; when `diff.tool` is unset, Git falls back to `merge.tool`. This command changes neither side. Resolve a conflict with `mise dot pull --take-remote` or `--keep-local`.
+Prints a unified diff from this machine's saved version to the version fetched from the origin. `--difftool` opens the comparison in Git's configured diff tool; when `diff.tool` is unset, Git falls back to `merge.tool`. `--json` prints one record per conflict, with the commands that resolve it, and writes nothing. `--sides` writes each side's plaintext into a private directory and reports those paths. Encrypted sides are decrypted before a diff, a diff tool, or a side file sees them. This command changes neither saved side. Resolve a conflict with `mise dot pull --take-remote` or `--keep-local`.
 """#
         flag --difftool help="Open the comparison in Git's configured diff or merge tool"
         flag --tool help="Use this Git diff tool instead of the configured default" requires=--difftool {
             arg <TOOL>
+        }
+        flag --json help="Print one JSON record per conflict, with the commands that resolve it" {
+            long_help #"""
+Print one JSON record per conflict, with the commands that resolve it
+
+Writes nothing on its own. Each record names the live path, the history path, the kind, any detail, whether the saved object is encrypted, and each side's mode. It never includes file content.
+"""#
+        }
+        flag --sides help="Write each side's plaintext into a new directory and report the paths" requires=--json {
+            long_help #"""
+Write each side's plaintext into a new directory and report the paths
+
+`DIR` must not exist. mise creates it at mode 0700 and each side file at mode 0600. An existing path, including a directory or symlink, is refused. Requires `--json`.
+"""#
+            arg <DIR>
         }
         flag "-h --help" help="Print help" action=help builtin=#true
         arg "[PATH]…" help="Only inspect these conflicted paths" required=#false var=#true
@@ -3198,6 +3246,8 @@ Prints a unified diff from this machine's saved version to the version fetched f
         example "mise dot conflicts ~/.zshrc" help="Show one conflicted file"
         example "mise dot conflicts --difftool ~/.zshrc" help="Open the comparison in Git's diff tool"
         example "mise dot conflicts --difftool --tool meld ~/.zshrc" help="Use a specific diff tool"
+        example "mise dot conflicts --json" help="Print each conflict and the commands that resolve it"
+        example "mise dot conflicts --json --sides /tmp/sides" help="Write each side's plaintext beside the JSON handoff"
     }
     cmd diff help="Show what `mise dot apply` would change" effect=read {
         long_help #"""
@@ -3511,6 +3561,14 @@ Resolve every remaining conflict by keeping this machine's version
 Paths named by `--take-remote` take the origin's version; every other conflict keeps this machine's. Each kept path must already be saved.
 """#
         }
+        flag --wait help="Wait this long for a running sync or pull instead of failing" {
+            long_help #"""
+Wait this long for a running sync or pull instead of failing
+
+Accepts a duration such as `90s`, `5m` or `1h` (at most one hour). Without it the wait is `history.lock_wait`, 30 seconds by default; `0` fails at once. The refusal names the holder either way.
+"""#
+            arg <DURATION>
+        }
         flag "-h --help" help="Print help" action=help builtin=#true
         arg "[PATH]…" help="Not supported; a pull always applies every incoming change" required=#false var=#true hide=#true
         example "mise dot pull --dry-run" help="Show what would be written"
@@ -3622,6 +3680,14 @@ The watcher does this on its own in `sync` and `fetch-only` mode (the `history.s
         flag --fetch-only help="Fetch without pushing"
         flag --allow-plaintext-history help="Allow pushing older unencrypted versions of files that are now encrypted, and versions that look like they contain secrets"
         flag --best-effort help="Warn instead of failing when the origin is unreachable"
+        flag --wait help="Wait this long for a running sync or pull instead of failing" {
+            long_help #"""
+Wait this long for a running sync or pull instead of failing
+
+Accepts a duration such as `90s`, `5m` or `1h` (at most one hour). Without it the wait is `history.lock_wait`, 30 seconds by default; `0` fails at once. The refusal names the holder either way.
+"""#
+            arg <DURATION>
+        }
         flag "-h --help" help="Print help" action=help builtin=#true
         example "mise dot sync" help="Push and fetch now"
         example "mise dot sync --fetch-only" help="Fetch without pushing"

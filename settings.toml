@@ -1810,6 +1810,27 @@ it ends, its end-of-run lock attempt uses this setting.
 env = "MISE_HISTORY_LOCK_WAIT"
 type = "Duration"
 
+[history.network_timeout]
+default = "5m"
+description = "How long a history fetch, push, or remote listing may run before mise ends it."
+docs = """
+`mise dot sync`, `mise dot pull`, and the history watcher run `git fetch`,
+`git push`, and `git ls-remote` while they hold the sync lock. A transfer that
+does not finish within this time is ended, including the `ssh` or
+`git-remote-https` process it started, and the lock is released. The error
+names the Git command, how long it ran, and this setting.
+
+`0` waits without a limit. Values above `1h` count as `1h`. An HTTPS transfer
+that sends or receives nothing for 30 seconds also ends, whatever this is set
+to; SSH has no such stall check, so this setting is what bounds it.
+
+```sh
+MISE_HISTORY_NETWORK_TIMEOUT=30s mise dot sync
+```
+"""
+env = "MISE_HISTORY_NETWORK_TIMEOUT"
+type = "Duration"
+
 [history.notify]
 default = true
 description = "Show a desktop notification when a sync conflict pauses sharing."

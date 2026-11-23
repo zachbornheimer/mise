@@ -102,7 +102,10 @@ fn network_commands_override_hooks_with_a_private_directory() {
     assert!(Path::new(&internal).is_dir());
     assert_eq!(std::fs::read_dir(&internal).unwrap().count(), 0);
     let out = repo
-        .network_output(PlumbingCall::new(["config", "--get", "core.hooksPath"]))
+        .network_output(
+            PlumbingCall::new(["config", "--get", "core.hooksPath"]),
+            Some(std::time::Duration::from_secs(30)),
+        )
         .unwrap();
     assert!(out.status.success());
     let hooks = String::from_utf8(out.stdout).unwrap();

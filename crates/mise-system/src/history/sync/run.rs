@@ -24,7 +24,40 @@ use crate::history::store as hstore;
 use crate::history::tracked::{Asked, ExcludeSet, TrackedSet};
 use mise_util::file::display_path;
 
-const PUSH_RETRIES: usize = 5;
+/// How many times one sync re-plans because the local saved history moved
+/// while it planned. The watcher saves every edit, so a busy machine moves it
+/// often; a bound keeps a machine that never settles from looping forever.
+const REPLAN_LIMIT: usize = 20;
+
+/// How many times one sync may push before a rejection is final. Machines
+/// that publish together all lose the race except one; enough attempts let
+/// the losers fetch the winner and fast-forward instead of failing together.
+const PUSH_ATTEMPTS: usize = 8;
+
+/// Upper bound of the wait before the next fetch, in milliseconds, growing by
+/// retry and then capped. The first rejected push waits at most half a second.
+const REJECTION_DELAYS_MS: [u64; 3] = [500, 1_000, 2_000];
+const REJECTION_DELAY_CAP_MS: u64 = 3_000;
+
+/// How long to wait before fetching again after rejected publication `retry`
+/// (the first rejection is 1). `sample` picks a delay from the upper half of
+/// that retry's bound: `0` is the lower end and `u32::MAX` is the bound, so
+/// two machines that lose the same race do not fetch again together.
+fn rejection_delay(retry: u32, sample: u32) -> Duration {
+    let bound = REJECTION_DELAYS_MS
+        .get(retry.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or(REJECTION_DELAY_CAP_MS);
+    let lower = bound / 2;
+    let span = bound - lower;
+    Duration::from_millis(lower + (span * u64::from(sample)) / u64::from(u32::MAX))
+}
+
+/// Draws the wait for rejected publication `retry` and hands it to `wait`.
+/// Production sleeps; a test records the duration and returns.
+fn pause_after_rejection(retry: u32, wait: &mut impl FnMut(Duration)) {
+    wait(rejection_delay(retry, rand::random()));
+}
 
 /// An incoming change waiting for `mise dot pull` (or automatic
 /// application in `sync` mode).
@@ -221,6 +254,14 @@ pub struct SyncRequest {
     /// A preview: nothing is announced (the caller puts the recorded state
     /// back afterwards).
     pub dry_run: bool,
+    /// Wait in line behind a running sync or pull (`history.lock_wait`)
+    /// instead of failing at once. Commands someone runs queue; the watcher
+    /// does not, because it retries a contended sync on its own schedule.
+    pub queue: bool,
+    /// How long a queued sync waits for the lock before giving up; `None`
+    /// uses `history.lock_wait`. This is `--wait`, so a caller can bound a
+    /// wait longer or shorter than the setting.
+    pub wait: Option<Duration>,
 }
 
 impl SyncRequest {
@@ -232,6 +273,8 @@ impl SyncRequest {
             origin: None,
             offline: false,
             dry_run: false,
+            queue: false,
+            wait: None,
         }
     }
 }
@@ -255,10 +298,139 @@ pub fn origin() -> Result<OriginTomlConfig> {
     bail!("no setup repository is connected; `mise dot origin set <url>` connects one")
 }
 
+/// Whether the saved history has moved since `shared` was read from it. The
+/// watcher saves a checkpoint on every edit, so this is how a sync finds out
+/// that the plans built from `shared` no longer describe what would be
+/// published.
+fn head_moved(
+    repo: &crate::history::shadow::HistoryRepo,
+    shared: &share::ShareReport,
+) -> Result<bool> {
+    Ok(repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)? != shared.checkpoint)
+}
+
 /// Runs one synchronization.
 pub fn sync(store: &Store, tracked: &TrackedSet, request: &SyncRequest) -> Result<SyncOutcome> {
-    let _sync_lock = lock(store)?;
+    let asked = chrono::Utc::now();
+    let _sync_lock = if request.queue {
+        match lock_in(store.state_dir()) {
+            Ok(lock) => lock,
+            Err(_) => match wait_in_line(store, tracked, request, asked)? {
+                Queued::Lock(lock) => lock,
+                Queued::Served(outcome) => return Ok(outcome),
+            },
+        }
+    } else {
+        lock(store)?
+    };
     sync_locked(store, tracked, request)
+}
+
+enum Queued {
+    Lock(fslock::LockFile),
+    Served(SyncOutcome),
+}
+
+/// Waits for the sync lock behind a running sync, and stops waiting as soon
+/// as a sync that began after this one was asked has published what this
+/// machine had saved when it was asked. The lock is not first come, first
+/// served: polling waiters race for it, and one could lose to newer syncs
+/// until its wait ran out although each of them had already done its work.
+/// Checking while waiting needs no lock: `sync.json` is replaced
+/// atomically, and a sync writes it once, when it is done.
+fn wait_in_line(
+    store: &Store,
+    tracked: &TrackedSet,
+    request: &SyncRequest,
+    asked: chrono::DateTime<chrono::Utc>,
+) -> Result<Queued> {
+    // a dry run, an offline sync and a sync to another origin are not the
+    // sync whose result another one reports, so they only wait
+    let may_be_covered = !request.dry_run && !request.offline && request.origin.is_none();
+    // what this sync must publish is what is saved now, so save the live
+    // files first, as the sync itself would (skipped while another write
+    // operation holds the files, exactly as the sync would skip it)
+    if may_be_covered && request.capture {
+        capture_now(store, tracked);
+    }
+    let pinned = store
+        .repo()
+        .map(|repo| repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF))
+        .transpose()?
+        .flatten();
+    let publishes = SyncMode::current()?.publishes() && !request.fetch_only;
+    let wait = request
+        .wait
+        .unwrap_or_else(crate::history::scope::operation_lock_wait);
+    let deadline = Instant::now() + wait;
+    let mut seen_fetch = None;
+    loop {
+        if let Some(lock) = mise_util::lock_file::LockFile::at(&lock_path(store.state_dir()))
+            .with_pid()
+            .try_lock()?
+        {
+            return Ok(Queued::Lock(lock));
+        }
+        let status = read_status(store.state_dir())?;
+        if may_be_covered && status.last_fetch != seen_fetch {
+            seen_fetch = status.last_fetch.clone();
+            if let Some(outcome) = covered(store, &status, asked, pinned.as_deref(), publishes)? {
+                debug!("history sync: a sync that began after this one covered it");
+                return Ok(Queued::Served(outcome));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(contended(store.state_dir(), Some(wait)));
+        }
+        std::thread::sleep(STATUS_LOCK_POLL);
+    }
+}
+
+/// Whether the sync that last wrote `status` did this sync's work: it
+/// fetched after this sync was asked, succeeded, and (when this sync would
+/// publish) the origin holds `pinned`, the newest checkpoint saved when this
+/// sync was asked.
+fn covered(
+    store: &Store,
+    status: &SyncStatus,
+    asked: chrono::DateTime<chrono::Utc>,
+    pinned: Option<&str>,
+    publishes: bool,
+) -> Result<Option<SyncOutcome>> {
+    let fetched_since_asked = status
+        .last_fetch
+        .as_deref()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .is_some_and(|at| at >= asked);
+    if !fetched_since_asked || status.last_error.is_some() {
+        return Ok(None);
+    }
+    if publishes && let Some(pinned) = pinned {
+        let Some(repo) = store.repo() else {
+            return Ok(None);
+        };
+        let Some(upstream) = repo.ref_oid(UPSTREAM_REF)? else {
+            return Ok(None);
+        };
+        if upstream != pinned
+            && !repo
+                .merge_bases(pinned, &upstream)?
+                .iter()
+                .any(|base| base == pinned)
+        {
+            return Ok(None);
+        }
+    }
+    // Nothing was published and nothing was skipped by this sync: those
+    // fields, and any the mirror adds to the outcome, keep their defaults.
+    Ok(Some(SyncOutcome {
+        pending: status.pending_applications.len() + usize::from(status.pending_repository),
+        pending_repository: status.pending_repository,
+        pending_directories: status.pending_directories,
+        conflicts: status.conflicts.len(),
+        fetched_upstream: status.upstream_commit.clone(),
+        ..Default::default()
+    }))
 }
 
 /// Runs one synchronization while the caller holds the sync lock.
@@ -266,6 +438,27 @@ pub(crate) fn sync_locked(
     store: &Store,
     tracked: &TrackedSet,
     request: &SyncRequest,
+) -> Result<SyncOutcome> {
+    sync_locked_waiting(
+        store,
+        tracked,
+        request,
+        &mut std::thread::sleep,
+        &mut |_| {},
+    )
+}
+
+/// [`sync_locked`], with the wait a rejected publication takes before it
+/// fetches again and the hook that runs after each fetch. Production sleeps
+/// and does nothing after a fetch; a caller may record the wait and move the
+/// origin between the fetch and the push. The publication and the re-plan are
+/// unchanged.
+fn sync_locked_waiting(
+    store: &Store,
+    tracked: &TrackedSet,
+    request: &SyncRequest,
+    wait: &mut impl FnMut(Duration),
+    after_fetch: &mut impl FnMut(&str),
 ) -> Result<SyncOutcome> {
     // Synchronizing publishes and applies, so it does not run on a rule
     // set that could not be fully built: the missing rules are exactly
@@ -294,6 +487,7 @@ pub(crate) fn sync_locked(
             // synced with is not an empty upstream: reading it as one would
             // queue the deletion of every file it held
             let found = remote.fetch(&origin.branch)?;
+            after_fetch(&origin.url);
             if !found && status.upstream_commit.is_some() {
                 bail!(
                     "the setup branch `{}` is not at {} any more (renamed, or deleted?); nothing was changed. `mise dot origin set {} --branch <name>` follows a renamed branch",
@@ -340,7 +534,7 @@ pub(crate) fn sync_locked(
             super::origin::discard_contentless_history(repo)?;
         }
         let mut shared = share::current(repo, tracked)?;
-        let unsaved = unsaved_paths(repo, tracked, &shared)?;
+        let mut unsaved = unsaved_paths(repo, tracked, &shared)?;
         let publish = mode.publishes() && !request.fetch_only && !request.offline;
         if publish
             && !allow_plaintext_history
@@ -350,8 +544,48 @@ pub(crate) fn sync_locked(
         }
         let mut plans;
         let mut attempts = 0;
+        let mut replans = 0;
         loop {
             attempts += 1;
+            // The plans below are built from `shared`, the saved history as it
+            // was when it was read. A checkpoint saved since then (autosave
+            // keeps saving while a sync runs) was never examined by them, so
+            // publishing past it is unsafe and failing wastes the whole sync.
+            // Read the history again and plan again instead. Re-planning is not
+            // a rejected push, so it does not spend the push retries.
+            if head_moved(repo, &shared)?
+                && !shared.checkpoint.as_deref().is_some_and(|pinned| {
+                    publish::fast_forwards(
+                        repo,
+                        pinned,
+                        repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)
+                            .ok()
+                            .flatten()
+                            .as_deref(),
+                        upstream_commit.as_deref(),
+                    )
+                    .unwrap_or(false)
+                })
+            {
+                replans += 1;
+                if replans > REPLAN_LIMIT {
+                    bail!(
+                        "local saved history kept changing while planning ({REPLAN_LIMIT} re-plans); retry shortly"
+                    );
+                }
+                debug!("history sync: saved history moved while planning, planning again");
+                attempts -= 1;
+                shared = share::current(repo, tracked)?;
+                unsaved = unsaved_paths(repo, tracked, &shared)?;
+                if publish
+                    && !allow_plaintext_history
+                    && let Some(head) =
+                        repo.ref_oid(crate::history::shadow::HistoryRepo::HISTORY_REF)?
+                {
+                    audit_publication(repo, &head, tracked)?;
+                }
+                continue;
+            }
             let upstream = reconcile::upstream_with_interaction(
                 repo,
                 upstream_commit.as_deref(),
@@ -446,9 +680,13 @@ pub(crate) fn sync_locked(
                     )?;
                     break;
                 }
-                PushOutcome::Rejected(reason) if attempts < PUSH_RETRIES => {
-                    debug!("history sync: publication rejected, fetching again: {reason}");
+                PushOutcome::Rejected(reason) if attempts < PUSH_ATTEMPTS => {
+                    debug!(
+                        "history sync: publication rejected, waiting before fetching again: {reason}"
+                    );
+                    pause_after_rejection(attempts as u32, wait);
                     remote.fetch(&origin.branch)?;
+                    after_fetch(&origin.url);
                     upstream_commit = repo.ref_oid(UPSTREAM_REF)?;
                 }
                 PushOutcome::Rejected(reason) => {
@@ -514,6 +752,85 @@ fn lock_path(state_dir: &Path) -> PathBuf {
     hstore::store_dir_in(state_dir).join("sync.lock")
 }
 
+/// Who holds the sync lock, for a refusal to name: the pid the holder
+/// recorded, the command that pid runs, and how long it has held the lock.
+/// "Another sync is running" and "a watcher is parked on the lock" read the
+/// same without this, and only one of them is worth waiting for.
+fn describe_holder(state_dir: &Path) -> String {
+    let path = lock_path(state_dir);
+    let Some(pid) = mise_util::lock_file::read_holder_pid(&path) else {
+        return "the holder recorded no pid (a mise older than this one, or it released the lock as this was read)".to_string();
+    };
+    let command = process_command(pid)
+        .map(|command| format!(" running `{command}`"))
+        .unwrap_or_default();
+    let held = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|written| written.elapsed().ok())
+        .map(|held| format!(", holding the lock for {}", human_duration(held)))
+        .unwrap_or_default();
+    let liveness = if process_alive(pid) {
+        ""
+    } else {
+        ", and that process has exited (an older holder took the lock without recording a pid)"
+    };
+    format!("pid {pid}{command}{held}{liveness}")
+}
+
+/// The command line of `pid`, best effort. Another user's process, a process
+/// that exited, or a platform without the source of truth yields nothing and
+/// the refusal names the pid alone.
+#[cfg(target_os = "linux")]
+fn process_command(pid: u32) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let command = raw
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!command.is_empty()).then_some(command)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_command(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!command.is_empty()).then_some(command)
+}
+
+/// Whether `pid` is still running. Unanswerable counts as running: a refusal
+/// that wrongly says the holder is gone would invite concurrent syncs.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(true)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
+
+/// A lock age in the units someone reads at a glance: seconds under a
+/// minute, then minutes, then hours and minutes.
+fn human_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m", seconds / 60),
+        _ => format!("{}h {}m", seconds / 3600, (seconds % 3600) / 60),
+    }
+}
+
 /// The sync lock: every reader-then-writer of `sync.json` holds it. A sync
 /// or pull takes it for its whole duration and fails at once when another
 /// holds it.
@@ -521,10 +838,72 @@ pub fn lock(store: &Store) -> Result<fslock::LockFile> {
     lock_in(store.state_dir())
 }
 
+/// The sync lock for a command someone ran: it waits its turn behind a
+/// running sync or pull for `history.lock_wait`, as a save waits behind a
+/// running save, so syncs started together run one after another instead of
+/// all but one failing. The watcher keeps [`lock`]: waiting would stall its
+/// event loop, and it retries a contended sync on its own schedule.
+pub fn lock_queued(store: &Store, wait: Option<Duration>) -> Result<fslock::LockFile> {
+    lock_wait(
+        store.state_dir(),
+        wait.unwrap_or_else(crate::history::scope::operation_lock_wait),
+    )
+}
+
+/// The sync lock was already held. The text is the refusal a command prints;
+/// the type is how the watcher tells a held lock from a sync that failed.
+#[derive(Debug)]
+pub(crate) struct SyncLockHeld {
+    pub holder: String,
+    waited: Option<Duration>,
+}
+
+impl std::fmt::Display for SyncLockHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.waited {
+            None => write!(
+                f,
+                "another setup sync or pull is running: {}; pass `--wait <duration>` to queue behind it, or stop the holder",
+                self.holder
+            ),
+            Some(waited) => write!(
+                f,
+                "another setup sync or pull is running: {}; waited {} and gave up, so raise `history.lock_wait`, pass a longer `--wait`, or stop the holder",
+                self.holder,
+                human_duration(waited)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SyncLockHeld {}
+
+/// The refusal for a sync that could not take the lock: who holds it, and
+/// what to do instead of retrying into the same wall. A command someone ran
+/// can pick a wait; the watcher can only be stopped or waited out.
+pub(crate) fn contended(state_dir: &Path, waited: Option<Duration>) -> eyre::Report {
+    eyre::Report::new(SyncLockHeld {
+        holder: describe_holder(state_dir),
+        waited,
+    })
+}
+
+/// Whether a sync or pull holds the sync lock right now. A reader that only
+/// looks at `sync.json` and the fetched objects takes no lock: the record is
+/// replaced atomically and the objects are immutable, so the worst a running
+/// sync does is make what the reader shows out of date. This lets the reader
+/// say so instead of queueing behind a network round trip.
+pub fn sync_running(store: &Store) -> bool {
+    matches!(
+        mise_util::lock_file::LockFile::at(&lock_path(store.state_dir())).try_lock(),
+        Ok(None)
+    )
+}
 pub(crate) fn lock_in(state_dir: &Path) -> Result<fslock::LockFile> {
     mise_util::lock_file::LockFile::at(&lock_path(state_dir))
+        .with_pid()
         .try_lock()?
-        .ok_or_else(|| eyre::eyre!("another setup sync or pull is running; retry shortly"))
+        .ok_or_else(|| contended(state_dir, None))
 }
 
 /// Changes one thing in `sync.json` under the sync lock, reading the record
@@ -545,11 +924,14 @@ pub(crate) fn update_status(
 pub(crate) fn lock_wait(state_dir: &Path, wait: Duration) -> Result<fslock::LockFile> {
     let deadline = Instant::now() + wait;
     loop {
-        if let Some(lock) = mise_util::lock_file::LockFile::at(&lock_path(state_dir)).try_lock()? {
+        if let Some(lock) = mise_util::lock_file::LockFile::at(&lock_path(state_dir))
+            .with_pid()
+            .try_lock()?
+        {
             return Ok(lock);
         }
         if Instant::now() >= deadline {
-            bail!("another setup sync or pull is running; retry shortly");
+            return Err(contended(state_dir, Some(wait)));
         }
         std::thread::sleep(STATUS_LOCK_POLL);
     }
@@ -719,8 +1101,19 @@ fn prepare(
     status: &mut SyncStatus,
 ) -> Result<Vec<PathPlan>> {
     let shared = &report.objects();
-    let incoming =
-        incoming_tracking(repo, tracked).inspect_err(|error| repository_conflict(status, error))?;
+    // One observation of the heads, and one virtual base when there are
+    // several. Tracking and the file baseline both use it; neither recomputes it.
+    let heads = super::graph::Heads::read(repo)?;
+    // A base conflict is a repository conflict. Computing it inside the
+    // match would return before status records it, and a later caller
+    // would see an empty conflict list for a pause that already happened.
+    let base = enrollment_manifest(repo, &heads).inspect_err(|error| {
+        if heads.local.is_some() && heads.remote.is_some() {
+            repository_conflict(status, error);
+        }
+    })?;
+    let incoming = incoming_tracking_with(repo, tracked, &heads, base.as_ref())
+        .inspect_err(|error| repository_conflict(status, error))?;
     let tracked = &incoming;
     let roots = Roots::current();
     // **A live file that already holds the incoming version has no edit
@@ -737,7 +1130,6 @@ fn prepare(
     // Git ancestry, not a machine's replaceable acknowledgement cache,
     // determines the shared baseline. Losing local bookkeeping must not
     // turn an ordinary incoming edit into an unrelated adoption conflict.
-    let heads = super::graph::Heads::read(repo)?;
     status.upstream_commit = heads.remote.clone();
     status.pending_repository = match &heads.local {
         Some(local) => {
@@ -746,7 +1138,7 @@ fn prepare(
         }
         None => heads.remote.is_some(),
     };
-    let repository_tree = incoming_repository_tree(repo, tracked)
+    let repository_tree = incoming_repository_tree_with(repo, tracked, &heads)
         .inspect_err(|error| repository_conflict(status, error))?;
     status.pending_repository |= repository_tree.is_some();
     status.pending_directories = 0;
@@ -758,6 +1150,10 @@ fn prepare(
     if heads.remote != upstream.commit {
         bail!("origin changed while planning; reconcile again");
     }
+    // File ancestry is a real commit when there is one. Several merge
+    // bases have no single commit, and a tree that holds only the virtual
+    // enrollment is not their file history: reading it as a baseline would
+    // invent an empty file set. Keep the conservative absence instead.
     let baseline = reconcile::upstream(repo, heads.base.as_deref())?;
     let local_manifest = heads
         .local
@@ -801,6 +1197,10 @@ fn prepare(
                 })
                 .map(|(path, object)| (path.clone(), object.clone()))
                 .collect(),
+            // never filtered: an origin plaintext version of an encrypted
+            // path is reported for every such path the incoming config
+            // declares, whether or not this machine selects it
+            plaintext: upstream.plaintext.clone(),
         };
         let mut plans = reconcile::reconcile(repo, shared, &selected, &sync_state, unsaved)?;
         // Old acknowledgements are not authority to delete a path this
@@ -861,6 +1261,7 @@ fn prepare(
                         local: shared.get(&plan.branch_path).cloned(),
                         remote: upstream.files.get(&plan.branch_path).cloned(),
                         base: plan.next.acknowledged.clone(),
+                        detail: None,
                     });
                     plan.publish = None;
                 }
@@ -893,6 +1294,7 @@ fn repository_conflict(status: &mut SyncStatus, error: &eyre::Report) {
         local: None,
         remote: None,
         base: None,
+        detail: None,
     }];
 }
 
@@ -1065,6 +1467,7 @@ fn apply_resolutions(
                 local: shared.get(&plan.branch_path).cloned(),
                 remote: upstream.files.get(&plan.branch_path).cloned(),
                 base: plan.next.acknowledged.clone(),
+                detail: None,
             });
             plan.publish = None;
         }
@@ -1129,29 +1532,201 @@ pub(super) fn eligible(
     }
 }
 
+/// The enrollment both tips descend from, so [`Manifest::merge`] can tell a
+/// change from an addition.
+///
+/// One merge base is that commit's manifest. Several are one virtual
+/// manifest: each pair is merged against the ancestry they share, and that
+/// result is the base the tips are merged against. Nothing is dropped to
+/// make the bases agree, and a pair that cannot be merged is a conflict
+/// naming its path. A pair with no shared ancestry cannot be constructed;
+/// that fails closed and names `mise dot status`, which prints the manual
+/// reconciliation. The result is a manifest. When the merge needs a parent
+/// for the next pair, that parent is an unreferenced commit whose only job
+/// is to keep the accumulated ancestry; it is not a history ref and not a
+/// file baseline.
+pub(super) fn enrollment_base(
+    repo: &crate::history::shadow::HistoryRepo,
+    local: &str,
+    remote: &str,
+) -> Result<crate::history::manifest::Manifest> {
+    enrollment_against(repo, local, remote, &mut EnrollmentCache::default()).wrap_err(
+        "a virtual enrollment base could not be constructed; run `mise dot status` and reconcile the histories it names before syncing",
+    )
+}
+
+fn enrollment_manifest(
+    repo: &crate::history::shadow::HistoryRepo,
+    heads: &super::graph::Heads,
+) -> Result<Option<crate::history::manifest::Manifest>> {
+    match (&heads.local, &heads.remote) {
+        (Some(local), Some(remote)) => Ok(Some(enrollment_base(repo, local, remote)?)),
+        _ => Ok(None),
+    }
+}
+
+/// Pair, base, and manifest reads for one enrollment computation. A nested
+/// criss-cross asks the same question of commits already answered.
+#[derive(Default)]
+struct EnrollmentCache {
+    bases: std::collections::HashMap<(String, String), Vec<String>>,
+    manifests: std::collections::HashMap<String, Option<crate::history::manifest::Manifest>>,
+}
+
+fn enrollment_against(
+    repo: &crate::history::shadow::HistoryRepo,
+    local: &str,
+    remote: &str,
+    cache: &mut EnrollmentCache,
+) -> Result<crate::history::manifest::Manifest> {
+    let bases = cached_bases(repo, local, remote, cache)?;
+    if bases.is_empty() {
+        // Heads::read already refuses unrelated tips before a sync plans.
+        // Reaching here means two merge bases themselves share nothing, which
+        // a user reconciles by hand. `mise dot conflicts` plans through this
+        // same function, so it cannot be the recovery.
+        bail!(
+            "merge bases share no ancestry, so a virtual base cannot be constructed; \
+             run `mise dot status` and reconcile the histories it names before syncing"
+        );
+    }
+    if bases.len() == 1 {
+        return Ok(cached_manifest(repo, &bases[0], cache)?.unwrap_or_default());
+    }
+    let mut paired = Vec::with_capacity(bases.len());
+    for base in &bases {
+        let manifest = cached_manifest(repo, base, cache)?.ok_or_else(|| {
+            eyre::eyre!(
+                "a merge base has no enrollment metadata, so a virtual base cannot be constructed; \
+                 run `mise dot status` and reconcile the histories it names before syncing"
+            )
+        })?;
+        paired.push((base.clone(), manifest));
+    }
+    virtual_enrollment(repo, &paired, cache)
+}
+
+fn cached_bases(
+    repo: &crate::history::shadow::HistoryRepo,
+    local: &str,
+    remote: &str,
+    cache: &mut EnrollmentCache,
+) -> Result<Vec<String>> {
+    let key = if local <= remote {
+        (local.to_string(), remote.to_string())
+    } else {
+        (remote.to_string(), local.to_string())
+    };
+    if let Some(bases) = cache.bases.get(&key) {
+        return Ok(bases.clone());
+    }
+    let bases = repo.merge_bases(local, remote)?;
+    cache.bases.insert(key, bases.clone());
+    Ok(bases)
+}
+
+fn cached_manifest(
+    repo: &crate::history::shadow::HistoryRepo,
+    commit: &str,
+    cache: &mut EnrollmentCache,
+) -> Result<Option<crate::history::manifest::Manifest>> {
+    if let Some(manifest) = cache.manifests.get(commit) {
+        return Ok(manifest.clone());
+    }
+    let manifest = crate::history::manifest::Manifest::read(repo, commit)?;
+    cache.manifests.insert(commit.to_string(), manifest.clone());
+    Ok(manifest)
+}
+
+/// Merge base manifests pairwise against the ancestry each pair shares.
+///
+/// Reducing left to right is safe because [`Manifest::merge`] is the only
+/// rule, and it does not depend on which side is asked first when the two
+/// sides differ: that is a conflict, not a choice. An accumulated result is
+/// written as an unreferenced commit with both parents, so the next pair's
+/// merge-base sees that ancestry instead of an empty id. A pair whose own
+/// bases are several is the same function again.
+fn virtual_enrollment(
+    repo: &crate::history::shadow::HistoryRepo,
+    bases: &[(String, crate::history::manifest::Manifest)],
+    cache: &mut EnrollmentCache,
+) -> Result<crate::history::manifest::Manifest> {
+    use crate::history::manifest::Manifest;
+    let mut reduced: Option<(String, Manifest)> = None;
+    for (index, (commit, manifest)) in bases.iter().enumerate() {
+        let last = index + 1 == bases.len();
+        reduced = Some(match reduced {
+            None => (commit.clone(), manifest.clone()),
+            Some((previous, previous_manifest)) => {
+                let shared = enrollment_against(repo, &previous, commit, cache)?;
+                let merged = Manifest::merge(&shared, &previous_manifest, manifest)?;
+                // The last pair has no later merge-base to answer, so its
+                // parent commit would be written and never read.
+                let accumulated = if last {
+                    String::new()
+                } else {
+                    accumulated_parent(repo, &merged, &previous, commit, cache)?
+                };
+                (accumulated, merged)
+            }
+        });
+    }
+    reduced
+        .map(|(_, manifest)| manifest)
+        .ok_or_else(|| eyre::eyre!("a virtual base needs at least one merge base"))
+}
+
+/// An unreferenced commit whose parents are the two enrollments just merged.
+/// Later pairs ask merge-base against it; nothing stores it as history or
+/// reads its tree as a file baseline.
+fn accumulated_parent(
+    repo: &crate::history::shadow::HistoryRepo,
+    merged: &crate::history::manifest::Manifest,
+    left: &str,
+    right: &str,
+    cache: &mut EnrollmentCache,
+) -> Result<String> {
+    let empty = repo.empty_object("tree")?;
+    let tree = merged.write(repo, &empty)?;
+    let commit = repo.commit_tree(&tree, vec![left, right], "virtual enrollment base")?;
+    cache.manifests.insert(commit.clone(), Some(merged.clone()));
+    Ok(commit)
+}
+
 /// A fresh store gets its explicit inventory from the fetched ordinary branch.
 /// Do not create an unrelated local root just to discover incoming files.
 pub(super) fn incoming_tracking(
     repo: &crate::history::shadow::HistoryRepo,
     tracked: &TrackedSet,
 ) -> Result<TrackedSet> {
-    use crate::history::manifest::Manifest;
     let heads = super::graph::Heads::read(repo)?;
+    let base = enrollment_manifest(repo, &heads)?;
+    incoming_tracking_with(repo, tracked, &heads, base.as_ref())
+}
+
+fn incoming_tracking_with(
+    repo: &crate::history::shadow::HistoryRepo,
+    tracked: &TrackedSet,
+    heads: &super::graph::Heads,
+    base: Option<&crate::history::manifest::Manifest>,
+) -> Result<TrackedSet> {
+    use crate::history::manifest::Manifest;
     let Some(remote) = &heads.remote else {
         return Ok(tracked.clone());
     };
     let remote = Manifest::read(repo, remote)?
         .ok_or_else(|| eyre::eyre!("setup repository has no enrollment metadata"))?;
-    let manifest = match (&heads.local, &heads.base) {
-        (None, _) => remote,
-        (Some(local), Some(base)) => Manifest::merge(
-            &Manifest::read(repo, base)?.unwrap_or_default(),
+    let manifest = match &heads.local {
+        None => remote,
+        Some(local) => Manifest::merge(
+            base.ok_or_else(|| {
+                eyre::eyre!(
+                "enrollment base was not computed; run `mise dot status` and reconcile the histories it names before syncing"
+                )
+            })?,
             &Manifest::read(repo, local)?.unwrap_or_default(),
             &remote,
         )?,
-        (Some(_), None) => bail!(
-            "multiple merge bases require explicit Git reconciliation before applying enrollment"
-        ),
     };
     let mut incoming = manifest.tracking()?;
     incoming.required_sources = tracked.required_sources.clone();
@@ -1169,7 +1744,14 @@ pub(super) fn incoming_repository_tree(
     repo: &crate::history::shadow::HistoryRepo,
     tracked: &TrackedSet,
 ) -> Result<Option<String>> {
-    let heads = super::graph::Heads::read(repo)?;
+    incoming_repository_tree_with(repo, tracked, &super::graph::Heads::read(repo)?)
+}
+
+fn incoming_repository_tree_with(
+    repo: &crate::history::shadow::HistoryRepo,
+    tracked: &TrackedSet,
+    heads: &super::graph::Heads,
+) -> Result<Option<String>> {
     let (Some(local), Some(remote)) = (&heads.local, &heads.remote) else {
         return Ok(None);
     };
@@ -1177,16 +1759,37 @@ pub(super) fn incoming_repository_tree(
         return Ok(None);
     }
     let (merged, conflicts) = repo.merge_tree(local, remote)?;
+    // Settling replaces Git's version of a conflicted path, so the merged tree
+    // can equal the saved one; the merge still happened, and its tree is the
+    // one to adopt.
+    let merged_conflicts = !conflicts.is_empty();
+    let (merged, conflicts) = settle_conflicts(
+        repo,
+        heads.base.as_deref(),
+        local,
+        remote,
+        &merged,
+        conflicts,
+    )?;
     let tree = tracked.manifest.write(repo, &merged)?;
     let roots = Roots::current();
     let exclude = tracked.exclude_set()?;
-    if repo.output_tree_of(local)? == tree && conflicts.is_empty() {
+    if repo.output_tree_of(local)? == tree && conflicts.is_empty() && !merged_conflicts {
         return Ok(None);
     }
+    // An eligible tracked file is decided per file, so its ordinary text
+    // conflict is not a repository conflict. An encrypted envelope is not
+    // text: dropping its conflict here is how a text-merged ciphertext was
+    // committed as "merge origin dotfiles". It stays a conflict the user resolves.
+    let encrypted = super::files::encrypted_paths(repo, Some(local))?
+        .union(&super::files::encrypted_paths(repo, Some(remote))?)
+        .cloned()
+        .collect::<BTreeSet<_>>();
     let unresolved: Vec<_> = conflicts
         .into_iter()
         .filter(|path| {
-            path != crate::history::manifest::PATH && !eligible(&roots, tracked, &exclude, path)
+            path != crate::history::manifest::PATH
+                && (!eligible(&roots, tracked, &exclude, path) || encrypted.contains(path))
         })
         .collect();
     if !unresolved.is_empty() {
@@ -1196,6 +1799,175 @@ pub(super) fn incoming_repository_tree(
         );
     }
     Ok(Some(tree))
+}
+
+/// Git merged the saved envelopes as text. Whatever it wrote for a conflicted
+/// path is not a saved version: when the decrypted content is equal, the local
+/// saved envelope stands, and every other path is replaced by the per-file
+/// plan before anything is adopted. A marker blob is never carried forward.
+pub(super) fn settle_conflicts(
+    repo: &crate::history::shadow::HistoryRepo,
+    base: Option<&str>,
+    local: &str,
+    remote: &str,
+    merged: &str,
+    conflicts: Vec<String>,
+) -> Result<(String, Vec<String>)> {
+    let mut overlays = vec![];
+    let mut settled = std::collections::BTreeSet::new();
+    for path in &conflicts {
+        if path == crate::history::manifest::PATH {
+            continue;
+        }
+        let Some(saved) = repo.object_at(local, path)? else {
+            continue;
+        };
+        let Some(merged_object) = repo.object_at(merged, path)? else {
+            continue;
+        };
+        // A record Git merged as text is repaired here: when its two sides
+        // hold the same content, one clean envelope replaces it.
+        let repaired = match super::files::repair(repo, path, &merged_object, false)? {
+            super::files::Repair::Same { envelope, .. } => {
+                Some(("100644".to_string(), repo.store_blob(&envelope)?))
+            }
+            _ => match super::files::repair(repo, path, &saved, false)? {
+                super::files::Repair::Same { envelope, .. } => {
+                    Some(("100644".to_string(), repo.store_blob(&envelope)?))
+                }
+                _ => None,
+            },
+        };
+        if let Some(object) = repaired {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some(object),
+            });
+            continue;
+        }
+        // Compare the two saved sides, not the blob Git kept. With -merge
+        // that blob is one parent, so comparing it with the local side
+        // would settle a real difference.
+        let Some(theirs) = repo.object_at(remote, path)? else {
+            continue;
+        };
+        if super::files::normalized_equal(repo, path, &saved, &theirs, false)? {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some(saved),
+            });
+            continue;
+        }
+        // The origin still holds the base's content: only this machine changed
+        // the file. A machine that re-encrypts a file it did not edit writes a
+        // new envelope, and a new envelope is not a change to merge. A base that
+        // cannot be read proves nothing, so the path stays a conflict.
+        if let Some(base) = base
+            && let Some(base_object) = repo.object_at(base, path)?
+            && matches!(
+                super::files::normalized_equal(repo, path, &base_object, &theirs, false),
+                Ok(true)
+            )
+        {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some(saved),
+            });
+            continue;
+        }
+        // A structured file is merged by key before any line merge. A
+        // parsed clash must stay a conflict: a clean line merge would hide it.
+        if let Some(base) = base
+            && let Some(base_object) = repo.object_at(base, path)?
+        {
+            match super::files::merge_by_key(repo, path, &base_object, &saved, &theirs, false)? {
+                super::files::KeyMerge::KeepLocal => {
+                    settled.insert(path.clone());
+                    overlays.push(crate::history::shadow::Overlay {
+                        path: path.clone(),
+                        object: Some(saved),
+                    });
+                    continue;
+                }
+                super::files::KeyMerge::Merged { mode, text } => {
+                    let local_encrypted = repo.blob_starts_with(&saved.1, super::files::MAGIC)?;
+                    let remote_encrypted = repo.blob_starts_with(&theirs.1, super::files::MAGIC)?;
+                    let base_encrypted =
+                        repo.blob_starts_with(&base_object.1, super::files::MAGIC)?;
+                    if local_encrypted != remote_encrypted || local_encrypted != base_encrypted {
+                        continue;
+                    }
+                    let object = if local_encrypted {
+                        let tree = repo.output_tree_of(local)?;
+                        let recipients = super::files::recipients_of(repo, &tree, path, &saved)?;
+                        let scheme = super::files::scheme_of(repo, &saved)?;
+                        super::files::seal(repo, path, &mode, &text, &scheme, &recipients)?
+                    } else {
+                        (mode, repo.store_blob(&text)?)
+                    };
+                    settled.insert(path.clone());
+                    overlays.push(crate::history::shadow::Overlay {
+                        path: path.clone(),
+                        object: Some(object),
+                    });
+                    continue;
+                }
+                super::files::KeyMerge::Clash => {
+                    continue;
+                }
+                super::files::KeyMerge::Inapplicable => {}
+            }
+        }
+        // A symlink, a binary file, and a mode change are not text to merge.
+        // A regular file whose sides changed different lines is merged here
+        // exactly as Git used to, before -merge kept one side instead.
+        // An envelope is valid UTF-8, so the text check below would merge it.
+        // It is never text: its comparison happened above, after decryption.
+        let encrypted = repo.blob_starts_with(&saved.1, super::files::MAGIC)?
+            || repo.blob_starts_with(&theirs.1, super::files::MAGIC)?;
+        let merged_text = if !encrypted
+            && saved.0 == theirs.0
+            && saved.0 != "120000"
+            && let Some(base) = base
+            && let Some(base) = repo.object_at(base, path)?
+            && base.0 == saved.0
+            && !repo.blob_starts_with(&base.1, super::files::MAGIC)?
+        {
+            let (base_bytes, saved_bytes, remote_bytes) = (
+                repo.cat_object(&base.1)?,
+                repo.cat_object(&saved.1)?,
+                repo.cat_object(&theirs.1)?,
+            );
+            if super::files::utf8_text(&base_bytes)
+                && super::files::utf8_text(&saved_bytes)
+                && super::files::utf8_text(&remote_bytes)
+            {
+                repo.merge3(&base_bytes, &saved_bytes, &remote_bytes)?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(text) = merged_text {
+            settled.insert(path.clone());
+            overlays.push(crate::history::shadow::Overlay {
+                path: path.clone(),
+                object: Some((saved.0.clone(), repo.store_blob(&text)?)),
+            });
+        }
+    }
+    let remaining = conflicts
+        .into_iter()
+        .filter(|path| !settled.contains(path))
+        .collect();
+    if overlays.is_empty() {
+        return Ok((merged.to_string(), remaining));
+    }
+    Ok((repo.compose(merged, &overlays)?, remaining))
 }
 
 /// A bootstrap finished: the declarations that arrived through sync are
@@ -1290,6 +2062,47 @@ mod capture_tests {
             ..Default::default()
         };
         assert!(audit_publication(repo, &head, &tracked).is_err());
+        Ok(())
+    }
+
+    /// The decision a sync makes before it publishes: has a checkpoint been
+    /// saved since the plans were built? A sync that publishes past one would
+    /// publish history its plans never examined; a sync that fails on it
+    /// never finishes while the watcher keeps saving.
+    #[test]
+    fn a_checkpoint_saved_after_the_snapshot_moves_the_head() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open_in(temp.path())?;
+        let repo = store.repo().ok_or_else(|| eyre::eyre!("git required"))?;
+        let tree = repo.empty_object("tree")?;
+        let first = repo.commit_tree(&tree, vec![], "first")?;
+        repo.update_ref(
+            crate::history::shadow::HistoryRepo::HISTORY_REF,
+            &first,
+            None,
+        )?;
+        let snapshot = share::current(repo, &TrackedSet::default())?;
+        assert!(
+            !head_moved(repo, &snapshot)?,
+            "nothing was saved since the snapshot"
+        );
+
+        let second = repo.commit_tree(&tree, vec![first.as_str()], "second")?;
+        repo.update_ref(
+            crate::history::shadow::HistoryRepo::HISTORY_REF,
+            &second,
+            Some(&first),
+        )?;
+        assert!(
+            head_moved(repo, &snapshot)?,
+            "a checkpoint saved after the snapshot must be noticed"
+        );
+
+        let fresh = share::current(repo, &TrackedSet::default())?;
+        assert!(
+            !head_moved(repo, &fresh)?,
+            "planning again from the new head settles it"
+        );
         Ok(())
     }
 
@@ -1410,6 +2223,7 @@ mod notification_tests {
             local: None,
             remote: None,
             base: None,
+            detail: None,
         }
     }
 
@@ -1478,6 +2292,7 @@ mod status_tests {
             local: None,
             remote: None,
             base: None,
+            detail: None,
         }
     }
 
@@ -1531,6 +2346,106 @@ mod status_tests {
         })
         .unwrap();
     }
+
+    /// A sync someone ran queues behind a running one instead of failing, and
+    /// the watcher's no-wait lock still fails at once on the same contention.
+    #[test]
+    fn a_queued_sync_waits_for_a_running_one_and_a_plain_one_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hstore::store_dir_in(&state_dir)).unwrap();
+        let held = lock_in(&state_dir).unwrap();
+        assert!(
+            lock_in(&state_dir)
+                .unwrap_err()
+                .to_string()
+                .contains("another setup sync or pull")
+        );
+        let waiter = {
+            let state_dir = state_dir.clone();
+            std::thread::spawn(move || lock_wait(&state_dir, Duration::from_secs(10)).is_ok())
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        drop(held);
+        assert!(
+            waiter.join().unwrap(),
+            "the queued sync should take the lock once it is free"
+        );
+    }
+
+    /// A refusal names who holds the lock, so a permanent holder is visible
+    /// without `lsof`: waiting out `mise dot watch` is wasted time, and the
+    /// refusal is what an agent reads.
+    #[test]
+    fn a_refused_lock_names_the_holder_pid_and_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hstore::store_dir_in(&state_dir)).unwrap();
+        let held = lock_in(&state_dir).unwrap();
+        let err = lock_in(&state_dir).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("pid {}", std::process::id())),
+            "the refusal must name the holder: {err}"
+        );
+        assert!(
+            err.contains("holding the lock for"),
+            "the refusal must say how long it has been held: {err}"
+        );
+        assert!(
+            err.contains("--wait"),
+            "the refusal must point at the bounded wait: {err}"
+        );
+        drop(held);
+    }
+
+    /// A bounded wait that runs out says who it was waiting for and how long
+    /// it waited, rather than "retry shortly" about a process that may never
+    /// release the lock.
+    #[test]
+    fn an_expired_wait_names_the_holder_and_the_wait() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hstore::store_dir_in(&state_dir)).unwrap();
+        let held = lock_in(&state_dir).unwrap();
+        let err = lock_wait(&state_dir, Duration::ZERO)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("pid {}", std::process::id())),
+            "the timeout must name the holder: {err}"
+        );
+        assert!(
+            err.contains("waited 0s and gave up"),
+            "the timeout must say how long it waited: {err}"
+        );
+        drop(held);
+    }
+
+    /// A holder from a mise that did not record a pid is a fact, not a panic:
+    /// the refusal says so instead of inventing a holder.
+    #[test]
+    fn a_holder_that_recorded_no_pid_is_reported_as_such() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().to_path_buf();
+        std::fs::create_dir_all(hstore::store_dir_in(&state_dir)).unwrap();
+        let path = lock_path(&state_dir);
+        let mut older = fslock::LockFile::open(&path).unwrap();
+        assert!(older.try_lock().unwrap());
+        let err = lock_in(&state_dir).unwrap_err().to_string();
+        assert!(
+            err.contains("recorded no pid"),
+            "an unrecorded holder must be named as such: {err}"
+        );
+        drop(older);
+    }
+
+    #[test]
+    fn lock_ages_read_in_seconds_minutes_and_hours() {
+        assert_eq!(human_duration(Duration::ZERO), "0s");
+        assert_eq!(human_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(human_duration(Duration::from_secs(90)), "1m");
+        assert_eq!(human_duration(Duration::from_secs(3600 + 840)), "1h 14m");
+    }
 }
 
 #[cfg(test)]
@@ -1579,6 +2494,343 @@ mod nested_repository_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod rejection_backoff_tests {
+    use super::*;
+    use crate::files::{FileMode, FilePolicy};
+    use crate::history::manifest::Manifest;
+    use crate::history::shadow::HistoryRepo;
+    use crate::history::tracked::TrackedEntry;
+
+    /// A marked history whose saved manifest matches an empty tracked set, so
+    /// publication is not held for an incoming repository change.
+    fn marked(repo: &HistoryRepo, parent: Option<&str>, message: &str) -> String {
+        let tree = Manifest::default()
+            .write(repo, &repo.empty_object("tree").unwrap())
+            .unwrap();
+        let parents = parent.into_iter().collect::<Vec<_>>();
+        let commit = repo.commit_tree(&tree, parents, message).unwrap();
+        repo.update_history_head(&commit, parent).unwrap();
+        commit
+    }
+
+    /// A bare origin and a local store one commit ahead of the fetched base.
+    fn ahead(name: &str) -> (tempfile::TempDir, Store, std::path::PathBuf, String) {
+        let root = tempfile::tempdir().unwrap();
+        let origin = root.path().join(format!("{name}.git"));
+        std::fs::create_dir_all(&origin).unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "mise"])
+            .current_dir(&origin)
+            .output()
+            .unwrap();
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let store = Store::open_in(&root.path().join("state")).unwrap();
+        let repo = store.repo().unwrap();
+        let base = marked(repo, None, "base");
+        let seeded = std::process::Command::new("git")
+            .args([
+                "push",
+                "--quiet",
+                &origin.to_string_lossy(),
+                &format!("{base}:refs/heads/mise"),
+            ])
+            .current_dir(repo.dir())
+            .output()
+            .unwrap();
+        assert!(
+            seeded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&seeded.stderr)
+        );
+        repo.update_ref(UPSTREAM_REF, &base, None).unwrap();
+        let local = marked(repo, Some(&base), name);
+        (root, store, origin, local)
+    }
+
+    /// Moves the origin branch on after a fetch, the race a rejected push
+    /// retries. The move happens inside the fetch the sync just made, so the
+    /// lease check sees a branch the fetch did not, and the next fetch sees
+    /// the move. `moves` bounds how many fetches lose the race.
+    fn race_after_fetch<'a>(
+        branch: &str,
+        remaining: &'a mut usize,
+        raced: &'a mut Vec<String>,
+    ) -> impl FnMut(&str) + 'a {
+        let branch = branch.to_string();
+        move |url: &str| {
+            if *remaining == 0 {
+                return;
+            }
+            *remaining -= 1;
+            // the commit is born in the origin, so the next fetch can read it
+            let moved = std::process::Command::new("git")
+                .args([
+                    "commit-tree",
+                    &format!("refs/heads/{branch}^{{tree}}"),
+                    "-p",
+                    &format!("refs/heads/{branch}"),
+                    "-m",
+                    "raced",
+                ])
+                .current_dir(url)
+                .env("GIT_AUTHOR_NAME", "mise")
+                .env("GIT_AUTHOR_EMAIL", "mise@localhost")
+                .env("GIT_COMMITTER_NAME", "mise")
+                .env("GIT_COMMITTER_EMAIL", "mise@localhost")
+                .output()
+                .unwrap();
+            assert!(
+                moved.status.success(),
+                "{}",
+                String::from_utf8_lossy(&moved.stderr)
+            );
+            let commit = String::from_utf8(moved.stdout).unwrap().trim().to_string();
+            raced.push(commit.clone());
+            let advanced = std::process::Command::new("git")
+                .args(["update-ref", &format!("refs/heads/{branch}"), &commit])
+                .current_dir(url)
+                .output()
+                .unwrap();
+            assert!(
+                advanced.status.success(),
+                "{}",
+                String::from_utf8_lossy(&advanced.stderr)
+            );
+        }
+    }
+    fn publishing(origin: &std::path::Path) -> SyncRequest {
+        let mut request = SyncRequest::new(false);
+        request.capture = false;
+        request.allow_plaintext_history = true;
+        request.origin = Some(OriginTomlConfig::plain(
+            origin.to_string_lossy().into_owned(),
+            "mise".into(),
+        ));
+        request
+    }
+
+    fn sync_recording(
+        store: &Store,
+        request: &SyncRequest,
+        after_fetch: &mut impl FnMut(&str),
+    ) -> (Result<SyncOutcome>, Vec<Duration>) {
+        let mut delays = Vec::new();
+        let result = sync_locked_waiting(
+            store,
+            &TrackedSet::default(),
+            request,
+            &mut |delay| delays.push(delay),
+            after_fetch,
+        );
+        (result, delays)
+    }
+
+    /// The origin rejects the first pushes of this sync, after the fetch. Each
+    /// rejection waits, the waits grow, and their worst case stays under 16
+    /// seconds. The later push is accepted and this machine's commit is kept.
+    #[test]
+    fn rejected_push_backs_off() {
+        let (_root, store, origin, local) = ahead("rejected");
+        let mut moves = 1;
+        let mut raced = Vec::new();
+        let (result, delays) = sync_recording(
+            &store,
+            &publishing(&origin),
+            &mut race_after_fetch("mise", &mut moves, &mut raced),
+        );
+        assert_eq!(
+            moves, 0,
+            "the origin moved after the fetch, so the push was rejected"
+        );
+        assert_eq!(raced.len(), 1);
+        assert!(
+            result.is_ok(),
+            "the retry publishes once the race ends: {result:?}"
+        );
+        assert_eq!(
+            delays.len(),
+            1,
+            "one rejection waits once before fetching again"
+        );
+        assert!(
+            (Duration::from_millis(250)..=Duration::from_millis(500)).contains(&delays[0]),
+            "the first wait is the upper half of half a second: {:?}",
+            delays[0]
+        );
+        let published = result
+            .unwrap()
+            .published
+            .expect("the retried publication is accepted");
+        let history = store
+            .repo()
+            .unwrap()
+            .rev_list(&published, usize::MAX)
+            .unwrap();
+        assert!(
+            history.contains(&local),
+            "this machine's commit is what the retry publishes"
+        );
+        assert!(
+            history.contains(&raced[0]),
+            "the competing commit is reconciled in"
+        );
+    }
+
+    /// The first push is accepted: nothing was rejected, so nothing waits.
+    #[test]
+    fn an_accepted_push_does_not_wait() {
+        let (_root, store, origin, local) = ahead("accepted");
+        let (result, delays) = sync_recording(&store, &publishing(&origin), &mut |_| {});
+        assert!(
+            delays.is_empty(),
+            "an accepted push waits for nothing: {delays:?}"
+        );
+        assert_eq!(result.unwrap().published.as_deref(), Some(local.as_str()));
+    }
+
+    /// Every push is rejected. The failure names how many were tried and the
+    /// reason the origin gave.
+    #[test]
+    fn an_exhausted_rejection_names_the_attempts_and_the_reason() {
+        let (_root, store, origin, _local) = ahead("exhausted");
+        let mut moves = PUSH_ATTEMPTS;
+        let mut raced = Vec::new();
+        let (result, delays) = sync_recording(
+            &store,
+            &publishing(&origin),
+            &mut race_after_fetch("mise", &mut moves, &mut raced),
+        );
+        assert_eq!(raced.len(), PUSH_ATTEMPTS, "every attempt lost the race");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("after {PUSH_ATTEMPTS} attempts")),
+            "{err}"
+        );
+        assert!(err.contains("the origin branch changed"), "{err}");
+        assert_eq!(delays.len(), PUSH_ATTEMPTS - 1);
+    }
+
+    /// Publishing a store whose saved file cannot be read does not publish
+    /// that unreadability as a deletion. The origin keeps the saved object,
+    /// and a readable sibling edit is published beside it.
+    #[test]
+    fn publishing_keeps_a_denied_saved_object_and_publishes_the_sibling_edit() {
+        use crate::history::checkpoint::{Draft, Outcome};
+        use crate::history::manifest::Enrollment;
+        use crate::history::store::Trigger;
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore(std::path::PathBuf, u32);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+            }
+        }
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let (_root, store, origin, _local) = ahead("denied-publish");
+        // portable-home-ok: history maps paths under the real home
+        let live = tempfile::tempdir_in(*mise_util::dirs::HOME).unwrap();
+        let denied = live.path().join("notes.toml");
+        let sibling = live.path().join("settings.toml");
+        std::fs::write(&denied, "saved-notes").unwrap();
+        std::fs::write(&sibling, "before").unwrap();
+        let policy = FilePolicy::for_mode(FileMode::Track);
+        let denied_entry = TrackedEntry::new(denied.clone(), "track", policy);
+        let sibling_entry = TrackedEntry::new(sibling.clone(), "track", policy);
+        let enroll = |entry: &TrackedEntry, path: &std::path::Path| Enrollment {
+            path: entry.tree_path(path).unwrap(),
+            autosave: true,
+            encrypt: false,
+            allow_plaintext: None,
+            variants: vec![],
+            exclude: None,
+            include: None,
+        };
+        let tracked = TrackedSet {
+            manifest: Manifest {
+                enrollment: vec![
+                    enroll(&denied_entry, &denied),
+                    enroll(&sibling_entry, &sibling),
+                ],
+                ..Default::default()
+            },
+            entries: vec![denied_entry, sibling_entry],
+            ..Default::default()
+        };
+        let Outcome::Created(_) = store.attempt(&tracked, Draft::new(Trigger::Save)).unwrap()
+        else {
+            panic!("the baseline recorded nothing");
+        };
+        let repo = store.repo().unwrap();
+        let head = repo.ref_oid(HistoryRepo::HISTORY_REF).unwrap().unwrap();
+        let denied_tree = tracked
+            .entry_for(&denied)
+            .unwrap()
+            .tree_path(&denied)
+            .unwrap();
+        let (_, saved_oid) = repo.object_at(&head, &denied_tree).unwrap().unwrap();
+
+        let mode = std::fs::symlink_metadata(&denied)
+            .unwrap()
+            .permissions()
+            .mode();
+        let _restore = Restore(denied.clone(), mode);
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let probe = std::fs::File::open(&denied).expect_err("a non-root denial was readable");
+        assert_eq!(probe.kind(), std::io::ErrorKind::PermissionDenied);
+        std::fs::write(&sibling, "after").unwrap();
+        // The watcher's save stores the sibling edit; the denied path keeps
+        // its saved object. Sync then publishes that saved history.
+        let Outcome::Created(_) = store.attempt(&tracked, Draft::new(Trigger::Save)).unwrap()
+        else {
+            panic!("the sibling edit was not saved");
+        };
+
+        let published = sync_locked(&store, &tracked, &publishing(&origin))
+            .unwrap()
+            .published
+            .expect("the saved history was not published");
+        let (_, kept_oid) = repo
+            .object_at(&published, &denied_tree)
+            .unwrap()
+            .expect("unreadability was published as a deletion");
+        assert_eq!(kept_oid, saved_oid, "the denied path lost its saved object");
+        let sibling_tree = tracked
+            .entry_for(&sibling)
+            .unwrap()
+            .tree_path(&sibling)
+            .unwrap();
+        let (_, sibling_oid) = repo
+            .object_at(&published, &sibling_tree)
+            .unwrap()
+            .expect("the sibling edit was not published");
+        assert_eq!(repo.cat_object(&sibling_oid).unwrap(), b"after");
+    }
+
+    #[test]
+    fn a_rejection_delay_grows_then_caps_and_two_samples_differ_by_half() {
+        let bounds = [500, 1_000, 2_000, 3_000, 3_000, 3_000, 3_000];
+        for (index, bound) in bounds.into_iter().enumerate() {
+            let retry = index as u32 + 1;
+            assert_eq!(rejection_delay(retry, 0), Duration::from_millis(bound / 2));
+            assert_eq!(
+                rejection_delay(retry, u32::MAX),
+                Duration::from_millis(bound)
+            );
+        }
+        let worst: Duration = (1..PUSH_ATTEMPTS)
+            .map(|retry| rejection_delay(retry as u32, u32::MAX))
+            .sum();
+        assert_eq!(worst, Duration::from_millis(15_500));
+        assert!(worst <= Duration::from_secs(16));
+    }
+}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -1646,5 +2898,418 @@ mod tests {
             &exclude,
             "home/.sample/nested/leave"
         ));
+    }
+}
+
+#[cfg(test)]
+mod enrollment_base_tests {
+    use super::*;
+    use crate::history::manifest::{Enrollment, Manifest, PATH};
+    use crate::history::shadow::HistoryRepo;
+
+    fn enrollment(path: &str, autosave: bool) -> Enrollment {
+        Enrollment {
+            path: path.into(),
+            autosave,
+            encrypt: false,
+            allow_plaintext: None,
+            variants: vec![],
+            exclude: None,
+            include: None,
+        }
+    }
+
+    fn manifest(entries: Vec<Enrollment>) -> Manifest {
+        Manifest {
+            enrollment: entries,
+            ..Default::default()
+        }
+    }
+
+    /// A commit whose only content is enrollment metadata.
+    fn commit(repo: &HistoryRepo, parents: &[&str], manifest: &Manifest) -> Result<String> {
+        let empty = repo.empty_object("tree")?;
+        let tree = manifest.write(repo, &empty)?;
+        repo.commit_tree(&tree, parents.to_vec(), "enrollment")
+    }
+
+    /// Criss-cross: root, then A and B, then each side merges the other.
+    /// The two merges are the only merge bases of the resulting tips.
+    fn criss_cross(
+        repo: &HistoryRepo,
+        root: &Manifest,
+        left: &Manifest,
+        right: &Manifest,
+        local_tip: &Manifest,
+        remote_tip: &Manifest,
+    ) -> Result<()> {
+        let root = commit(repo, &[], root)?;
+        let left = commit(repo, &[&root], left)?;
+        let right = commit(repo, &[&root], right)?;
+        let local = commit(repo, &[&left, &right], local_tip)?;
+        let remote = commit(repo, &[&right, &left], remote_tip)?;
+        repo.update_ref(HistoryRepo::HISTORY_REF, &local, None)?;
+        repo.update_ref(UPSTREAM_REF, &remote, None)?;
+        let bases = repo.merge_bases(&local, &remote)?;
+        eyre::ensure!(
+            bases.len() == 2 && bases.contains(&left) && bases.contains(&right),
+            "fixture is not a criss-cross: {bases:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enrollment_with_several_merge_bases() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = HistoryRepo::open_or_init_in(temp.path())?.unwrap();
+        criss_cross(
+            &repo,
+            &manifest(vec![enrollment("home/.shared", true)]),
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-left", true),
+            ]),
+            &manifest(vec![
+                enrollment("home/.shared", false),
+                enrollment("home/.from-right", true),
+            ]),
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-left", true),
+                enrollment("home/.from-right", true),
+                enrollment("home/.local-only", true),
+            ]),
+            &manifest(vec![
+                enrollment("home/.shared", false),
+                enrollment("home/.from-left", true),
+                enrollment("home/.from-right", true),
+                enrollment("home/.remote-only", true),
+            ]),
+        )?;
+
+        let incoming = incoming_tracking(&repo, &TrackedSet::default())?;
+        let paths = incoming
+            .manifest
+            .enrollment
+            .iter()
+            .map(|entry| (entry.path.as_str(), entry.autosave))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                ("home/.from-left", true),
+                ("home/.from-right", true),
+                ("home/.local-only", true),
+                ("home/.remote-only", true),
+                ("home/.shared", true),
+            ],
+            "independent additions survive; the base is false, the local tip changed it to true, and the remote tip left the base value, so the result is true"
+        );
+        assert!(
+            incoming_repository_tree(&repo, &incoming)?.is_some(),
+            "several bases are not a fast-forward, so the repository tree is still merged"
+        );
+        assert!(
+            repo.ref_oid(HistoryRepo::HISTORY_REF)?.is_some(),
+            "computing the base writes no history"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enrollment_conflict_across_two_bases_names_the_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = HistoryRepo::open_or_init_in(temp.path())?.unwrap();
+        // Each base changed `.shared` a different way, and neither tip
+        // restates it, so the conflict is between the bases themselves.
+        criss_cross(
+            &repo,
+            &manifest(vec![enrollment("home/.shared", true)]),
+            &manifest(vec![enrollment("home/.shared", false)]),
+            &manifest(vec![]),
+            &manifest(vec![enrollment("home/.local-only", true)]),
+            &manifest(vec![enrollment("home/.remote-only", true)]),
+        )?;
+
+        let error = incoming_tracking(&repo, &TrackedSet::default()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("home/.shared"),
+            "a real enrollment conflict names its path, got {message}"
+        );
+        assert!(
+            !message.contains("home/.local-only") && !message.contains("home/.remote-only"),
+            "an independent addition is not reported as the conflict, got {message}"
+        );
+        let mut status = SyncStatus::default();
+        repository_conflict(&mut status, &error);
+        assert_eq!(
+            status.conflicts[0].branch_path, PATH,
+            "the conflict is reported through the repository conflict, not dropped"
+        );
+        assert!(
+            status
+                .validation_error
+                .as_deref()
+                .is_some_and(|text| text.contains("home/.shared")),
+            "status keeps the path the merge named"
+        );
+        Ok(())
+    }
+
+    /// Each of the two merge bases is itself a criss-cross, so the pair
+    /// has two common bases. Recursion has to merge that inner pair; a
+    /// walk that only descends one side never asks.
+    #[test]
+    fn a_nested_criss_cross_merges_bases_that_themselves_have_two_bases() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = HistoryRepo::open_or_init_in(temp.path())?.unwrap();
+        let root = commit(
+            &repo,
+            &[],
+            &manifest(vec![enrollment("home/.shared", true)]),
+        )?;
+        let west = commit(
+            &repo,
+            &[&root],
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-west", true),
+            ]),
+        )?;
+        let east = commit(
+            &repo,
+            &[&root],
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-east", true),
+            ]),
+        )?;
+        let left = commit(
+            &repo,
+            &[&west, &east],
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-west", true),
+                enrollment("home/.from-east", true),
+            ]),
+        )?;
+        let right = commit(
+            &repo,
+            &[&east, &west],
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-west", true),
+                enrollment("home/.from-east", true),
+                enrollment("home/.from-right", true),
+            ]),
+        )?;
+        let local = commit(
+            &repo,
+            &[&left, &right],
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-west", true),
+                enrollment("home/.from-east", true),
+                enrollment("home/.from-right", true),
+                enrollment("home/.local-only", true),
+            ]),
+        )?;
+        let remote = commit(
+            &repo,
+            &[&right, &left],
+            &manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment("home/.from-west", true),
+                enrollment("home/.from-east", true),
+                enrollment("home/.from-right", true),
+                enrollment("home/.remote-only", true),
+            ]),
+        )?;
+        repo.update_ref(HistoryRepo::HISTORY_REF, &local, None)?;
+        repo.update_ref(UPSTREAM_REF, &remote, None)?;
+        let bases = repo.merge_bases(&local, &remote)?;
+        assert_eq!(bases.len(), 2, "tips have two merge bases: {bases:?}");
+        for base in &bases {
+            let other = bases.iter().find(|candidate| *candidate != base).unwrap();
+            let inner = repo.merge_bases(base, other)?;
+            assert_eq!(
+                inner.len(),
+                2,
+                "merge bases {base} and {other} themselves have two bases: {inner:?}"
+            );
+            assert!(inner.contains(&west) && inner.contains(&east));
+        }
+
+        let incoming = incoming_tracking(&repo, &TrackedSet::default())?;
+        let paths: Vec<_> = incoming
+            .manifest
+            .enrollment
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "home/.from-east",
+                "home/.from-right",
+                "home/.from-west",
+                "home/.local-only",
+                "home/.remote-only",
+                "home/.shared",
+            ],
+            "additions from both inner bases survive the recursive merge"
+        );
+        Ok(())
+    }
+
+    /// Three merge bases. The accumulated parent of the first pair must
+    /// stay a real commit, or the third base is asked against an empty id.
+    #[test]
+    fn enrollment_with_three_merge_bases_keeps_each_independent_addition() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = HistoryRepo::open_or_init_in(temp.path())?.unwrap();
+        let root = commit(
+            &repo,
+            &[],
+            &manifest(vec![enrollment("home/.shared", true)]),
+        )?;
+        let added = |name: &str| {
+            manifest(vec![
+                enrollment("home/.shared", true),
+                enrollment(name, true),
+            ])
+        };
+        let first = commit(&repo, &[&root], &added("home/.from-first"))?;
+        let second = commit(&repo, &[&root], &added("home/.from-second"))?;
+        let third = commit(&repo, &[&root], &added("home/.from-third"))?;
+        let combined = manifest(vec![
+            enrollment("home/.shared", true),
+            enrollment("home/.from-first", true),
+            enrollment("home/.from-second", true),
+            enrollment("home/.from-third", true),
+        ]);
+        let mut local_entries = combined.enrollment.clone();
+        local_entries.push(enrollment("home/.local-only", true));
+        let mut remote_entries = combined.enrollment.clone();
+        remote_entries.push(enrollment("home/.remote-only", true));
+        let local = commit(&repo, &[&first, &second, &third], &manifest(local_entries))?;
+        let remote = commit(&repo, &[&third, &first, &second], &manifest(remote_entries))?;
+        repo.update_ref(HistoryRepo::HISTORY_REF, &local, None)?;
+        repo.update_ref(UPSTREAM_REF, &remote, None)?;
+        assert_eq!(repo.merge_bases(&local, &remote)?.len(), 3);
+
+        let incoming = incoming_tracking(&repo, &TrackedSet::default())?;
+        let paths: Vec<_> = incoming
+            .manifest
+            .enrollment
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "home/.from-first",
+                "home/.from-second",
+                "home/.from-third",
+                "home/.local-only",
+                "home/.remote-only",
+                "home/.shared",
+            ],
+            "each of the three bases contributes its addition"
+        );
+        assert_eq!(
+            repo.ref_oid(HistoryRepo::HISTORY_REF)?.as_deref(),
+            Some(local.as_str()),
+            "the accumulated parent is unreferenced and does not move history"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn merge_bases_without_shared_ancestry_fail_closed_and_name_status() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = HistoryRepo::open_or_init_in(temp.path())?.unwrap();
+        let left_root = commit(&repo, &[], &manifest(vec![enrollment("home/.left", true)]))?;
+        let right_root = commit(&repo, &[], &manifest(vec![enrollment("home/.right", true)]))?;
+        let left = commit(
+            &repo,
+            &[&left_root],
+            &manifest(vec![enrollment("home/.left", true)]),
+        )?;
+        let right = commit(
+            &repo,
+            &[&right_root],
+            &manifest(vec![enrollment("home/.right", true)]),
+        )?;
+        let local = commit(
+            &repo,
+            &[&left, &right],
+            &manifest(vec![enrollment("home/.left", true)]),
+        )?;
+        let remote = commit(
+            &repo,
+            &[&right, &left],
+            &manifest(vec![enrollment("home/.right", true)]),
+        )?;
+        repo.update_ref(HistoryRepo::HISTORY_REF, &local, None)?;
+        repo.update_ref(UPSTREAM_REF, &remote, None)?;
+        assert_eq!(repo.merge_bases(&local, &remote)?.len(), 2);
+        assert!(
+            repo.merge_bases(&left, &right)?.is_empty(),
+            "the two bases must share no ancestry"
+        );
+
+        let error = incoming_tracking(&repo, &TrackedSet::default()).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("mise dot status"),
+            "recovery names status, which can print the reconciliation, got {message}"
+        );
+        assert!(
+            !message.contains("mise dot conflicts"),
+            "conflicts plans through the same failing code, got {message}"
+        );
+        assert!(
+            message.contains("no ancestry"),
+            "the failure says why a virtual base cannot be built, got {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_records_a_base_conflict_before_returning() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = crate::history::checkpoint::Store::open_in(temp.path())?;
+        let repo = store.repo().unwrap();
+        criss_cross(
+            repo,
+            &manifest(vec![enrollment("home/.shared", true)]),
+            &manifest(vec![enrollment("home/.shared", false)]),
+            &manifest(vec![]),
+            &manifest(vec![enrollment("home/.local-only", true)]),
+            &manifest(vec![enrollment("home/.remote-only", true)]),
+        )?;
+        let mut status = SyncStatus::default();
+        let error = refresh(&store, &TrackedSet::default(), &mut status).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("home/.shared"),
+            "refresh returns the named path conflict, got {message}"
+        );
+        assert!(
+            status.pending_repository,
+            "a base conflict is a repository conflict, not an empty plan"
+        );
+        assert_eq!(status.conflicts[0].branch_path, PATH);
+        assert!(
+            status
+                .validation_error
+                .as_deref()
+                .is_some_and(|text| text.contains("home/.shared")),
+            "status was filled before planning returned, got {:?}",
+            status.validation_error
+        );
+        Ok(())
     }
 }

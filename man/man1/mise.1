@@ -4577,7 +4577,7 @@ mise dot capture \-\-label "theme switch" \-\- ./switch\-theme.sh
 .SH "MISE DOTFILES CONFLICTS"
 Compare both sides of a sync conflict
 
-Prints a unified diff from this machine's saved version to the version fetched from the origin. `\-\-difftool` opens the comparison in Git's configured diff tool; when `diff.tool` is unset, Git falls back to `merge.tool`. This command changes neither side. Resolve a conflict with `mise dot pull \-\-take\-remote` or `\-\-keep\-local`.
+Prints a unified diff from this machine's saved version to the version fetched from the origin. `\-\-difftool` opens the comparison in Git's configured diff tool; when `diff.tool` is unset, Git falls back to `merge.tool`. `\-\-json` prints one record per conflict, with the commands that resolve it, and writes nothing. `\-\-sides` writes each side's plaintext into a private directory and reports those paths. Encrypted sides are decrypted before a diff, a diff tool, or a side file sees them. This command changes neither saved side. Resolve a conflict with `mise dot pull \-\-take\-remote` or `\-\-keep\-local`.
 .PP
 \fBUsage:\fR mise dotfiles conflicts [OPTIONS] [<PATH>] ...
 .PP
@@ -4589,6 +4589,16 @@ Open the comparison in Git's configured diff or merge tool
 .TP
 \fB\-\-tool\fR \fI<TOOL>\fR
 Use this Git diff tool instead of the configured default
+.TP
+\fB\-\-json\fR
+Print one JSON record per conflict, with the commands that resolve it
+
+Writes nothing on its own. Each record names the live path, the history path, the kind, any detail, whether the saved object is encrypted, and each side's mode. It never includes file content.
+.TP
+\fB\-\-sides\fR \fI<DIR>\fR
+Write each side's plaintext into a new directory and report the paths
+
+`DIR` must not exist. mise creates it at mode 0700 and each side file at mode 0600. An existing path, including a directory or symlink, is refused. Requires `\-\-json`.
 .TP
 \fB\-h, \-\-help\fR
 Print help
@@ -4621,6 +4631,18 @@ Use a specific diff tool
 .PP
 .RS 4
 mise dot conflicts \-\-difftool \-\-tool meld ~/.zshrc
+.RE
+.PP
+Print each conflict and the commands that resolve it
+.PP
+.RS 4
+mise dot conflicts \-\-json
+.RE
+.PP
+Write each side's plaintext beside the JSON handoff
+.PP
+.RS 4
+mise dot conflicts \-\-json \-\-sides /tmp/sides
 .RE
 .SH "MISE DOTFILES DIFF"
 Show what `mise dot apply` would change
@@ -5268,6 +5290,11 @@ Resolve every remaining conflict by keeping this machine's version
 
 Paths named by `\-\-take\-remote` take the origin's version; every other conflict keeps this machine's. Each kept path must already be saved.
 .TP
+\fB\-\-wait\fR \fI<DURATION>\fR
+Wait this long for a running sync or pull instead of failing
+
+Accepts a duration such as `90s`, `5m` or `1h` (at most one hour). Without it the wait is `history.lock_wait`, 30 seconds by default; `0` fails at once. The refusal names the holder either way.
+.TP
 \fB\-h, \-\-help\fR
 Print help
 \fBArguments:\fR
@@ -5546,6 +5573,11 @@ Allow pushing older unencrypted versions of files that are now encrypted, and ve
 .TP
 \fB\-\-best\-effort\fR
 Warn instead of failing when the origin is unreachable
+.TP
+\fB\-\-wait\fR \fI<DURATION>\fR
+Wait this long for a running sync or pull instead of failing
+
+Accepts a duration such as `90s`, `5m` or `1h` (at most one hour). Without it the wait is `history.lock_wait`, 30 seconds by default; `0` fails at once. The refusal names the holder either way.
 .TP
 \fB\-h, \-\-help\fR
 Print help

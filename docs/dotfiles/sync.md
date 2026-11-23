@@ -298,9 +298,13 @@ Invalid incoming configuration, an unsafe local path, or staged Git changes in
 your own checkout of a tracked path also block the whole batch (commit or
 unstage them first); `mise dot status` and `mise doctor` name the paths and
 the last successful application. A few conflicts cannot be resolved with
-`pull`, such as changes to tracking or encryption settings, inactive platform
-variants, or histories with several Git merge bases. For those, `status`
-prints Git commands to run in a separate clone.
+`pull`, such as changes to tracking or encryption settings or inactive platform
+variants. Histories with several Git merge bases are merged from the enrollment
+those bases share, so an independent addition from any base is kept. A path both
+sides changed, including the bases themselves, stays a conflict that names
+the path. A history whose bases share no ancestry cannot be merged; `mise
+dot status` then prints the manual reconciliation. `mise dot conflicts`
+cannot recover that case, because it plans through the same merge.
 
 ### Conflict notifications {#conflict-notifications}
 
@@ -428,7 +432,9 @@ history and sync locks, so a running watcher cannot save a checkpoint during
 the replacement. Existing files that differ from the incoming setup still
 wait for your decision before setup can finish; add `--take-remote-all` to take
 the repository's version of each. The replaced versions are saved first, so
-`mise dot undo` restores them. A failure restores the previous local branch and
+`mise dot undo` restores them. A fresh adoption keeps that recovery snapshot
+on this machine: it does not publish a deletion of a file the adoption
+created, or a new encrypted envelope for content that did not change. A failure restores the previous local branch and
 sync state. `--replace-history` applies only to
 this adoption; no setting lets the watcher discard divergent history. It
 does not work with an ordinary Git repository that holds no mise history. To
@@ -445,10 +451,14 @@ managed files. Other files in the repository, such as a README, stay in Git
 and are never restored as live configuration.
 
 Sync uses Git ancestry, fast-forwards, and merge commits. A push keeps the
-saved commits and their Git author identities. A rejected push triggers
-another fetch and reconciliation. mise never force-pushes, and leaves
-divergent or unrelated histories for you to resolve. Before it writes incoming
-changes, it checks the complete batch, including configuration, required
+saved commits and their Git author identities. A rejected push waits a short,
+growing, jittered interval, then fetches and reconciles again, up to eight
+attempts. Those waits add up to at most fifteen and a half seconds. That bound
+is only the time spent waiting, not the fetches and pushes themselves, and the
+jitter keeps several machines that publish at once from retrying together.
+mise never force-pushes, and leaves divergent or unrelated histories for you to
+resolve. Before it writes incoming changes, it checks the complete batch,
+including configuration, required
 sources, committed files, and unsaved local edits.
 
 When you adopt the repository on a new machine, mise restores the shared

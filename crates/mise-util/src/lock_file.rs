@@ -117,9 +117,16 @@ impl LockFile {
         if !self.record_pid {
             return None;
         }
-        let contents = std::fs::read_to_string(&self.path).ok()?;
-        contents.lines().next()?.trim().parse().ok()
+        read_holder_pid(&self.path)
     }
+}
+
+/// The PID the holder of `path` recorded with [`LockFile::with_pid`]. For a
+/// caller that lost the lock and wants to say who holds it, without taking a
+/// builder of its own.
+pub fn read_holder_pid(path: &Path) -> Option<u32> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    contents.lines().next()?.trim().parse().ok()
 }
 
 pub fn get(path: &Path, force: bool) -> eyre::Result<Option<fslock::LockFile>> {

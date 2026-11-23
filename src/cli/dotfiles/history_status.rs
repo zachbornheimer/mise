@@ -155,7 +155,7 @@ pub(crate) async fn report() -> Result<HistoryReport> {
             history_repo: None,
         });
     }
-    let (store, tracked, entries) = super::history::open().await?;
+    let (store, tracked) = super::history::open_store().await?;
     let walk = tracked.walk()?;
     walk.report_warnings();
     let tracked_files = walk.roots.iter().map(|root| root.files.len() as u64).sum();
@@ -163,7 +163,7 @@ pub(crate) async fn report() -> Result<HistoryReport> {
     // the index only once it is closed
     let pending_operations =
         crate::system::history::store::peek_pending_in(store.state_dir())?.len();
-    let latest = entries.last().map(|entry| LatestReport {
+    let latest = store.latest()?.map(|entry| LatestReport {
         id: entry.id,
         created_at: entry.checkpoint.created_at.clone(),
         trigger: entry.checkpoint.trigger.as_str().to_string(),
@@ -171,10 +171,10 @@ pub(crate) async fn report() -> Result<HistoryReport> {
     });
     // edits nothing has saved yet, which a stopped watcher or a manual-save
     // entry leaves behind; worked out like `mise dot history diff`
-    let snapshot = entries
-        .iter()
-        .rev()
-        .find_map(|entry| entry.checkpoint.tree.snapshot.as_deref());
+    let snapshot_entry = store.latest_with_snapshot()?;
+    let snapshot = snapshot_entry
+        .as_ref()
+        .and_then(|entry| entry.checkpoint.tree.snapshot.as_deref());
     let not_applied = match (store.repo(), snapshot) {
         (Some(repo), Some(snapshot)) => {
             match crate::system::history::held::unheld_entries(repo, snapshot, &walk) {
@@ -199,6 +199,7 @@ pub(crate) async fn report() -> Result<HistoryReport> {
         }
         _ => None,
     };
+    let health = permission_health(store.state_dir(), &walk);
     Ok(HistoryReport {
         enabled,
         tracked_entries: tracked.entries.len(),
@@ -206,14 +207,14 @@ pub(crate) async fn report() -> Result<HistoryReport> {
         local_entries: tracked.local.len(),
         omitted: walk.omitted,
         nested: walk.nested,
-        checkpoints: entries.len(),
+        checkpoints: store.checkpoint_count()?,
         latest,
         unsaved,
         not_applied,
         pending_operations,
         watcher: super::capture_health::watcher().await?,
         unavailable: store.unavailable().map(str::to_string),
-        health: crate::system::history::health::read(store.state_dir()),
+        health,
         sync: sync_report(&store)?,
         history_repo: store.repo().map(|_| {
             crate::file::display_path(crate::system::history::shadow::HistoryRepo::path_in(
@@ -221,6 +222,49 @@ pub(crate) async fn report() -> Result<HistoryReport> {
             ))
         }),
     })
+}
+
+/// The stored health with this run's permission denials in place of the
+/// previous ones. A regular file whose metadata is readable but whose open
+/// is refused is included; a symlink is never opened. Text and `--json`
+/// both read this value. A second denied path is kept even when its name
+/// starts with another denied path.
+fn permission_health(
+    state_dir: &std::path::Path,
+    walk: &crate::system::history::tracked::Walk,
+) -> Option<crate::system::history::health::Health> {
+    use crate::system::history::health::{self, permission_denial, permission_report};
+    let stored = health::read(state_dir);
+    let mut lines: Vec<String> = walk
+        .permission_denied
+        .iter()
+        .map(|denial| permission_report(&denial.path, &denial.reason))
+        .collect();
+    let named = |lines: &[String], path: &str| {
+        lines
+            .iter()
+            .any(|line| health::permission_report_path(line) == Some(path))
+    };
+    for path in walk.files.keys() {
+        if !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()) {
+            continue;
+        }
+        let display = crate::file::display_path(path);
+        if named(&lines, &display) {
+            continue;
+        }
+        if let Err(error) = std::fs::File::open(path)
+            && health::is_permission_denied(&error)
+        {
+            lines.push(permission_denial(&display, &error));
+        }
+    }
+    if stored.is_none() && lines.is_empty() {
+        return None;
+    }
+    let mut health = stored.unwrap_or_default();
+    health::replace_permission_denials(&mut health.watcher.degraded, &lines);
+    Some(health)
 }
 
 fn plural(count: impl Into<u64>, noun: &str) -> String {
@@ -547,4 +591,154 @@ fn print_capture(report: &HistoryReport, next: &mut Vec<String>) -> Result<()> {
 
 fn is_zero(count: &usize) -> bool {
     *count == 0
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Restore(std::path::PathBuf, u32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    fn walk_of(path: &std::path::Path) -> crate::system::history::tracked::Walk {
+        let policy =
+            crate::system::files::FilePolicy::for_mode(crate::system::files::FileMode::Track);
+        let entry =
+            crate::system::history::tracked::TrackedEntry::new(path.to_path_buf(), "track", policy);
+        let mut walk = crate::system::history::tracked::Walk::default();
+        walk.files.insert(path.to_path_buf(), (0, entry.policy));
+        walk.entries.push(entry);
+        walk
+    }
+
+    #[test]
+    fn status_names_an_unreadable_file_and_clears_it_once_readable() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        // portable-home-ok: history maps paths under the real home
+        let live = tempfile::tempdir_in(*crate::dirs::HOME).unwrap();
+        let file = live.path().join("notes.toml");
+        let prefixed = live.path().join("notes.toml-other");
+        std::fs::write(&file, "saved").unwrap();
+        std::fs::write(&prefixed, "other").unwrap();
+        let mode = std::fs::symlink_metadata(&file)
+            .unwrap()
+            .permissions()
+            .mode();
+        let other_mode = std::fs::symlink_metadata(&prefixed)
+            .unwrap()
+            .permissions()
+            .mode();
+        let restore = Restore(file.clone(), mode);
+        let restore_other = Restore(prefixed.clone(), other_mode);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(&prefixed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut walk = walk_of(&file);
+        walk.files.insert(
+            prefixed.clone(),
+            (
+                0,
+                crate::system::files::FilePolicy::for_mode(crate::system::files::FileMode::Track),
+            ),
+        );
+        let health = permission_health(state.path(), &walk).unwrap();
+        let named = |path: &std::path::Path| {
+            health.watcher.degraded.iter().find(|line| {
+                crate::system::history::health::permission_report_path(line)
+                    == Some(crate::file::display_path(path).as_str())
+            })
+        };
+        let file_line = named(&file).expect("the denied file is missing");
+        let other_line = named(&prefixed).expect("a prefix-named denial was hidden");
+        assert!(file_line.contains("Privacy & Security"), "{file_line}");
+        assert!(other_line.contains("Privacy & Security"), "{other_line}");
+        let report = HistoryReport {
+            enabled: true,
+            tracked_entries: 1,
+            tracked_files: 2,
+            local_entries: 0,
+            omitted: vec![],
+            nested: vec![],
+            checkpoints: 0,
+            latest: None,
+            unsaved: None,
+            not_applied: vec![],
+            pending_operations: 0,
+            watcher: super::super::capture_health::Watcher::NotDeclared,
+            unavailable: None,
+            health: Some(health.clone()),
+            sync: None,
+            history_repo: None,
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        let degraded = json["health"]["watcher"]["degraded"].as_array().unwrap();
+        assert!(degraded.iter().any(|line| line == file_line));
+        assert!(degraded.iter().any(|line| line == other_line));
+        drop(restore);
+        drop(restore_other);
+        assert!(
+            permission_health(state.path(), &walk_of(&file)).is_none(),
+            "a readable tree with no stored health invented a watcher report"
+        );
+    }
+
+    #[test]
+    fn status_names_an_unreadable_directory_without_opening_a_symlink() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+        let state = tempfile::tempdir().unwrap();
+        // portable-home-ok: history maps paths under the real home
+        let live = tempfile::tempdir_in(*crate::dirs::HOME).unwrap();
+        let dir = live.path().join("folder");
+        std::fs::create_dir(&dir).unwrap();
+        let child = dir.join("settings.toml");
+        std::fs::write(&child, "saved").unwrap();
+        let link = live.path().join("link.toml");
+        std::os::unix::fs::symlink(&child, &link).unwrap();
+        let mode = std::fs::symlink_metadata(&dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        let restore = Restore(dir.clone(), mode);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut walk = walk_of(&child);
+        walk.permission_denied
+            .push(crate::system::history::store::PathReason {
+                path: crate::file::display_path(&dir),
+                reason: "Operation not permitted".into(),
+            });
+        walk.files.insert(
+            link.clone(),
+            (
+                0,
+                crate::system::files::FilePolicy::for_mode(crate::system::files::FileMode::Track),
+            ),
+        );
+        let health = permission_health(state.path(), &walk).unwrap();
+        assert!(
+            health.watcher.degraded.iter().any(|line| {
+                crate::system::history::health::permission_report_path(line)
+                    == Some(crate::file::display_path(&dir).as_str())
+                    && line.contains("Operation not permitted")
+                    && line.contains("Privacy & Security")
+            }),
+            "{health:?}"
+        );
+        assert!(
+            health.watcher.degraded.iter().all(|line| {
+                crate::system::history::health::permission_report_path(line)
+                    != Some(crate::file::display_path(&link).as_str())
+            }),
+            "a symlink was opened: {health:?}"
+        );
+        drop(restore);
+    }
 }

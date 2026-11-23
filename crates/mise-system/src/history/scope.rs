@@ -675,6 +675,11 @@ impl Writer {
     fn capture_before(&mut self, id: u64, paths: &[PathBuf]) {
         let mut draft = Draft::new(before_trigger(self.kind()));
         draft.protective = true;
+        // Only a fresh adoption skips its first snapshot. Its protective
+        // snapshot records files this machine does not have as absent, which
+        // must not become the history other machines fetch. A bootstrap,
+        // capture, or undo with no starting head is ordinary history.
+        draft.recovery_only = self.kind() == OperationKind::Apply && self.starting_head.is_none();
         // A tree equal to the newest checkpoint's is already protected by it:
         // the operation's `before` points there instead of recording a copy.
         draft.skip_unchanged = self.kind() == OperationKind::Bootstrap;
@@ -1061,7 +1066,7 @@ fn acquire_operation_lock(store: &Store, wait: std::time::Duration) -> Result<fs
 /// How long an operation waits for a running one (`history.lock_wait`), and
 /// how often it looks. An unreadable value falls back to the default rather
 /// than failing a command that only wanted to save.
-fn operation_lock_wait() -> std::time::Duration {
+pub(crate) fn operation_lock_wait() -> std::time::Duration {
     const DEFAULT: std::time::Duration = std::time::Duration::from_secs(30);
     match parse_lock_wait(&Settings::get().history.lock_wait) {
         Ok(wait) => wait,
@@ -1072,9 +1077,34 @@ fn operation_lock_wait() -> std::time::Duration {
     }
 }
 
-fn parse_lock_wait(value: &str) -> Result<std::time::Duration> {
+/// Parses a `history.lock_wait` value (`5m`, `45`, `0`), capped at an hour.
+/// Public so `--wait` takes the same spellings.
+pub fn parse_lock_wait(value: &str) -> Result<std::time::Duration> {
     const MAX: std::time::Duration = std::time::Duration::from_secs(60 * 60);
     Ok(mise_util::duration::parse_duration(value)?.min(MAX))
+}
+
+/// How long a history fetch, push, or ls-remote may run
+/// (`history.network_timeout`). `None` waits without a limit, which is what
+/// `0` means. An unreadable value falls back to the default rather than
+/// failing a sync that only wanted to publish.
+pub(crate) fn network_timeout() -> Option<std::time::Duration> {
+    const DEFAULT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+    match parse_network_timeout(&Settings::get().history.network_timeout) {
+        Ok(timeout) => timeout,
+        Err(err) => {
+            warn!("history.network_timeout: {err}; using {DEFAULT:?}");
+            Some(DEFAULT)
+        }
+    }
+}
+
+/// Parses a `history.network_timeout` value (`5m`, `45`, `0`) the way
+/// [`parse_lock_wait`] does. `0` is no limit rather than an immediate failure,
+/// and the hour cap still applies to a positive value.
+pub fn parse_network_timeout(value: &str) -> Result<Option<std::time::Duration>> {
+    let timeout = parse_lock_wait(value)?;
+    Ok((!timeout.is_zero()).then_some(timeout))
 }
 const OPERATION_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -1570,6 +1600,19 @@ mod tests {
         assert!(parse_lock_wait("0")?.is_zero());
         assert_eq!(parse_lock_wait("2h")?.as_secs(), 3600);
         assert!(parse_lock_wait("soon").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn network_timeout_matches_lock_wait_except_zero_disables_it() -> Result<()> {
+        assert_eq!(
+            parse_network_timeout("5m")?.unwrap().as_secs(),
+            parse_lock_wait("5m")?.as_secs()
+        );
+        assert_eq!(parse_network_timeout("45")?.unwrap().as_secs(), 45);
+        assert_eq!(parse_network_timeout("2h")?.unwrap().as_secs(), 3600);
+        assert!(parse_network_timeout("0")?.is_none());
+        assert!(parse_network_timeout("soon").is_err());
         Ok(())
     }
 }

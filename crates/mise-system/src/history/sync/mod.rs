@@ -11,11 +11,16 @@ use eyre::{Result, bail};
 
 pub mod apply;
 mod directories;
-pub(crate) mod files;
+pub mod files;
 pub(crate) mod format;
 pub(crate) mod graph;
+mod key_merge;
 pub mod layout;
+#[cfg(test)]
+mod merge_by_key;
 pub mod network;
+#[cfg(test)]
+mod normalized_equal;
 pub mod onboard;
 pub mod origin;
 mod preflight;
