@@ -1143,18 +1143,36 @@ fn recover_records(
         store::remove_marker_in(state_dir);
         return Ok(());
     }
-    // An outcome commit may have reached Git before its derived index was
-    // written. Rebuild before deciding whether recovery must record it.
-    let index = store.rebuild_index()?;
+    // Serialize the head/index observation with writers. A crash can leave Git
+    // ahead of its derived index, but a coherent index needs no full rebuild.
+    let started = std::time::Instant::now();
     let _store_lock = store.lock()?;
+    let mut index = store::load_index_in(state_dir)?;
+    if let Some(repo) = store.repo()
+        && repo.ref_oid(super::shadow::HistoryRepo::HISTORY_REF)?.as_deref()
+            != index.entries.last().map(|entry| entry.commit.as_str())
+    {
+        info!("history: recovery is refreshing an index behind its Git head");
+        index = store.rebuild_index_locked()?;
+    }
+    // An outcome can only follow its protective checkpoint. Older records
+    // without that boundary conservatively inspect the whole index.
+    let first = pending.iter().map(|(_, record)| {
+        record.checkpoint.operation.as_ref()
+            .and_then(|op| op.before.as_deref())
+            .and_then(|before| index.entries.iter().position(|entry| entry.uuid == before))
+            .map_or(0, |position| position + 1)
+    }).min().unwrap_or(0);
     let mut recorded_operations = BTreeSet::new();
-    for entry in &index.entries {
+    for entry in &index.entries[first..] {
         if let Some(operation) = store::read_meta_cache_in(state_dir, &entry.uuid)?
             .and_then(|checkpoint| checkpoint.operation)
         {
             recorded_operations.insert(operation.id);
         }
     }
+    debug!("history: recovery inspected {} of {} indexed checkpoints for {} pending operation(s) in {:?}",
+        index.entries.len() - first, index.entries.len(), pending.len(), started.elapsed());
     for (path, mut record) in pending {
         let interrupted = record
             .checkpoint
@@ -1349,6 +1367,50 @@ mod tests {
                 .ref_oid(HistoryRepo::HISTORY_REF)?
                 .is_none()
         );
+        Ok(())
+    }
+
+    #[test]
+fn interrupted_apply_does_not_read_unrelated_checkpoint_metadata() -> Result<()> {
+        use super::super::journal::{Capture, PathSnapshot, PathState};
+        let temp = tempfile::tempdir()?;
+        let live = temp.path().join("applied");
+        std::fs::write(&live, "original")?;
+        let store = Store::open_in(temp.path())?;
+        let mut draft = Draft::new(Trigger::Edit);
+        draft.description = Some("prior history".into());
+        let Outcome::Created(prior) = store.attempt(&TrackedSet::default(), draft)? else {
+            panic!("missing prior checkpoint");
+        };
+        // More history than the fleet fixture: ordinary Git commits, not mocks.
+        let repo = store.repo().unwrap();
+        for n in 0..8_250 {
+            let mut checkpoint = prior.checkpoint.clone();
+            checkpoint.uuid = format!("prior-{n}");
+            checkpoint.description = format!("prior {n}");
+            repo.write_checkpoint(None, &checkpoint)?;
+        }
+        store.rebuild_index()?;
+        let writer = Writer::begin(
+            temp.path(), OperationKind::Apply, "pull", TrackedSet::default(),
+            std::time::Duration::ZERO, false,
+        )?;
+        let mut pending = writer.pending.clone();
+        let before = PathSnapshot::capture_with(temp.path(), &live, Capture::Full);
+        std::fs::write(&live, "incoming")?;
+        pending.checkpoint.operation.as_mut().unwrap().journal = vec![
+            JournalEntry::PathChanged {
+                part: "files".into(), item: "applied".into(), path: live.clone(), prior: before,
+            },
+            JournalEntry::Committed { seq: 0, after: PathState::observe(&live) },
+        ];
+        store::write_pending_in(temp.path(), &pending)?;
+        drop(writer);
+        std::fs::write(store::meta_cache_path_in(temp.path(), &prior.checkpoint.uuid), "invalid")?;
+        recover_stale(&store, &TrackedSet::default())?;
+        assert_eq!(std::fs::read_to_string(&live)?, "original");
+        assert!(store::list_pending_in(temp.path())?.is_empty());
+        assert_eq!(std::fs::read_to_string(store::meta_cache_path_in(temp.path(), &prior.checkpoint.uuid))?, "invalid");
         Ok(())
     }
 

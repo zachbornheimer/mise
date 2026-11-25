@@ -51,8 +51,8 @@ pub(crate) struct SyncReport {
     pub branch: String,
     pub mode: String,
     pub last_publish: Option<String>,
-    /// Why the latest sync did not publish; a skip is not an error.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Historical reason the last publication attempt skipped; not current pending state.
+    #[serde(rename = "last_publication_skip", skip_serializing_if = "Option::is_none")]
     pub publish_skipped: Option<crate::system::history::sync::publish_skip_reason::PublishSkip>,
     pub last_fetch: Option<String>,
     pub last_apply: Option<String>,
@@ -438,7 +438,7 @@ fn print_repository(
         push_step(next, "mise dot pull");
     }
     if let Some(skip) = &sync.publish_skipped {
-        miseprintln!("  {WARN} {}", skip.sentence());
+        miseprintln!("  Last publication attempt (historical): {}", skip.sentence());
     }
     if let Some(error) = &sync.last_error {
         match &sync.failing_since {
@@ -605,6 +605,22 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
+    #[test]
+    fn publication_skip_is_historical_not_current_pending_state() {
+        use crate::system::history::sync::publish_skip_reason::PublishSkip;
+        let report = SyncReport {
+            origin: "fixture".into(), branch: "history".into(), mode: "sync".into(),
+            last_publish: None, publish_skipped: Some(PublishSkip::PendingApplications { count: 9 }),
+            last_fetch: None, last_apply: None, pending_applications: vec!["current".into()],
+            conflicts: vec![], declarations_changed: false, last_error: None,
+            failing_since: None, consecutive_failures: 0, application_failure: None,
+            validation_error: None, skipped: vec![], notifications: "fixture".into(),
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["pending_applications"], serde_json::json!(["current"]));
+        assert_eq!(json["last_publication_skip"]["count"], 9);
+        assert!(json.get("publish_skipped").is_none());
+    }
     struct Restore(std::path::PathBuf, u32);
     impl Drop for Restore {
         fn drop(&mut self) {
