@@ -10,3 +10,4 @@ perf/dotfiles-envelope-verdict-cache
 fix/audit-unpublished-only
 fix/audit-pinned-publish-bounded
 fix/encrypted-repo-conflict-choice
+fix/incremental-history-index
