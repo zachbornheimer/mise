@@ -196,6 +196,35 @@ description = "run unit tests"
 run = "cargo test --all-features --workspace"
 env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
 
+# `cargo test <filter>` exits 0 when the filter matches nothing, so each of
+# these tasks asserts the matching test count first: a renamed regression must
+# fail its task rather than pass it silently.
+["test:history:scoped-rollback"]
+description = "unit tests that a stale index is extended without replaying history, while the whole live tree is recorded, its preimage stays encrypted, and production rollback then undo round-trips it"
+run = """
+set -eu
+count=$(cargo test --all-features -p mise-system --lib -- --list 2>/dev/null | grep -c 'scoped_rollback' || true)
+if [ "$count" -eq 0 ]; then
+  echo "no scoped_rollback tests found" >&2
+  exit 1
+fi
+cargo test --all-features -p mise-system --lib scoped_rollback
+"""
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
+["test:history:replay"]
+description = "unit tests for selective rollback and undo planning (history::replay)"
+run = """
+set -eu
+count=$(cargo test --all-features -p mise-system --lib -- --list 2>/dev/null | grep -c 'history::replay' || true)
+if [ "$count" -eq 0 ]; then
+  echo "no history::replay tests found" >&2
+  exit 1
+fi
+cargo test --all-features -p mise-system --lib history::replay
+"""
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
 ["test:unit-ci"]
 description = "run unit tests with CI time limits"
 # NEXTEST_PROFILE lets CI pick `ci-shared` on shared runners, where the strict

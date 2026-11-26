@@ -108,6 +108,19 @@ struct Target {
 
 pub async fn rollback(req: RollbackRequest) -> Result<()> {
     ensure_enabled()?;
+    let (store, tracked, entries) = crate::history::open().await?;
+    rollback_with(&store, &tracked, &entries, req).await
+}
+
+/// The rollback over a store the caller already holds: the engine plans and
+/// records against one history, so resilience tests drive exactly the path a
+/// user's `mise dot rollback` drives.
+pub(crate) async fn rollback_with(
+    store: &Store,
+    tracked: &TrackedSet,
+    entries: &[Entry],
+    req: RollbackRequest,
+) -> Result<()> {
     if req.all && !req.paths.is_empty() {
         bail!("choose explicit paths or `--all`, not both");
     }
@@ -119,7 +132,6 @@ pub async fn rollback(req: RollbackRequest) -> Result<()> {
     if req.to.is_none() && req.all {
         bail!("`--all` needs `--to <ref>`");
     }
-    let (store, tracked, entries) = crate::history::open().await?;
     // A rollback writes and removes live files, so it does not run on a
     // rule set that could not be fully built.
     tracked.refuse_unusable_exclusions()?;
@@ -271,6 +283,16 @@ pub async fn rollback(req: RollbackRequest) -> Result<()> {
 pub async fn undo(req: UndoRequest) -> Result<()> {
     ensure_enabled()?;
     let (store, tracked, entries) = crate::history::open().await?;
+    undo_with(&store, &tracked, &entries, req).await
+}
+
+/// The undo over a store the caller already holds; see [`rollback_with`].
+pub(crate) async fn undo_with(
+    store: &Store,
+    tracked: &TrackedSet,
+    entries: &[Entry],
+    req: UndoRequest,
+) -> Result<()> {
     let repo = store
         .repo()
         .ok_or_else(|| eyre::eyre!("undoing requires git"))?;
@@ -282,7 +304,7 @@ pub async fn undo(req: UndoRequest) -> Result<()> {
     // points at it; undoing that undo puts its target back in line
     let mut undone: BTreeSet<String> = BTreeSet::new();
     let mut undoes_of: BTreeMap<String, String> = BTreeMap::new();
-    for entry in &entries {
+    for entry in entries {
         let Some(op) = entry.checkpoint.operation.as_ref() else {
             continue;
         };
@@ -480,7 +502,8 @@ async fn execute(
     // resolved from the trusted layers now, so nothing this operation writes
     // can change which commands run afterwards
     let reload = super::config::reload_commands()?;
-    let scope = OperationScope::begin_kind(exec.kind, &exec.command, false).await?;
+    let scope =
+        OperationScope::begin_restoring_in(store.state_dir(), exec.kind, &exec.command).await?;
     scope.with_operation(|op| {
         op.to = exec.to.clone();
         op.sources = exec.sources.clone();
