@@ -247,6 +247,11 @@ description = "run the history model tests"
 run = "cargo test --all-features -p mise-system --lib -- history::"
 env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
 
+["test:history:cold-adoption"]
+description = "a nested first adoption owns recovery and cannot bypass an active parent"
+run = "cargo test --all-features -p mise-system --lib -- history::scope::tests::cold_adoption_"
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
 ["test:history:cold-rollback"]
 description = "a cold rebuild derives each distinct manifest once, not once per checkpoint"
 run = "cargo test --all-features -p mise-system --lib -- history::checkpoint::tests::cold_rebuild_resolves_each_manifest_once"

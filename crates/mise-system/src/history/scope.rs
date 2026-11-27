@@ -205,6 +205,8 @@ pub struct OperationScope {
     shared: Option<Shared>,
     /// Opened on demand: the journal, if any, is in [`CURRENT`].
     lazy: bool,
+    /// A nested apply owns recovery, but restores its caller's attachment id.
+    inherited_operation: Option<std::ffi::OsString>,
 }
 
 impl OperationScope {
@@ -290,7 +292,11 @@ impl OperationScope {
             return Ok(Self::inactive());
         }
         let _initializing = INITIALIZING.lock().await;
-        if std::env::var_os(ENV_VAR).is_some() {
+        let inherited_operation = std::env::var_os(ENV_VAR);
+        // A lazy parent exports an id before it owns a journal or lock.
+        // Incoming application cannot attach without recovery: it opens its
+        // own writer below, and an active parent's lock still rejects it.
+        if inherited_operation.is_some() && kind != OperationKind::Apply {
             debug!("history: attached to the parent mise operation");
             return Ok(Self::inactive());
         }
@@ -313,6 +319,7 @@ impl OperationScope {
             return Ok(Self {
                 shared: None,
                 lazy: true,
+                inherited_operation,
             });
         }
         let writer = tokio::task::spawn_blocking(move || {
@@ -327,6 +334,7 @@ impl OperationScope {
         Ok(Self {
             shared: Some(shared),
             lazy: false,
+            inherited_operation,
         })
     }
 
@@ -334,6 +342,7 @@ impl OperationScope {
         Self {
             shared: None,
             lazy: false,
+            inherited_operation: None,
         }
     }
 
@@ -543,7 +552,7 @@ impl OperationScope {
     fn close(&mut self) -> Option<Shared> {
         if let Some(shared) = self.shared.take() {
             self.lazy = false;
-            Self::clear_current();
+            self.clear_current();
             return Some(shared);
         }
         if !self.lazy {
@@ -560,9 +569,13 @@ impl OperationScope {
         }
     }
 
-    fn clear_current() {
+    fn clear_current(&mut self) {
         *lock_unpoisoned(&CURRENT) = None;
-        env::remove_var(ENV_VAR);
+        if let Some(inherited) = self.inherited_operation.take() {
+            env::set_var(ENV_VAR, inherited);
+        } else {
+            env::remove_var(ENV_VAR);
+        }
     }
 }
 
@@ -1508,6 +1521,109 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn cold_adoption_under_lazy_parent_applies_with_recovery() -> Result<()> {
+        use super::super::manifest::{Enrollment, Manifest};
+        use super::super::sync::{apply, network::UPSTREAM_REF};
+
+        let temp = tempfile::tempdir()?;
+        // portable-home-ok: incoming home paths map through the real roots
+        let live = tempfile::tempdir_in(*mise_util::dirs::HOME)?;
+        let path = live.path().join("adopted");
+        let branch_path = super::super::sync::layout::Roots::current()
+            .branch_path(&path, None)
+            .unwrap();
+        let store = Store::open_in(temp.path())?;
+        let repo = store.repo().unwrap();
+        let tree = repo.write_tree(&[(
+            "100644".into(),
+            repo.hash_blob(b"incoming")?,
+            branch_path.clone(),
+        )])?;
+        let manifest = Manifest {
+            enrollment: vec![Enrollment {
+                path: branch_path,
+                autosave: true,
+                encrypt: false,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            }],
+            ..Default::default()
+        };
+        let tree = manifest.write(repo, &tree)?;
+        let upstream = repo.commit_tree(&tree, vec![], "incoming setup")?;
+        repo.update_ref(UPSTREAM_REF, &upstream, None)?;
+        let mut environment = mise_util::testing::EnvVarGuard::new();
+        // An unenrolled bootstrap exports an id before it has a journal or
+        // operation lock. Its task inherits that id into cold adoption.
+        environment.set(ENV_VAR, "lazy-parent");
+        let scope = OperationScope::begin_with_wait(
+            temp.path().to_path_buf(),
+            OperationKind::Apply,
+            "dotfiles pull",
+            false,
+            std::time::Duration::ZERO,
+            false,
+        )
+        .await?;
+        let outcome = apply::apply_locked_with_scope(
+            &store,
+            &TrackedSet::default(),
+            &apply::ApplyRequest::automatic(),
+            Some(scope),
+        )
+        .await?;
+        assert_eq!(outcome.written, 1);
+        assert_eq!(std::fs::read(&path)?, b"incoming");
+        let head = repo.ref_oid(HistoryRepo::HISTORY_REF)?.unwrap();
+        assert!(repo.rev_list(&head, usize::MAX)?.contains(&upstream));
+        assert!(store::list_pending_in(temp.path())?.is_empty());
+        assert_eq!(std::env::var(ENV_VAR)?.as_str(), "lazy-parent");
+        let index = store.rebuild_index()?;
+        let operation = index
+            .entries
+            .iter()
+            .filter_map(|entry| store::read_meta_cache_in(temp.path(), &entry.uuid).unwrap())
+            .filter_map(|checkpoint| checkpoint.operation)
+            .find(|operation| operation.kind == OperationKind::Apply)
+            .expect("the adoption must record a recovery operation");
+        assert_eq!(operation.status, OperationStatus::Completed);
+        assert_eq!(operation.applied.as_deref(), Some(upstream.as_str()));
+        assert_eq!(
+            operation.affected,
+            vec![mise_util::file::display_path(&path)]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cold_adoption_cannot_bypass_active_parent_lock() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let _store = Store::open_in(temp.path())?;
+        let held = LockFile::at(&store::operation_lock_in(temp.path()))
+            .try_lock()?
+            .unwrap();
+        let mut environment = mise_util::testing::EnvVarGuard::new();
+        environment.set(ENV_VAR, "active-parent");
+        let result = OperationScope::begin_with_wait(
+            temp.path().to_path_buf(),
+            OperationKind::Apply,
+            "dotfiles pull",
+            false,
+            std::time::Duration::ZERO,
+            false,
+        )
+        .await;
+        let error = result.err().expect("the parent owns the operation lock");
+        assert!(error.downcast_ref::<OperationLockBusy>().is_some());
+        assert_eq!(std::env::var(ENV_VAR)?.as_str(), "active-parent");
+        assert!(store::list_pending_in(temp.path())?.is_empty());
+        drop(held);
+        Ok(())
+    }
+
     #[test]
     fn application_checks_head_from_before_its_own_protective_commit() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -1530,6 +1646,7 @@ mod tests {
         let scope = OperationScope {
             shared: Some(Arc::new(Mutex::new(writer))),
             lazy: false,
+            inherited_operation: None,
         };
         assert!(!scope.starting_head_is(Some(&planned))?);
         assert!(scope.starting_head_is(Some(&saved))?);
