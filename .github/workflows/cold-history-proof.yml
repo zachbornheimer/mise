@@ -1,0 +1,38 @@
+name: Cold history proof artifact
+on:
+  push:
+    branches: [proof/cold-history-artifact]
+concurrency:
+  group: cold-history-proof-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  artifact:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y cmake pkg-config libssl-dev clang
+      - name: Install Rust
+        run: rustup toolchain install 1.95.0 --profile minimal && rustup default 1.95.0
+      - name: Install task runner
+        shell: bash
+        run: |
+          curl --fail --location https://github.com/jdx/mise/releases/download/v2026.11.14/mise-v2026.11.14-linux-x64.tar.gz | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/mise/bin" >> "$GITHUB_PATH"
+      - name: Build public history API driver
+        env:
+          MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+          MISE_TASK_RUN_AUTO_INSTALL: "false"
+          CARGO_BUILD_JOBS: "2"
+        run: mise run build:history-proof
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: history-proof-linux-x64
+          path: target/release/examples/history-proof
+          if-no-files-found: error
+          retention-days: 1

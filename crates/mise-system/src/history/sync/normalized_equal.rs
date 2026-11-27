@@ -578,13 +578,8 @@ fn both_machines_appending_different_lines_keeps_both() {
     let (base_commit, _) = encrypted_commit(&repo, None, path, b"shared\n", &key);
     let (local_commit, _) =
         encrypted_commit(&repo, Some(&base_commit), path, b"shared\nfrom-mac\n", &key);
-    let (remote_commit, _) = encrypted_commit(
-        &repo,
-        Some(&base_commit),
-        path,
-        b"shared\nfrom-vps\n",
-        &key,
-    );
+    let (remote_commit, _) =
+        encrypted_commit(&repo, Some(&base_commit), path, b"shared\nfrom-vps\n", &key);
     let (merged, conflicts) = repo.merge_tree(&local_commit, &remote_commit).unwrap();
     let (tree, remaining) = settle_conflicts(
         &repo,

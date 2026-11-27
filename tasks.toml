@@ -239,6 +239,37 @@ run = [
 description = 'Run tests with shuffling enabled'
 run = 'cargo +nightly test --all-features -- -Z unstable-options --shuffle'
 
+# A cold context is one with no index and no cached checkpoint metadata — a
+# machine that has just cloned the history. These are the two guarantees a
+# rollback on such a machine rests on, named for the proofs that gate them.
+["test:history"]
+description = "run the history model tests"
+run = "cargo test --all-features -p mise-system --lib -- history::"
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
+["test:history:cold-rollback"]
+description = "a cold rebuild derives each distinct manifest once, not once per checkpoint"
+run = "cargo test --all-features -p mise-system --lib -- history::checkpoint::tests::cold_rebuild_resolves_each_manifest_once"
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
+["test:history:cold-metadata-equivalence"]
+description = "a cold rebuild records exactly what a single commit read does"
+run = "cargo test --all-features -p mise-system --lib -- history::checkpoint::tests::cold_rebuild_matches_a_single_commit_read"
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
+["test:history:cold-restore"]
+description = "a cold encrypted history rolls back and undoes through the production path"
+run = "cargo test --all-features -p mise-system --lib -- history::checkpoint::tests::cold_restore"
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
+["format:history-proof"]
+description = "format the composed proof source with the repository Rust formatter"
+run = "cargo fmt --all"
+
+["build:history-proof"]
+description = "build the throwaway public history API Linux measurement driver"
+run = "cargo build --release -p mise-system --example history-proof"
+
 [install-dev]
 description = 'Install the current project in debug mode'
 run = 'cargo install --path . --debug'

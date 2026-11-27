@@ -632,10 +632,31 @@ impl Manifest {
     }
 
     pub(crate) fn read_gix(tree: &gix::Tree<'_>) -> Result<Option<Self>> {
-        let Some(entry) = tree.lookup_entry_by_path(PATH)? else {
+        let Some(entry) = Self::entry(tree)? else {
             return Ok(None);
         };
         Self::read_gix_entry(&entry).map(Some)
+    }
+
+    /// The tree entry a manifest sits in, validated as the regular file the
+    /// format requires — without reading it. Its object id is what a reader
+    /// memoizes the parsed manifest on: one blob, one parse, however many
+    /// checkpoints carry it.
+    pub(crate) fn entry<'repo>(
+        tree: &gix::Tree<'repo>,
+    ) -> Result<Option<gix::object::tree::Entry<'repo>>> {
+        let Some(entry) = tree.lookup_entry_by_path(PATH)? else {
+            return Ok(None);
+        };
+        if entry.mode().value() != 0o100644 {
+            bail!("dotfile enrollment metadata must be a regular file");
+        }
+        Ok(Some(entry))
+    }
+
+    /// [`Self::entry`]'s manifest, read.
+    pub(crate) fn read_entry(entry: &gix::object::tree::Entry<'_>) -> Result<Self> {
+        Self::read_gix_entry(entry)
     }
 
     /// Visits the manifest of each of `commits` that has one, in order, but

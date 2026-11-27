@@ -139,9 +139,7 @@ pub(crate) fn plaintext_versions(
 ) -> Result<Vec<UnpublishedPlaintext>> {
     let mut found = Vec::new();
     match published {
-        Some(published) => {
-            audit_unpublished_history(repo, head, published, protected, &mut found)?
-        }
+        Some(published) => audit_unpublished_history(repo, head, published, protected, &mut found)?,
         None => {
             audit_history_cached(repo, head, protected, &mut found)?;
         }
@@ -1536,13 +1534,7 @@ mod tests {
         );
         // A live policy change at the same head also invalidates the proof.
         assert!(
-            audit_history(
-                &repo,
-                &other,
-                None,
-                &BTreeSet::from(["home/secret".into()])
-            )
-            .is_err()
+            audit_history(&repo, &other, None, &BTreeSet::from(["home/secret".into()])).is_err()
         );
     }
 
