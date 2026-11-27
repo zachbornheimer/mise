@@ -268,7 +268,7 @@ run = "cargo fmt --all"
 
 ["build:history-proof"]
 description = "build the throwaway public history API Linux measurement driver"
-run = "cargo build --release -p mise-system --example history-proof"
+run = "cargo build --release -p mise-system --features vendored-lua --example history-proof"
 
 [install-dev]
 description = 'Install the current project in debug mode'
