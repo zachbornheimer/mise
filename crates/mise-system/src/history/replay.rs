@@ -25,7 +25,9 @@ use super::checkpoint::Store;
 use super::journal;
 use super::scope::OperationScope;
 use super::shadow::HistoryRepo;
-use super::store::{Checkpoint, Entry, OperationKind, OperationSource, OperationStatus, Summary};
+use super::store::{
+    Checkpoint, Entry, IndexEntry, OperationKind, OperationSource, OperationStatus, Summary,
+};
 use super::tracked::{
     TrackedSet, display_to_tree_path, normalize, normalize_target, tree_path_to_display,
 };
@@ -108,19 +110,15 @@ struct Target {
 
 pub async fn rollback(req: RollbackRequest) -> Result<()> {
     ensure_enabled()?;
-    let (store, tracked, entries) = crate::history::open().await?;
-    rollback_with(&store, &tracked, &entries, req).await
+    validate_rollback(&req)?;
+    let store = Store::open()?;
+    let tracked = TrackedSet::effective().await?;
+    rollback_with(&store, &tracked, req).await
 }
 
-/// The rollback over a store the caller already holds: the engine plans and
-/// records against one history, so resilience tests drive exactly the path a
-/// user's `mise dot rollback` drives.
-pub(crate) async fn rollback_with(
-    store: &Store,
-    tracked: &TrackedSet,
-    entries: &[Entry],
-    req: RollbackRequest,
-) -> Result<()> {
+/// The selections a rollback can answer. Checked before the store is opened,
+/// so a mistyped command changes nothing on disk.
+fn validate_rollback(req: &RollbackRequest) -> Result<()> {
     if req.all && !req.paths.is_empty() {
         bail!("choose explicit paths or `--all`, not both");
     }
@@ -132,13 +130,29 @@ pub(crate) async fn rollback_with(
     if req.to.is_none() && req.all {
         bail!("`--all` needs `--to <ref>`");
     }
+    Ok(())
+}
+
+/// [`rollback`] against a store the caller opened: the whole workflow from the
+/// tracked set to the applied plan.
+///
+/// **Selection reads the index, not the history.** The index says which
+/// checkpoints exist and in what order; a checkpoint record is read only when
+/// a decision needs its content, so rolling back one path costs the
+/// checkpoints that path has to be compared with rather than every checkpoint
+/// ever recorded.
+pub(crate) async fn rollback_with(
+    store: &Store,
+    tracked: &TrackedSet,
+    req: RollbackRequest,
+) -> Result<()> {
     // A rollback writes and removes live files, so it does not run on a
     // rule set that could not be fully built.
     tracked.refuse_unusable_exclusions()?;
     let repo = store
         .repo()
         .ok_or_else(|| eyre::eyre!("rolling back requires git"))?;
-    let live = live_tree(repo, &tracked)?;
+    let live = live_tree(repo, tracked)?;
     let paths: Vec<PathBuf> = req
         .paths
         .iter()
@@ -154,7 +168,7 @@ pub(crate) async fn rollback_with(
         // a repository found inside a tracked directory is skipped by
         // every capture, so a rollback has nothing to put back there and
         // says so rather than quietly doing nothing
-        if let Some(repository) = nested_repository_at_or_above(&tracked, path) {
+        if let Some(repository) = nested_repository_at_or_above(tracked, path) {
             // the target may be the repository itself, and "X is inside
             // X" is not a sentence that helps anyone
             if repository == *path {
@@ -173,11 +187,13 @@ pub(crate) async fn rollback_with(
             }
         }
     }
+    let handles = store.handles()?;
     let targets = match &req.to {
         Some(reference) => {
-            let entry = crate::history::resolve(
+            let entry = resolve_target(
+                store,
+                &handles,
                 reference,
-                &entries,
                 (paths.len() == 1)
                     .then(|| display_path(&paths[0]))
                     .as_deref(),
@@ -193,7 +209,8 @@ pub(crate) async fn rollback_with(
         None => {
             let mut by_id: BTreeMap<u64, Target> = BTreeMap::new();
             for path in &paths {
-                let Some(entry) = newest_differing(repo, &entries, &live, path, &tracked.local)?
+                let Some(entry) =
+                    newest_differing(store, &handles, repo, &live, path, &tracked.local)?
                 else {
                     info!(
                         "history: {} has no saved version that differs from the working tree",
@@ -230,13 +247,7 @@ pub(crate) async fn rollback_with(
             let portable = tree_path_to_display(&repository_path(repo, &live, path)?);
             let id = match req.to {
                 Some(_) => target.entry.id,
-                None => saved_in(
-                    entries
-                        .iter()
-                        .map(|entry| (entry.id, &entry.checkpoint.changes)),
-                    target.entry.id,
-                    &portable,
-                ),
+                None => saved_in(store, &handles, target.entry.id, &portable)?,
             };
             versions.entry(id).or_default().push(portable);
         }
@@ -272,9 +283,8 @@ pub(crate) async fn rollback_with(
             yes: req.yes,
             force: req.force,
         },
-        &store,
-        &tracked,
-        &entries,
+        store,
+        tracked,
         live,
     )
     .await
@@ -282,58 +292,28 @@ pub(crate) async fn rollback_with(
 
 pub async fn undo(req: UndoRequest) -> Result<()> {
     ensure_enabled()?;
-    let (store, tracked, entries) = crate::history::open().await?;
-    undo_with(&store, &tracked, &entries, req).await
+    let store = Store::open()?;
+    let tracked = TrackedSet::effective().await?;
+    undo_with(&store, &tracked, req).await
 }
 
-/// The undo over a store the caller already holds; see [`rollback_with`].
-pub(crate) async fn undo_with(
-    store: &Store,
-    tracked: &TrackedSet,
-    entries: &[Entry],
-    req: UndoRequest,
-) -> Result<()> {
+/// [`undo`] against a store the caller opened.
+///
+/// Undo restores exactly the paths an earlier operation touched, from the
+/// protective checkpoint it took. Which operation is next in line is decided
+/// from the lineage every operation records; only that lineage survives the
+/// scan, and only the operation being undone and its protective checkpoint are
+/// read out of the history again.
+pub(crate) async fn undo_with(store: &Store, tracked: &TrackedSet, req: UndoRequest) -> Result<()> {
     let repo = store
         .repo()
         .ok_or_else(|| eyre::eyre!("undoing requires git"))?;
-    let live = live_tree(repo, &tracked)?;
-    // an operation counts as undone only when an undo actually changed
-    // something for it: a declined or failed undo that touched nothing
-    // leaves the original next in line
-    // an operation counts as undone while an undo that changed something
-    // points at it; undoing that undo puts its target back in line
-    let mut undone: BTreeSet<String> = BTreeSet::new();
-    let mut undoes_of: BTreeMap<String, String> = BTreeMap::new();
-    for entry in entries {
-        let Some(op) = entry.checkpoint.operation.as_ref() else {
-            continue;
-        };
-        let Some(target) = op.undoes.clone() else {
-            continue;
-        };
-        if op.affected.is_empty() {
-            continue;
-        }
-        undone.insert(target.clone());
-        if let Some(reinstated) = undoes_of.get(&target) {
-            undone.remove(reinstated);
-        }
-        undoes_of.insert(entry.checkpoint.uuid.clone(), target);
-    }
+    let live = live_tree(repo, tracked)?;
+    let handles = store.handles()?;
+    let lineage = undo_lineage(store, &handles)?;
     let operation = match &req.reference {
-        Some(reference) => crate::history::resolve(reference, &entries, None)?,
-        None => entries
-            .iter()
-            .rev()
-            .find(|entry| {
-                entry.checkpoint.operation.as_ref().is_some_and(|op| {
-                    op.status != OperationStatus::Pending
-                        && op.before.is_some()
-                        && !op.affected.is_empty()
-                }) && !undone.contains(&entry.checkpoint.uuid)
-            })
-            .cloned()
-            .ok_or_else(|| eyre::eyre!("nothing to undo: no tracked-file operation is left"))?,
+        Some(reference) => resolve_target(store, &handles, reference, None)?,
+        None => newest_open_operation(store, &handles, &lineage)?,
     };
     let Some(op) = operation.checkpoint.operation.clone() else {
         bail!("checkpoint {} is not an operation", operation.id);
@@ -358,11 +338,7 @@ pub(crate) async fn undo_with(
             operation.id
         );
     };
-    let Some(before) = entries
-        .iter()
-        .find(|entry| &entry.checkpoint.uuid == before_uuid)
-        .cloned()
-    else {
+    let Some(before) = store.record_by_uuid(before_uuid)? else {
         bail!(
             "checkpoint {} is unavailable; cannot find the state before operation {}",
             before_uuid,
@@ -412,12 +388,84 @@ pub(crate) async fn undo_with(
             // restored exactly
             force: true,
         },
-        &store,
-        &tracked,
-        &entries,
+        store,
+        tracked,
         live,
     )
     .await
+}
+
+/// Which operations are undone, and which undo points at what, folded from
+/// every checkpoint's recorded operation.
+///
+/// **A scan, not a load.** Each record is read, folded in, and dropped, so the
+/// memory an undo costs is the lineage — a uuid and a target per operation —
+/// rather than a copy of the history it was read from.
+#[derive(Default)]
+struct Lineage {
+    undone: BTreeSet<String>,
+    undoes_of: BTreeMap<String, String>,
+}
+
+impl Lineage {
+    /// Whether an operation still has something to undo.
+    ///
+    /// An operation counts as undone only when an undo actually changed
+    /// something for it: a declined or failed undo that touched nothing
+    /// leaves the original next in line. Undoing that undo puts its target
+    /// back in line.
+    fn is_open(&self, entry: &Entry) -> bool {
+        entry.checkpoint.operation.as_ref().is_some_and(|op| {
+            op.status != OperationStatus::Pending && op.before.is_some() && !op.affected.is_empty()
+        }) && !self.undone.contains(&entry.checkpoint.uuid)
+    }
+}
+
+/// Folds the undo relations every checkpoint records, oldest first.
+fn undo_lineage(store: &Store, handles: &[IndexEntry]) -> Result<Lineage> {
+    let mut lineage = Lineage::default();
+    for handle in handles {
+        let Some(entry) = store.record(handle)? else {
+            continue;
+        };
+        let Some(op) = entry.checkpoint.operation.as_ref() else {
+            continue;
+        };
+        let Some(target) = op.undoes.clone() else {
+            continue;
+        };
+        if op.affected.is_empty() {
+            continue;
+        }
+        lineage.undone.insert(target.clone());
+        if let Some(reinstated) = lineage.undoes_of.get(&target) {
+            lineage.undone.remove(reinstated);
+        }
+        lineage
+            .undoes_of
+            .insert(entry.checkpoint.uuid.clone(), target);
+    }
+    Ok(lineage)
+}
+
+/// The newest operation nothing has undone yet, read newest first so the
+/// answer usually costs no more than the records above it.
+fn newest_open_operation(
+    store: &Store,
+    handles: &[IndexEntry],
+    lineage: &Lineage,
+) -> Result<Entry> {
+    for handle in handles.iter().rev() {
+        let Some(entry) = store.record(handle)? else {
+            continue;
+        };
+        if lineage.is_open(&entry) {
+            return Ok(entry);
+        }
+    }
+    Err(eyre::eyre!(
+        "nothing to undo: no tracked-file operation is left"
+    ))
 }
 
 /// Restoring needs the store, which `history.enabled = false` closes.
@@ -455,13 +503,7 @@ fn sources_of(targets: &[Target]) -> Vec<OperationSource> {
         .collect()
 }
 
-async fn execute(
-    exec: Execution,
-    store: &Store,
-    tracked: &TrackedSet,
-    entries: &[Entry],
-    live: String,
-) -> Result<()> {
+async fn execute(exec: Execution, store: &Store, tracked: &TrackedSet, live: String) -> Result<()> {
     let repo = store.repo().expect("checked by the caller");
     let mut steps = plan(repo, &exec, &live, &tracked.local)?;
     print_plan(&steps, &exec, tracked)?;
@@ -509,7 +551,7 @@ async fn execute(
         op.sources = exec.sources.clone();
         op.undoes = exec.undoes.clone();
     });
-    let result = apply_steps(&scope, repo, store, tracked, &exec, entries, &mut steps).await;
+    let result = apply_steps(&scope, repo, store, tracked, &exec, &mut steps).await;
     let (error, summary) = match &result {
         Ok(touched) => {
             scope.promote(touched);
@@ -556,10 +598,8 @@ async fn apply_steps(
     store: &Store,
     tracked: &TrackedSet,
     exec: &Execution,
-    entries: &[Entry],
     steps: &mut Vec<Step>,
 ) -> Result<Vec<PathBuf>> {
-    let _ = (store, entries);
     let mut round = 0;
     let mut live;
     loop {
@@ -594,7 +634,11 @@ async fn apply_steps(
         let Some((before_id, _)) = scope.before() else {
             bail!("no protective checkpoint could be taken; nothing was changed");
         };
-        let before = store::entry(store, before_id)?;
+        // the protective checkpoint, read on its own: verifying against it
+        // must not cost the whole history
+        let before = store
+            .record_by_id(before_id)?
+            .ok_or_else(|| eyre::eyre!("no history checkpoint {before_id}"))?;
         let before_tree = before
             .checkpoint
             .tree
@@ -1018,18 +1062,6 @@ fn actionable(steps: &[Step]) -> Vec<(PathBuf, Action)> {
         .filter(|step| step.action.mutates() || matches!(step.action, Action::Conflict(_)))
         .map(|step| (step.path.clone(), step.action.clone()))
         .collect()
-}
-
-mod store {
-    use super::*;
-
-    pub(super) fn entry(store: &Store, id: u64) -> Result<Entry> {
-        store
-            .list()?
-            .into_iter()
-            .find(|entry| entry.id == id)
-            .ok_or_else(|| eyre::eyre!("no history checkpoint {id}"))
-    }
 }
 
 /// The plan for every selected path of every target.
@@ -1774,29 +1806,83 @@ pub fn unsaved_paths(
     Ok(Some(unsaved))
 }
 
+/// Resolves a checkpoint reference the way `history::resolve` does, reading a
+/// record only for the checkpoint it names.
+///
+/// `latest[~N]` with a path scope counts only the checkpoints that changed that
+/// path, so that scope is the one selection that must read change lists; every
+/// other spelling is answered from the index alone.
+fn resolve_target(
+    store: &Store,
+    handles: &[IndexEntry],
+    spec: &str,
+    path: Option<&str>,
+) -> Result<Entry> {
+    // the checkpoints a reference may count, in index order. `latest[~N]`
+    // with a path scope counts only the checkpoints that changed the path, the
+    // one selection that must read change lists; every other spelling is
+    // answered from the index alone.
+    let id = match (path, spec.starts_with("latest")) {
+        (Some(path), true) => {
+            let mut touching: Vec<(u64, &str)> = vec![];
+            for handle in handles {
+                let Some(entry) = store.record(handle)? else {
+                    continue;
+                };
+                if entry.checkpoint.changes.touches(path) {
+                    touching.push((handle.id, handle.uuid.as_str()));
+                }
+            }
+            super::store::resolve_ref_parts(spec, touching.iter().copied())?
+        }
+        _ => super::store::resolve_ref_parts(
+            spec,
+            handles
+                .iter()
+                .map(|handle| (handle.id, handle.uuid.as_str())),
+        )?,
+    };
+    handles
+        .iter()
+        .find(|handle| handle.id == id)
+        .and_then(|handle| store.record(handle).transpose())
+        .transpose()?
+        .ok_or_else(|| eyre::eyre!("no history checkpoint {id}"))
+}
+
 /// The checkpoint that saved the version of `path` that checkpoint `id`
 /// holds: the newest one at or before it that changed the path, or `id`
 /// itself when none did. A truncated change list cannot say whether it
 /// changed the path, so reaching one also answers `id`, which does hold
 /// the version.
-fn saved_in<'a>(
-    changes: impl DoubleEndedIterator<Item = (u64, &'a super::store::Changes)>,
-    id: u64,
-    path: &str,
-) -> u64 {
-    changes
-        .rev()
-        .filter(|(entry, _)| *entry <= id)
-        .find(|(_, changes)| changes.truncated || changes.touches(path))
-        .filter(|(_, changes)| changes.touches(path))
-        .map_or(id, |(entry, _)| entry)
+///
+/// Reads the change lists between `id` and the answer one at a time, and keeps
+/// none of them: naming what a rollback restored must not cost a copy of the
+/// history behind it.
+fn saved_in(store: &Store, handles: &[IndexEntry], id: u64, path: &str) -> Result<u64> {
+    for handle in handles.iter().rev().filter(|handle| handle.id <= id) {
+        let Some(entry) = store.record(handle)? else {
+            continue;
+        };
+        let changes = &entry.checkpoint.changes;
+        if changes.touches(path) {
+            return Ok(handle.id);
+        }
+        if changes.truncated {
+            return Ok(id);
+        }
+    }
+    Ok(id)
 }
 
 /// The newest checkpoint whose captured content for `path` differs from the
-/// working tree, if any.
+/// working tree, if any. Records are read newest first until one answers, so
+/// the usual case costs the checkpoints above the change, not the whole
+/// history.
 fn newest_differing(
+    store: &Store,
+    handles: &[IndexEntry],
     repo: &HistoryRepo,
-    entries: &[Entry],
     live: &str,
     path: &Path,
     local: &[PathBuf],
@@ -1805,7 +1891,10 @@ fn newest_differing(
     let live = live.as_str();
     let tree_path = repository_path(repo, live, path)?;
     let current = repo.restored_object_at(live, &tree_path)?;
-    for entry in entries.iter().rev() {
+    for handle in handles.iter().rev() {
+        let Some(entry) = store.record(handle)? else {
+            continue;
+        };
         let Some(snapshot) = &entry.checkpoint.tree.snapshot else {
             continue;
         };
@@ -1831,7 +1920,7 @@ fn newest_differing(
                         })
                 });
                 if changed {
-                    return Ok(Some(entry.clone()));
+                    return Ok(Some(entry));
                 }
             }
             if saved.is_none()
@@ -1841,7 +1930,7 @@ fn newest_differing(
                     PathState::Absent
                 )
             {
-                return Ok(Some(entry.clone()));
+                return Ok(Some(entry));
             }
             // the same bytes under other permissions differ too
             let recorded = recorded_bits(&entry.checkpoint, &tree_path, &normalize_target(path));
@@ -1852,7 +1941,7 @@ fn newest_differing(
             if !differs {
                 continue;
             }
-            return Ok(Some(entry.clone()));
+            return Ok(Some(entry));
         }
         // held content that differs, or a known absence while the path now
         // exists, are both versions to return to
@@ -1862,7 +1951,7 @@ fn newest_differing(
                 PathState::Absent
             );
         if differs {
-            return Ok(Some(entry.clone()));
+            return Ok(Some(entry));
         }
     }
     Ok(None)
@@ -2190,34 +2279,6 @@ fn config_hint(touched: &[PathBuf]) {
 mod reload_tests {
     use super::*;
 
-    /// A rollback names the checkpoint that changed the path, and falls back
-    /// to the one it restores from when a truncated change list in between
-    /// leaves that unknown.
-    #[test]
-    fn saved_in_names_the_checkpoint_that_changed_the_path() {
-        use super::super::store::Changes;
-        let touching = Changes {
-            modified: vec!["~/.zshrc".into()],
-            ..Default::default()
-        };
-        let other = Changes {
-            modified: vec!["~/.other".into()],
-            ..Default::default()
-        };
-        let truncated = Changes {
-            modified: vec!["~/.other".into()],
-            truncated: true,
-            ..Default::default()
-        };
-        let versions = [(1, &touching), (2, &other), (3, &other), (4, &touching)];
-        assert_eq!(saved_in(versions.into_iter(), 3, "~/.zshrc"), 1);
-        assert_eq!(saved_in(versions.into_iter(), 4, "~/.zshrc"), 4);
-        // nothing at or before it changed the path
-        assert_eq!(saved_in(versions.into_iter(), 3, "~/.none"), 3);
-        let versions = [(1, &touching), (2, &truncated), (3, &other)];
-        assert_eq!(saved_in(versions.into_iter(), 3, "~/.zshrc"), 3);
-    }
-
     #[test]
     fn excluded_empty_directories_require_removal_approval() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -2282,5 +2343,493 @@ mod reload_tests {
         );
         let outside = PathBuf::from("/etc/hosts");
         assert_eq!(reload_path(&outside), outside);
+    }
+}
+
+/// What a selected replay costs: the checkpoint records it reads.
+///
+/// A history is thousands of checkpoints, each holding its change list, its
+/// coverage and its modes, and replaying one path used to materialize all of
+/// them. These tests read one path out of a history whose older bulk is large
+/// and irrelevant, and then assert both what the caller sees — the checkpoint
+/// named, the object planned, the operation next in line — and that the records
+/// behind it were never read.
+#[cfg(test)]
+mod retention {
+    use super::super::checkpoint::{Draft, Outcome};
+    use super::super::manifest::{Enrollment, Manifest};
+    use super::super::store::{
+        self, Changes, DescriptionSource, Index, Operation, TreeInfo, Trigger,
+    };
+    use super::super::sync::layout::Roots;
+    use super::super::tracked::{TrackedEntry, normalize};
+    use super::*;
+    use crate::files::{FileMode, FilePolicy};
+
+    /// Older checkpoints a replay of one path must not read. Each carries a
+    /// change list naming this many paths it did not touch.
+    const UNRELATED: u64 = 64;
+    const UNRELATED_PATHS: usize = 2000;
+
+    /// A change list as large as a real checkpoint's, naming paths no probe
+    /// file is under.
+    fn unrelated_changes() -> Changes {
+        Changes {
+            modified: (0..UNRELATED_PATHS)
+                .map(|index| format!("~/.unrelated/{index}"))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn reads() -> usize {
+        store::RECORD_READS.with(|reads| reads.get())
+    }
+
+    fn forget_reads() {
+        store::RECORD_READS.with(|reads| reads.set(0));
+    }
+
+    /// A directory inside `$HOME`, which is where a tracked path can be
+    /// spelled portably.
+    fn probe() -> Result<(tempfile::TempDir, PathBuf)> {
+        let dir = tempfile::Builder::new()
+            .prefix(".history-replay-retention-")
+            .tempdir_in(Roots::current().home)?;
+        let path = normalize(dir.path());
+        Ok((dir, path))
+    }
+
+    /// The tracked set a real capture of `dir` runs under.
+    fn tracked_for(dir: &Path) -> Result<TrackedSet> {
+        let entry = TrackedEntry::new(
+            dir.to_path_buf(),
+            "track",
+            FilePolicy::for_mode(FileMode::Track),
+        );
+        Ok(TrackedSet {
+            manifest: Manifest {
+                enrollment: vec![Enrollment {
+                    path: entry.tree_path(dir)?,
+                    autosave: true,
+                    encrypt: false,
+                    allow_plaintext: None,
+                    variants: vec![],
+                    exclude: None,
+                    include: None,
+                }],
+                ..Default::default()
+            },
+            entries: vec![entry],
+            ..Default::default()
+        })
+    }
+
+    /// One index line and its record, written through the store's own writers
+    /// the way an index rebuild writes them. `payload` fills the record with a
+    /// change list of paths no replay of the probe file looks at.
+    fn seed(
+        store: &Store,
+        id: u64,
+        changes: Changes,
+        operation: Option<Operation>,
+    ) -> Result<IndexEntry> {
+        let uuid = store::new_uuid();
+        let checkpoint = Checkpoint {
+            schema_version: store::SCHEMA_VERSION,
+            uuid: uuid.clone(),
+            machine: store.machine().clone(),
+            created_at: store::now_rfc3339(),
+            mise_version: mise_util::deprecation::VERSION_PLAIN.clone(),
+            trigger: if operation.is_some() {
+                Trigger::Rollback
+            } else {
+                Trigger::Save
+            },
+            description: String::new(),
+            description_source: DescriptionSource::Computed,
+            summary: String::new(),
+            task: None,
+            labels: vec![],
+            tree: TreeInfo {
+                snapshot: None,
+                available: true,
+                reason: None,
+                roots: vec![],
+                coverage: Default::default(),
+                modes: BTreeMap::new(),
+            },
+            changes,
+            operation,
+        };
+        store::write_meta_cache_in(store.state_dir(), &checkpoint)?;
+        Ok(line(id, &checkpoint))
+    }
+
+    fn line(id: u64, checkpoint: &Checkpoint) -> IndexEntry {
+        IndexEntry {
+            id,
+            uuid: checkpoint.uuid.clone(),
+            commit: format!("{id:040x}"),
+            created_at: checkpoint.created_at.clone(),
+            trigger: checkpoint.trigger,
+        }
+    }
+
+    fn changes(modified: &[&str]) -> Changes {
+        Changes {
+            modified: modified.iter().map(|path| path.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn operation(
+        kind: OperationKind,
+        status: OperationStatus,
+        before: &str,
+        undoes: Option<&str>,
+        affected: &[&str],
+    ) -> Operation {
+        Operation {
+            id: format!("op-{}", store::new_uuid()),
+            kind,
+            status,
+            command: kind.as_str().into(),
+            argv: vec![],
+            cwd: PathBuf::new(),
+            user: None,
+            finished_at: None,
+            error: None,
+            before: Some(before.into()),
+            to: None,
+            undoes: undoes.map(str::to_string),
+            applied: None,
+            affected: affected.iter().map(|path| path.to_string()).collect(),
+            sources: vec![],
+            directories: vec![],
+            directory_modes: Default::default(),
+            message: None,
+            journal: vec![],
+        }
+    }
+
+    /// Rolling back one path reads the checkpoint that holds its version and
+    /// the change list that names it — not the older history, and not the
+    /// protective checkpoint a listing would have to find first.
+    #[test]
+    fn rollback_reads_only_the_checkpoint_it_replays() -> Result<()> {
+        let state = tempfile::tempdir()?;
+        let store = Store::open_in(state.path())?;
+        let Some(repo) = store.repo() else {
+            return Ok(());
+        };
+        let (_probe, dir) = probe()?;
+        let tracked = tracked_for(&dir)?;
+        let file = dir.join("settings.json");
+
+        std::fs::write(&file, "v1")?;
+        let Outcome::Created(first) = store.attempt(&tracked, Draft::new(Trigger::Edit))? else {
+            panic!("the first capture records")
+        };
+        std::fs::write(&file, "v2")?;
+        let Outcome::Created(second) = store.attempt(&tracked, Draft::new(Trigger::Edit))? else {
+            panic!("the second capture records")
+        };
+        // the working tree moves on, unsaved: the version to put back is v2
+        std::fs::write(&file, "v3")?;
+
+        // the history behind those two checkpoints: older records with large
+        // change lists, exactly what a load-everything replay materialized
+        let mut lines: Vec<IndexEntry> = (0..UNRELATED)
+            .map(|index| seed(&store, index + 1, unrelated_changes(), None))
+            .collect::<Result<_>>()?;
+        lines.push(line(UNRELATED + 1, &first.checkpoint));
+        lines.push(line(UNRELATED + 2, &second.checkpoint));
+        store::write_index_in(
+            store.state_dir(),
+            &Index {
+                next_id: UNRELATED + 3,
+                entries: lines,
+            },
+        )?;
+
+        let handles = store.handles()?;
+        assert_eq!(handles.len() as u64, UNRELATED + 2);
+        assert_eq!(
+            store.list()?.len(),
+            handles.len(),
+            "the history exists to be read"
+        );
+        let live = live_tree(repo, &tracked)?;
+
+        forget_reads();
+        let target = newest_differing(&store, &handles, repo, &live, &file, &tracked.local)?
+            .expect("a saved version differs from the working tree");
+        assert_eq!(target.id, UNRELATED + 2, "the newest differing version");
+        assert_eq!(target.checkpoint.uuid, second.checkpoint.uuid);
+        assert_eq!(reads(), 1, "the newest checkpoint answers first");
+
+        let portable = tree_path_to_display(&repository_path(repo, &live, &file)?);
+        let named = saved_in(&store, &handles, target.id, &portable)?;
+        assert_eq!(named, UNRELATED + 2, "the checkpoint that changed the path");
+        assert_eq!(reads(), 2, "and only that checkpoint's change list");
+
+        // what the caller sees: one write back to the saved bytes
+        let exec = Execution {
+            kind: OperationKind::Rollback,
+            command: format!("bootstrap dotfiles rollback {}", display_path(&file)),
+            targets: vec![Target {
+                entry: target.clone(),
+                paths: vec![file.clone()],
+            }],
+            message: format!("rolled back {portable} to checkpoint {named}"),
+            to: Some(target.checkpoint.uuid.clone()),
+            sources: sources_of(&[Target {
+                entry: target.clone(),
+                paths: vec![file.clone()],
+            }]),
+            undoes: None,
+            restore_dirs: BTreeSet::new(),
+            restore_modes: BTreeMap::new(),
+            dry_run: true,
+            yes: true,
+            force: false,
+        };
+        let steps = plan(repo, &exec, &live, &tracked.local)?;
+        let step = steps
+            .iter()
+            .find(|step| step.path == file)
+            .expect("the saved file is part of the plan");
+        let (mode, oid) = repo
+            .object_at(
+                target.checkpoint.tree.snapshot.as_deref().unwrap(),
+                &step.tree_path,
+            )?
+            .expect("the checkpoint holds the file");
+        assert_eq!(
+            step.action,
+            Action::Write {
+                mode,
+                oid: oid.clone()
+            }
+        );
+        assert_eq!(
+            repo.cat_object(&oid)?,
+            b"v2",
+            "the saved bytes are restored"
+        );
+        assert_eq!(std::fs::read(&file)?, b"v3", "planning writes nothing");
+        assert_eq!(reads(), 2, "planning reads no checkpoint record");
+
+        // the protective checkpoint a replay verifies against, and the one
+        // undo restores from, are single lookups
+        forget_reads();
+        assert_eq!(store.record_by_id(target.id)?.unwrap().id, target.id);
+        assert_eq!(reads(), 1);
+        forget_reads();
+        assert_eq!(
+            store.record_by_uuid(&target.checkpoint.uuid)?.unwrap().id,
+            target.id
+        );
+        assert_eq!(reads(), 1);
+
+        // naming a checkpoint reads only the record it names
+        forget_reads();
+        assert_eq!(
+            resolve_target(&store, &handles, "latest", None)?.id,
+            UNRELATED + 2
+        );
+        assert_eq!(reads(), 1, "a reference resolves from the index");
+        Ok(())
+    }
+
+    /// Naming what a rollback restored falls back to the checkpoint that holds
+    /// the version when a truncated change list cannot say whether it changed
+    /// the path.
+    /// `latest` names the newest checkpoint a listing can show. A checkpoint
+    /// whose cached record is gone is not one of them: an unscoped reference
+    /// still names the one before it, while naming the unreadable checkpoint
+    /// itself fails closed rather than substituting another.
+    #[test]
+    fn latest_skips_a_checkpoint_no_listing_can_show() -> Result<()> {
+        let state = tempfile::tempdir()?;
+        let store = Store::open_in(state.path())?;
+        let lines: Vec<IndexEntry> = (1..=3)
+            .map(|id| seed(&store, id, changes(&["~/.zshrc"]), None))
+            .collect::<Result<_>>()?;
+        store::write_index_in(
+            store.state_dir(),
+            &Index {
+                next_id: 4,
+                entries: lines.clone(),
+            },
+        )?;
+        // the index still names it; its derived record is gone
+        std::fs::remove_file(store::meta_cache_path_in(state.path(), &lines[2].uuid))?;
+        let handles = store.handles()?;
+        assert_eq!(
+            handles.len(),
+            2,
+            "a checkpoint no listing can show is not counted"
+        );
+        assert_eq!(resolve_target(&store, &handles, "latest", None)?.id, 2);
+        assert_eq!(resolve_target(&store, &handles, "latest~1", None)?.id, 1);
+        assert!(
+            resolve_target(&store, &handles, "3", None).is_err(),
+            "naming the unreadable checkpoint directly fails closed"
+        );
+        assert!(resolve_target(&store, &handles, "latest~2", None).is_err());
+        Ok(())
+    }
+    #[test]
+    fn saved_in_falls_back_when_a_change_list_is_truncated() -> Result<()> {
+        let state = tempfile::tempdir()?;
+        let store = Store::open_in(state.path())?;
+        let index = |lines: Vec<IndexEntry>| Index {
+            next_id: lines.len() as u64 + 1,
+            entries: lines,
+        };
+        let lines = vec![
+            seed(&store, 1, changes(&["~/.zshrc"]), None)?,
+            seed(&store, 2, changes(&["~/.other"]), None)?,
+            seed(&store, 3, changes(&["~/.other"]), None)?,
+            seed(&store, 4, changes(&["~/.zshrc"]), None)?,
+        ];
+        store::write_index_in(store.state_dir(), &index(lines))?;
+        let handles = store.handles()?;
+        assert_eq!(saved_in(&store, &handles, 3, "~/.zshrc")?, 1);
+        assert_eq!(saved_in(&store, &handles, 4, "~/.zshrc")?, 4);
+        // nothing at or before it changed the path
+        assert_eq!(saved_in(&store, &handles, 3, "~/.none")?, 3);
+        // a truncated list cannot say whether it changed the path, so the
+        // checkpoint that holds the version is the answer
+        let truncated = Changes {
+            truncated: true,
+            ..changes(&["~/.other"])
+        };
+        let lines = vec![
+            seed(&store, 1, changes(&["~/.zshrc"]), None)?,
+            seed(&store, 2, truncated, None)?,
+            seed(&store, 3, changes(&["~/.other"]), None)?,
+        ];
+        store::write_index_in(store.state_dir(), &index(lines))?;
+        let handles = store.handles()?;
+        assert_eq!(saved_in(&store, &handles, 3, "~/.zshrc")?, 3);
+        Ok(())
+    }
+
+    /// Which operation undo takes is decided from the relations every
+    /// checkpoint records, read once and folded: an operation whose undo was
+    /// itself undone is back in line, a failed operation that changed paths is
+    /// reversible, and a pending one is not.
+    #[test]
+    fn undo_lineage_folds_undoes_and_keeps_only_the_relations() -> Result<()> {
+        let state = tempfile::tempdir()?;
+        let store = Store::open_in(state.path())?;
+        let bootstrap = seed(
+            &store,
+            1,
+            changes(&["~/.a"]),
+            Some(operation(
+                OperationKind::Bootstrap,
+                OperationStatus::Completed,
+                "before-bootstrap",
+                None,
+                &["~/.a"],
+            )),
+        )?;
+        let first_undo = seed(
+            &store,
+            2,
+            changes(&["~/.a"]),
+            Some(operation(
+                OperationKind::Undo,
+                OperationStatus::Completed,
+                "before-undo",
+                Some(&bootstrap.uuid),
+                &["~/.a"],
+            )),
+        )?;
+        let second_undo = seed(
+            &store,
+            3,
+            changes(&["~/.a"]),
+            Some(operation(
+                OperationKind::Undo,
+                OperationStatus::Completed,
+                "before-undo",
+                Some(&first_undo.uuid),
+                &["~/.a"],
+            )),
+        )?;
+        let failed = seed(
+            &store,
+            4,
+            changes(&["~/.f"]),
+            Some(operation(
+                OperationKind::Bootstrap,
+                OperationStatus::Failed,
+                "before-failed",
+                None,
+                &["~/.f"],
+            )),
+        )?;
+        let pending = seed(
+            &store,
+            5,
+            changes(&["~/.p"]),
+            Some(operation(
+                OperationKind::Rollback,
+                OperationStatus::Pending,
+                "before-pending",
+                None,
+                &["~/.p"],
+            )),
+        )?;
+        let lines = vec![
+            bootstrap.clone(),
+            first_undo.clone(),
+            second_undo.clone(),
+            failed.clone(),
+            pending.clone(),
+            // a plain save records no operation at all
+            seed(&store, 6, unrelated_changes(), None)?,
+        ];
+        store::write_index_in(
+            store.state_dir(),
+            &Index {
+                next_id: 7,
+                entries: lines,
+            },
+        )?;
+        let handles = store.handles()?;
+        forget_reads();
+        let lineage = undo_lineage(&store, &handles)?;
+        assert_eq!(
+            reads(),
+            handles.len(),
+            "every record is read once, and dropped"
+        );
+        assert_eq!(lineage.undone, BTreeSet::from([first_undo.uuid.clone()]));
+        assert_eq!(
+            lineage.undoes_of,
+            BTreeMap::from([
+                (first_undo.uuid.clone(), bootstrap.uuid.clone()),
+                (second_undo.uuid.clone(), first_undo.uuid.clone()),
+            ])
+        );
+        // undoing the undo puts the operation it reversed back in line
+        assert!(lineage.is_open(&store.record_by_uuid(&bootstrap.uuid)?.unwrap()));
+        assert!(!lineage.is_open(&store.record_by_uuid(&first_undo.uuid)?.unwrap()));
+        // a pending operation still has nothing to undo
+        assert!(!lineage.is_open(&store.record_by_uuid(&pending.uuid)?.unwrap()));
+
+        let next = newest_open_operation(&store, &handles, &lineage)?;
+        assert_eq!(next.id, failed.id, "the failed operation is next in line");
+        assert_eq!(
+            next.checkpoint.operation.as_ref().unwrap().status,
+            OperationStatus::Failed
+        );
+        Ok(())
     }
 }

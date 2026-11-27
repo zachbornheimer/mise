@@ -262,6 +262,41 @@ description = "a cold encrypted history rolls back and undoes through the produc
 run = "cargo test --all-features -p mise-system --lib -- history::checkpoint::tests::cold_restore"
 env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
 
+["test:history:replay-retention"]
+description = 'Prove rollback and undo read only the checkpoint records they replay'
+run = "cargo test -p mise-system --features vendored-lua --lib -- history::replay::retention"
+
+
+["test:history:retention"]
+description = "a full index rebuild holds one checkpoint payload at a time"
+run = """
+set -eu
+filter='history::checkpoint::tests::rebuild_index_holds_one_checkpoint_payload_at_a_time'
+listing=$(cargo test --all-features -p mise-system --lib -- --list)
+count=$(printf '%s\n' "$listing" | grep -c "$filter" || true)
+if [ "$count" -ne 1 ]; then
+  echo "expected 1 test matching $filter, found $count" >&2
+  exit 1
+fi
+cargo test --all-features -p mise-system --lib -- "$filter"
+"""
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
+["test:history:rebuild"]
+description = "a full index rebuild records every checkpoint row, id, and annotation"
+run = """
+set -eu
+filter='history::checkpoint::tests::rebuild_index_records_every_checkpoint_row'
+listing=$(cargo test --all-features -p mise-system --lib -- --list)
+count=$(printf '%s\n' "$listing" | grep -c "$filter" || true)
+if [ "$count" -ne 1 ]; then
+  echo "expected 1 test matching $filter, found $count" >&2
+  exit 1
+fi
+cargo test --all-features -p mise-system --lib -- "$filter"
+"""
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
 ["format:history-proof"]
 description = "format the composed proof source with the repository Rust formatter"
 run = "cargo fmt --all"
