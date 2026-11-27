@@ -1139,7 +1139,6 @@ impl Store {
         repo: &HistoryRepo,
         existing: store::Index,
     ) -> Result<Index> {
-        let mut entries = vec![];
         let messages = repo.history_messages()?;
         // A fresh adoption's protective snapshot is not an ancestor of the
         // published history. Undo finds it by the commit the operation
@@ -1172,49 +1171,56 @@ impl Store {
         }
         let gix = repo.gix()?;
         let mut caches = store::CacheBatch::new(&self.state_dir);
+        // one resolution per distinct manifest: a rebuild visits thousands of
+        // checkpoints and a history holds a handful of manifests
+        let mut manifests = shadow::ManifestCache::default();
+        let mut retained_ids: BTreeMap<&str, u64> = BTreeMap::new();
+        for entry in &existing.entries {
+            retained_ids.entry(entry.uuid.as_str()).or_insert(entry.id);
+        }
+        let mut next_id = existing.next_id.max(1);
+        let mut rows = Vec::with_capacity(commits.len());
         for (commit, annotation) in commits {
             // Annotation commits remain in Git ancestry, but are not new file
             // checkpoints and must not move `latest` in the history browser.
             if annotation.is_some() {
                 continue;
             }
-            let mut checkpoint = match store::read_commit_meta_cache_in(&self.state_dir, &commit)? {
-                Some(checkpoint) => checkpoint,
-                None => {
-                    let checkpoint = HistoryRepo::read_meta_in(&gix, &commit)?;
-                    caches.write_commit_meta(&commit, &checkpoint)?;
-                    checkpoint
-                }
-            };
+            let mut checkpoint = held(
+                match store::read_commit_meta_cache_in(&self.state_dir, &commit)? {
+                    Some(checkpoint) => checkpoint,
+                    None => {
+                        let checkpoint =
+                            HistoryRepo::read_meta_reusing(&gix, &mut manifests, &commit)?;
+                        caches.write_commit_meta(&commit, &checkpoint)?;
+                        checkpoint
+                    }
+                },
+            );
             if let Some(annotations) = annotations.get(&commit) {
                 for annotation in annotations {
                     annotation.apply_to(&mut checkpoint);
                 }
             }
             caches.write_meta(&checkpoint)?;
-            let id = existing.by_uuid(&commit).map(|entry| entry.id);
-            entries.push((id, checkpoint, commit));
+            let id = match retained_ids.get(commit.as_str()) {
+                Some(id) => *id,
+                None => {
+                    let id = next_id;
+                    next_id += 1;
+                    id
+                }
+            };
+            #[cfg(test)]
+            rows.push(checkpoint.into_row(id, commit));
+            #[cfg(not(test))]
+            rows.push(index_row(checkpoint, id, commit));
         }
         caches.finish()?;
-        let mut next_id = existing.next_id.max(1);
         let mut index = Index {
             next_id,
-            entries: vec![],
+            entries: rows,
         };
-        for (id, checkpoint, commit) in entries {
-            let id = id.unwrap_or_else(|| {
-                let id = next_id;
-                next_id += 1;
-                id
-            });
-            index.entries.push(IndexEntry {
-                id,
-                uuid: checkpoint.uuid,
-                commit,
-                created_at: checkpoint.created_at,
-                trigger: checkpoint.trigger,
-            });
-        }
         index.next_id = next_id.max(index.entries.iter().map(|e| e.id + 1).max().unwrap_or(1));
         store::write_index_in(&self.state_dir, &index)?;
         store::write_index_context_in(&self.state_dir)?;
@@ -1273,6 +1279,7 @@ impl Store {
             caches.write_meta(&checkpoint)?;
         }
         let mut next_id = index.next_id.max(1);
+        let mut manifests = shadow::ManifestCache::default();
         for (commit, annotation) in parsed {
             if annotation.is_some() {
                 continue;
@@ -1280,7 +1287,7 @@ impl Store {
             let mut checkpoint = match store::read_commit_meta_cache_in(&self.state_dir, &commit)? {
                 Some(checkpoint) => checkpoint,
                 None => {
-                    let checkpoint = HistoryRepo::read_meta_in(&gix, &commit)?;
+                    let checkpoint = HistoryRepo::read_meta_reusing(&gix, &mut manifests, &commit)?;
                     caches.write_commit_meta(&commit, &checkpoint)?;
                     checkpoint
                 }
@@ -1350,6 +1357,102 @@ fn fresh_history(repo: &HistoryRepo, last: &str) -> Result<Option<Vec<(String, S
         commit = parent.detach();
     }
 }
+
+/// The index row a checkpoint contributes.
+///
+/// Taking the checkpoint by value is the contract: everything the index does
+/// not keep is dropped here, before the rebuild reads the next checkpoint.
+fn index_row(checkpoint: Checkpoint, id: u64, commit: String) -> IndexEntry {
+    IndexEntry {
+        id,
+        uuid: checkpoint.uuid,
+        commit,
+        created_at: checkpoint.created_at,
+        trigger: checkpoint.trigger,
+    }
+}
+
+/// The checkpoint a full rebuild holds while it writes that checkpoint's
+/// caches and row. The test build observes how many are held at once; a normal
+/// build holds the payload itself.
+#[cfg(not(test))]
+fn held(checkpoint: Checkpoint) -> Checkpoint {
+    checkpoint
+}
+
+/// Test-only count of the full checkpoint payloads a rebuild holds at once.
+///
+/// The rebuild must reduce each checkpoint to its index row before reading the
+/// next one, so the live set stays at one payload however long the history is.
+#[cfg(test)]
+mod payload_watch {
+    use std::cell::Cell;
+
+    use super::{Checkpoint, IndexEntry, index_row};
+
+    thread_local! {
+        static LIVE: Cell<usize> = const { Cell::new(0) };
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// A checkpoint the rebuild holds until it is reduced to its row.
+    pub(super) struct Held(Option<Checkpoint>);
+
+    pub(super) fn held(checkpoint: Checkpoint) -> Held {
+        LIVE.with(|live| {
+            let now = live.get() + 1;
+            live.set(now);
+            PEAK.with(|peak| peak.set(peak.get().max(now)));
+        });
+        Held(Some(checkpoint))
+    }
+
+    impl Held {
+        pub(super) fn into_row(mut self, id: u64, commit: String) -> IndexEntry {
+            // The payload is consumed by the row conversion; the count drops
+            // where its bytes do.
+            let row = index_row(self.0.take().expect("a held checkpoint"), id, commit);
+            LIVE.with(|live| live.set(live.get().saturating_sub(1)));
+            row
+        }
+    }
+
+    impl std::ops::Deref for Held {
+        type Target = Checkpoint;
+
+        fn deref(&self) -> &Checkpoint {
+            self.0.as_ref().expect("a held checkpoint")
+        }
+    }
+
+    impl std::ops::DerefMut for Held {
+        fn deref_mut(&mut self) -> &mut Checkpoint {
+            self.0.as_mut().expect("a held checkpoint")
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            if self.0.take().is_some() {
+                LIVE.with(|live| live.set(live.get().saturating_sub(1)));
+            }
+        }
+    }
+
+    /// Forgets what earlier rebuilds on this thread held.
+    pub(super) fn reset() {
+        LIVE.with(|live| live.set(0));
+        PEAK.with(|peak| peak.set(0));
+    }
+
+    /// The most payloads a rebuild held at once since [`reset`].
+    pub(super) fn peak() -> usize {
+        PEAK.with(Cell::get)
+    }
+}
+
+#[cfg(test)]
+use payload_watch::held;
 
 /// Append annotation metadata to ordinary history and rebuild its derived view.
 pub fn annotate(store: &Store, entry: &Entry, annotation: Annotation) -> Result<()> {
@@ -2123,6 +2226,207 @@ mod tests {
             store.list()?.last().unwrap().checkpoint.description,
             "checkpoint 7"
         );
+        Ok(())
+    }
+
+    /// The manifest a fixture history saves: one enrollment with the
+    /// non-default permissions given.
+    fn fixture_manifest(permissions: &[(&str, u32)]) -> super::super::manifest::Manifest {
+        super::super::manifest::Manifest {
+            format: 1,
+            enrollment: vec![super::super::manifest::Enrollment {
+                path: "home/.guard".into(),
+                autosave: true,
+                encrypt: false,
+                allow_plaintext: None,
+                variants: vec![],
+                exclude: None,
+                include: None,
+            }],
+            exclude: vec![],
+            recipients: vec![],
+            permissions: permissions
+                .iter()
+                .map(|(path, bits)| ((*path).to_string(), *bits))
+                .collect(),
+        }
+    }
+
+    /// A snapshot tree holding `manifest` and one saved file under the
+    /// enrolled directory.
+    fn fixture_tree(
+        repo: &HistoryRepo,
+        manifest: &super::super::manifest::Manifest,
+        file: &str,
+    ) -> Result<String> {
+        let tree = manifest.write(repo, &repo.empty_object("tree")?)?;
+        let blob = repo.hash_blob(file.as_bytes())?;
+        repo.compose(
+            &tree,
+            &[Overlay {
+                path: "home/.guard/guard.conf".into(),
+                object: Some(("100644".into(), blob)),
+            }],
+        )
+    }
+
+    /// Writes one ordinary checkpoint per `(tree, description)`, each the
+    /// next child of the last, and lists the commits oldest first.
+    fn write_history(repo: &HistoryRepo, trees: &[(String, String)]) -> Result<Vec<String>> {
+        let mut commits = vec![];
+        for (index, (tree, description)) in trees.iter().enumerate() {
+            let mut checkpoint = test_checkpoint(&format!("fixture-{index}"), Some(tree));
+            checkpoint.description = description.clone();
+            checkpoint.summary = description.clone();
+            commits.push(repo.write_checkpoint(Some(tree), &checkpoint)?);
+        }
+        Ok(commits)
+    }
+
+    /// **A cold context derives each distinct manifest once, not once per
+    /// checkpoint.**
+    ///
+    /// The guest this was measured on held 11,340 checkpoints that shared 182
+    /// manifests. Rebuilding from nothing re-ran the enrollment ownership
+    /// search for each of 1,462 saved permissions against 124 enrollments —
+    /// 329 of 1,449 samples of a rollback that never finished — once for every
+    /// commit in the history. That derivation is a fact about the manifest, so
+    /// a walk does it once for each one.
+    #[test]
+    fn cold_rebuild_resolves_each_manifest_once() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open_in(temp.path())?;
+        let Some(repo) = store.repo() else {
+            return Ok(());
+        };
+        let first = fixture_manifest(&[("home/.guard", 0o700), ("home/.guard/nested", 0o750)]);
+        let mut moved = first.clone();
+        moved.permissions.insert("home/.guard".into(), 0o711);
+        let trees = vec![
+            (fixture_tree(&repo, &first, "one\n")?, "first".to_string()),
+            (fixture_tree(&repo, &first, "two\n")?, "carried".to_string()),
+            (
+                fixture_tree(&repo, &first, "three\n")?,
+                "carried".to_string(),
+            ),
+            // the same file, a moved permission: the checkpoint changes the
+            // mode and nothing else
+            (
+                fixture_tree(&repo, &moved, "three\n")?,
+                "permissions moved".to_string(),
+            ),
+            (
+                fixture_tree(&repo, &moved, "five\n")?,
+                "carried".to_string(),
+            ),
+        ];
+        write_history(&repo, &trees)?;
+
+        crate::history::tracked::reset_ownership_searches();
+        shadow::reset_manifest_resolutions();
+        shadow::reset_read_meta_calls();
+        let index = store.rebuild_index()?;
+
+        // two manifests across five checkpoints
+        assert_eq!(index.entries.len(), 5);
+        assert_eq!(shadow::read_meta_calls(), 5);
+        assert_eq!(
+            shadow::manifest_resolutions(),
+            2,
+            "a checkpoint after the first re-derived its manifest's ownership"
+        );
+        // the search is bounded by the manifests, never by the checkpoints:
+        // two manifests of two permissions each is at most four searches
+        assert!(
+            crate::history::tracked::ownership_searches() <= 4,
+            "the cold rebuild searched entry ownership {} times for two \
+             manifests of two permissions",
+            crate::history::tracked::ownership_searches()
+        );
+
+        // and the records it wrote are the ones the manifest governs
+        let entries = store.list()?;
+        assert_eq!(entries.len(), 5);
+        assert_eq!(
+            entries[0].checkpoint.tree.modes,
+            BTreeMap::from([
+                ("~/.guard".to_string(), 0o700u32),
+                ("~/.guard/nested".to_string(), 0o750u32),
+            ]),
+            "a checkpoint did not record the modes its manifest governs here"
+        );
+        assert_eq!(
+            entries[3].checkpoint.tree.modes.get("~/.guard"),
+            Some(&0o711),
+            "the checkpoint after the permission change kept the old mode"
+        );
+        // the mode change is what that checkpoint changed, so a path-scoped
+        // rollback can find the checkpoint that moved it
+        assert!(
+            entries[3]
+                .checkpoint
+                .changes
+                .modified
+                .contains(&"~/.guard".to_string()),
+            "the moved permission is not in the checkpoint's changes: {:?}",
+            entries[3].checkpoint.changes.modified
+        );
+        Ok(())
+    }
+
+    /// **A cold rebuild records exactly what reading the commit by itself
+    /// does.** Sharing one manifest resolution across a walk is only sound if
+    /// every checkpoint still owns its own record, so each is compared against
+    /// an independent read.
+    #[test]
+    fn cold_rebuild_matches_a_single_commit_read() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open_in(temp.path())?;
+        let Some(repo) = store.repo() else {
+            return Ok(());
+        };
+        let first = fixture_manifest(&[("home/.guard", 0o700)]);
+        let mut nested_added = first.clone();
+        nested_added
+            .permissions
+            .insert("home/.guard/nested".into(), 0o750);
+        let mut guard_dropped = nested_added.clone();
+        guard_dropped.permissions.remove("home/.guard");
+        let mut trees = vec![
+            (fixture_tree(&repo, &first, "a\n")?, "first".to_string()),
+            (fixture_tree(&repo, &first, "b\n")?, "carried".to_string()),
+            (
+                fixture_tree(&repo, &nested_added, "c\n")?,
+                "nested added".to_string(),
+            ),
+            (String::new(), "carried".to_string()),
+            (
+                fixture_tree(&repo, &guard_dropped, "e\n")?,
+                "guard dropped".to_string(),
+            ),
+        ];
+        // the fourth checkpoint carries the third one's tree unchanged
+        trees[3].0 = trees[2].0.clone();
+        let commits = write_history(&repo, &trees)?;
+
+        shadow::reset_manifest_resolutions();
+        store.rebuild_index()?;
+        let rebuild_resolutions = shadow::manifest_resolutions();
+        let entries = store.list()?;
+        assert_eq!(entries.len(), commits.len());
+
+        for (entry, commit) in entries.iter().zip(&commits) {
+            // the whole record, not a chosen field: a shared manifest
+            // resolution must not change anything a checkpoint says
+            assert_eq!(
+                serde_json::to_value(&entry.checkpoint)?,
+                serde_json::to_value(&repo.read_meta(commit)?)?,
+                "checkpoint {} differs from reading its commit by itself",
+                entry.id
+            );
+        }
+        // three distinct manifests across five checkpoints
+        assert_eq!(rebuild_resolutions, 3);
         Ok(())
     }
 
@@ -3213,11 +3517,9 @@ mod tests {
 
         // the production rollback plans, captures its own protective
         // checkpoint, and restores the saved version
-        let entries = store.list()?;
         super::super::replay::rollback_with(
             &store,
             &tracked,
-            &entries,
             super::super::replay::RollbackRequest {
                 paths: vec![target.clone()],
                 to: Some(before_index.entries[0].id.to_string()),
@@ -3267,11 +3569,129 @@ mod tests {
 
         // production undo restores that exact preimage; the unrelated edit
         // is still untouched and nothing this test wrote stands in for undo
-        let entries = store.list()?;
         super::super::replay::undo_with(
             &store,
             &tracked,
-            &entries,
+            super::super::replay::UndoRequest {
+                reference: None,
+                dry_run: false,
+                yes: true,
+            },
+        )
+        .await?;
+        assert_eq!(std::fs::read(&target)?, b"target live\n");
+        assert_eq!(std::fs::read(&unrelated)?, b"other live\n");
+        Ok(())
+    }
+
+    /// **A cold history restores and undoes through the production path.**
+    ///
+    /// Two encrypted save checkpoints exist and then every cached record is
+    /// destroyed, so the store is in the state a freshly cloned machine is in:
+    /// opening it rebuilds the index from the commits before anything is
+    /// restored. `rollback_with` and `undo_with` are the calls `mise dot
+    /// rollback` and `mise dot undo` make once they hold the store, so the
+    /// plan, the protective capture and the writes are the production ones.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cold_restore_rolls_back_and_undoes_a_cold_encrypted_history() -> Result<()> {
+        let (_key, recipient) = encryption_identity();
+        let (state, _home, store, tracked, target, unrelated, index) =
+            two_checkpoint_fixture(&recipient)?;
+        let target_path = tracked.entries[0].tree_path(&target)?;
+        std::fs::write(&target, "target live\n")?;
+        std::fs::write(&unrelated, "other live\n")?;
+
+        // cold: no index and no cached record of any checkpoint survives
+        let index_dir = ["history/index", "index"]
+            .iter()
+            .map(|relative| state.path().join(relative))
+            .find(|dir| dir.is_dir())
+            .expect("the store's index directory");
+        std::fs::remove_dir_all(&index_dir)?;
+        drop(store);
+        let store = Store::open_in(state.path())?;
+        let entries = store.list()?;
+        assert_eq!(
+            entries.len(),
+            2,
+            "a cold store rebuilds its index from the commits"
+        );
+        let repo = store.repo().expect("the rebuilt store has its repository");
+
+        // the production rollback captures its own protective checkpoint and
+        // restores the saved version, leave no plaintext behind
+        super::super::replay::rollback_with(
+            &store,
+            &tracked,
+            super::super::replay::RollbackRequest {
+                paths: vec![target.clone()],
+                to: Some(index.entries[0].id.to_string()),
+                all: false,
+                dry_run: false,
+                yes: true,
+                force: false,
+            },
+        )
+        .await?;
+        assert_eq!(std::fs::read(&target)?, b"target one\n");
+        assert_eq!(
+            std::fs::read(&unrelated)?,
+            b"other live\n",
+            "an unrelated live edit survives a path rollback"
+        );
+        for plaintext in [
+            b"target one\n".as_slice(),
+            b"target saved\n".as_slice(),
+            b"target live\n".as_slice(),
+            b"other live\n".as_slice(),
+        ] {
+            let oid = gix::objs::compute_hash(
+                repo.gix()?.object_hash(),
+                gix::object::Kind::Blob,
+                plaintext,
+            )?;
+            assert!(
+                repo.gix()?.find_header(oid).is_err(),
+                "no plaintext version may be stored: {}",
+                String::from_utf8_lossy(plaintext)
+            );
+        }
+
+        // the operation's protective preimage is the live edit, encrypted
+        let after_rollback = store.list()?;
+        let operation = after_rollback
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.checkpoint.operation.as_ref().is_some_and(|op| {
+                    op.undoes.is_none() && op.before.is_some() && !op.affected.is_empty()
+                })
+            })
+            .expect("the rollback recorded an operation");
+        let op = operation.checkpoint.operation.clone().unwrap();
+        let before = after_rollback
+            .iter()
+            .find(|entry| Some(&entry.checkpoint.uuid) == op.before.as_ref())
+            .expect("the protective checkpoint is listed");
+        let object = repo
+            .object_at(
+                &before.checkpoint.tree.snapshot.clone().unwrap(),
+                &target_path,
+            )?
+            .expect("the protective checkpoint holds the restored path");
+        assert!(
+            repo.cat_object(&object.1)?
+                .starts_with(b"mise-encrypted-file-v1\n"),
+            "a protective preimage stays encrypted at rest"
+        );
+        let saved = super::super::sync::files::decrypt(repo, &target_path, &object, false)?;
+        assert_eq!(repo.cat_object(&saved.1)?, b"target live\n");
+
+        // production undo restores that exact preimage
+        super::super::replay::undo_with(
+            &store,
+            &tracked,
             super::super::replay::UndoRequest {
                 reference: None,
                 dry_run: false,
@@ -3388,6 +3808,220 @@ mod tests {
         Ok(())
     }
 
+    /// A full rebuild holds one checkpoint payload at a time, not a history's
+    /// worth.
+    ///
+    /// A checkpoint record carries its labels, coverage and change lists; the
+    /// index keeps five small fields. Holding the records until the caches
+    /// were flushed sized the rebuild with the whole history.
+    #[test]
+    fn rebuild_index_holds_one_checkpoint_payload_at_a_time() -> Result<()> {
+        const COUNT: usize = 24;
+        const LABEL_BYTES: usize = 512 * 1024;
+        let temp = tempfile::tempdir()?;
+        let store = Store::open_in(temp.path())?;
+        let Some(repo) = store.repo() else {
+            return Ok(());
+        };
+        let tree = repo.empty_object("tree")?;
+        let mut committed = Vec::new();
+        for i in 0..COUNT {
+            let mut checkpoint = test_checkpoint(&format!("retained-{i}"), Some(&tree));
+            checkpoint.description = format!("retained checkpoint {i}");
+            checkpoint.summary = checkpoint.description.clone();
+            checkpoint.labels = vec![format!("{i}:{}", "x".repeat(LABEL_BYTES))];
+            let commit = repo.write_checkpoint(Some(&tree), &checkpoint)?;
+            committed.push((commit, checkpoint));
+        }
+        let payload_bytes: usize = committed
+            .iter()
+            .map(|(_, checkpoint)| checkpoint.labels[0].len())
+            .sum();
+        assert!(
+            payload_bytes >= 8 * 1024 * 1024,
+            "the fixture must hold a long history's worth of payload"
+        );
+
+        payload_watch::reset();
+        let first = store.rebuild_index()?;
+        assert_eq!(
+            payload_watch::peak(),
+            1,
+            "the rebuild held {} checkpoint payloads at once; each must become its index row before the next is read",
+            payload_watch::peak()
+        );
+        assert_rebuilt_rows(&first, &committed);
+
+        // Ids already handed out survive a rebuild, including ids that do not
+        // continue the default sequence.
+        let mut renumbered = store::load_index_in(temp.path())?;
+        for (offset, entry) in renumbered.entries.iter_mut().enumerate() {
+            entry.id = 100 + offset as u64;
+        }
+        renumbered.next_id = 200;
+        store::write_index_in(temp.path(), &renumbered)?;
+
+        payload_watch::reset();
+        let second = store.rebuild_index()?;
+        assert_eq!(payload_watch::peak(), 1);
+        assert_rebuilt_rows(&second, &committed);
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            (100..100 + COUNT as u64).collect::<Vec<_>>(),
+            "a rebuild must keep the ids it already handed out"
+        );
+        assert_eq!(
+            second.next_id, 200,
+            "a rebuild must keep the id space it found"
+        );
+
+        // An annotation lands on the row it names without the rebuild holding
+        // any other checkpoint's payload.
+        let (target, _) = &committed[COUNT / 2];
+        repo.write_annotation(
+            target,
+            &Annotation {
+                description: Some("annotated mid-history".into()),
+                description_source: Some(DescriptionSource::User),
+                updated_at: store::now_rfc3339(),
+                ..Default::default()
+            },
+        )?;
+        payload_watch::reset();
+        let annotated =
+            store.rebuild_full_index_locked(repo, store::load_index_in(temp.path())?)?;
+        assert_eq!(payload_watch::peak(), 1);
+        assert_eq!(annotated.entries.len(), COUNT);
+        let listed = store.list()?;
+        assert_eq!(listed.len(), COUNT);
+        let entry = listed
+            .iter()
+            .find(|entry| &entry.commit == target)
+            .expect("the annotated checkpoint is listed");
+        assert_eq!(entry.checkpoint.description, "annotated mid-history");
+        assert_eq!(entry.id, 100 + (COUNT / 2) as u64);
+        Ok(())
+    }
+
+    fn assert_rebuilt_rows(index: &Index, committed: &[(String, Checkpoint)]) {
+        assert_eq!(index.entries.len(), committed.len());
+        for (row, (commit, checkpoint)) in index.entries.iter().zip(committed) {
+            assert_eq!(&row.uuid, commit, "a row names the commit it indexes");
+            assert_eq!(&row.commit, commit);
+            assert_eq!(row.trigger, checkpoint.trigger);
+            assert!(!row.created_at.is_empty());
+        }
+    }
+
+    fn row_facts(index: &Index) -> Vec<(u64, String, String, String, Trigger)> {
+        index
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    entry.uuid.clone(),
+                    entry.commit.clone(),
+                    entry.created_at.clone(),
+                    entry.trigger,
+                )
+            })
+            .collect()
+    }
+
+    /// Every checkpoint gets exactly one row, in ancestry order, and an
+    /// annotation edits a checkpoint's view without adding, moving, or
+    /// renumbering a row.
+    #[test]
+    fn rebuild_index_records_every_checkpoint_row() -> Result<()> {
+        const COUNT: u64 = 6;
+        let temp = tempfile::tempdir()?;
+        let store = Store::open_in(temp.path())?;
+        let Some(repo) = store.repo() else {
+            return Ok(());
+        };
+        let tree = repo.empty_object("tree")?;
+        let mut committed = Vec::new();
+        for i in 0..COUNT {
+            let mut checkpoint = test_checkpoint(&format!("row-{i}"), Some(&tree));
+            checkpoint.description = format!("checkpoint {i}");
+            checkpoint.summary = checkpoint.description.clone();
+            checkpoint.labels = vec![format!("label-{i}")];
+            let commit = repo.write_checkpoint(Some(&tree), &checkpoint)?;
+            committed.push((commit, checkpoint));
+        }
+
+        let first = store.rebuild_index()?;
+        assert_rebuilt_rows(&first, &committed);
+        assert_eq!(
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            (1..=COUNT).collect::<Vec<_>>()
+        );
+        assert_eq!(first.next_id, COUNT + 1);
+        let listed = store.list()?;
+        assert_eq!(
+            listed
+                .iter()
+                .map(|entry| entry.checkpoint.description.clone())
+                .collect::<Vec<_>>(),
+            (0..COUNT)
+                .map(|i| format!("checkpoint {i}"))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            listed.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            first
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>()
+        );
+        let rows = row_facts(&first);
+
+        let (target, _) = &committed[1];
+        repo.write_annotation(
+            target,
+            &Annotation {
+                description: Some("renamed checkpoint 1".into()),
+                description_source: Some(DescriptionSource::User),
+                updated_at: store::now_rfc3339(),
+                ..Default::default()
+            },
+        )?;
+        let annotation = repo
+            .ref_oid(HistoryRepo::HISTORY_REF)?
+            .expect("annotation commit");
+        let annotated = store.rebuild_index()?;
+        assert_eq!(
+            row_facts(&annotated),
+            rows,
+            "an annotation commit adds no row and moves none"
+        );
+        assert_eq!(annotated.next_id, COUNT + 1);
+        assert_eq!(
+            store.list()?[1].checkpoint.description,
+            "renamed checkpoint 1"
+        );
+
+        repo.update_history_head(&committed[COUNT as usize - 1].0, Some(&annotation))?;
+        let restored = store.rebuild_index()?;
+        assert_eq!(row_facts(&restored), rows);
+        let listed = store.list()?;
+        assert_eq!(listed[1].checkpoint.description, "checkpoint 1");
+        assert_eq!(
+            listed[1].checkpoint.description_source,
+            DescriptionSource::Computed
+        );
+        Ok(())
+    }
     #[cfg(unix)]
     fn encryption_identity() -> (mise_util::testing::EnvVarGuard, String) {
         use age::secrecy::ExposeSecret;

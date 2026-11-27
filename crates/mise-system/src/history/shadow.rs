@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{LazyLock, Mutex};
 
 use eyre::{Result, WrapErr, bail};
@@ -85,6 +86,23 @@ pub(crate) fn reset_blob_header_reads() {
 #[cfg(test)]
 pub(crate) fn blob_header_reads() -> usize {
     BLOB_HEADER_READS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    static MANIFEST_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many distinct manifests a metadata walk has resolved: the work
+/// [`ManifestCache`] exists to do once, not once per checkpoint.
+#[cfg(test)]
+pub(crate) fn reset_manifest_resolutions() {
+    MANIFEST_RESOLUTIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn manifest_resolutions() -> usize {
+    MANIFEST_RESOLUTIONS.with(std::cell::Cell::get)
 }
 
 /// One top-level root of a snapshot tree and the files to add under it,
@@ -530,6 +548,86 @@ fn encryption_cache_key(dir: &Path) -> Result<[u8; 32]> {
             }
         }
         Err(error) => Err(error.into()),
+    }
+}
+
+/// One manifest, resolved against this machine's layout: the directory modes
+/// its own governing streams own here, and the coverage its enrollment
+/// declares before a checkpoint's own record is folded in.
+///
+/// **A manifest hardly ever changes, so a history holds a handful of them** —
+/// 182 of 11,340 checkpoints on the store this was measured against.
+/// Resolving one per checkpoint instead ran the enrollment's ownership search
+/// for each of 1,462 saved permissions against 124 enrollments, once for every
+/// commit in the history.
+struct LocalManifest {
+    /// The non-default permissions the manifest saved, by portable path.
+    permissions: BTreeMap<String, u32>,
+    /// Directory modes by the display path a checkpoint records.
+    modes: BTreeMap<String, u32>,
+    coverage: super::store::Coverage,
+}
+
+impl LocalManifest {
+    fn of(manifest: super::manifest::Manifest) -> Result<Self> {
+        let tracked = manifest.saved_tracking()?;
+        let layout = super::sync::layout::Roots::current();
+        let mut modes = BTreeMap::new();
+        // only the record under the key that governs the path on this machine
+        // counts, the same key the pull planner applies: another stream's
+        // record for a directory whose governing stream has none (the default)
+        // is not this checkpoint's mode
+        for (portable, bits) in &manifest.permissions {
+            if let Some(path) = layout.locate(portable).path()
+                && super::tracked::governing_key(&layout, &tracked.entries, path).as_deref()
+                    == Some(portable)
+            {
+                modes.insert(mise_util::file::display_path(path), *bits);
+            }
+        }
+        let coverage = tracked.coverage(&super::tracked::Walk {
+            entries: tracked.entries.clone(),
+            ..Default::default()
+        });
+        Ok(Self {
+            permissions: manifest.permissions,
+            modes,
+            coverage,
+        })
+    }
+}
+
+/// The manifests one walk over a history has resolved, by the blob that holds
+/// them, so reading many checkpoints derives each distinct manifest once.
+///
+/// **The blob is the whole key.** What a manifest resolves to also depends on
+/// this machine's roots, environments and machine name, but those are fixed
+/// for the life of the process, so a cache that lives for one walk can key on
+/// the manifest alone and still never hand a checkpoint another machine's
+/// reading of it.
+#[derive(Default)]
+pub(crate) struct ManifestCache {
+    resolved: BTreeMap<gix::ObjectId, Rc<LocalManifest>>,
+}
+
+impl ManifestCache {
+    /// The tree's manifest, resolved — read and derived only the first time
+    /// this walk meets the blob that holds it.
+    fn resolve(&mut self, tree: &gix::Tree<'_>) -> Result<Option<Rc<LocalManifest>>> {
+        let Some(entry) = super::manifest::Manifest::entry(tree)? else {
+            return Ok(None);
+        };
+        let id = entry.object_id();
+        if let Some(resolved) = self.resolved.get(&id) {
+            return Ok(Some(resolved.clone()));
+        }
+        #[cfg(test)]
+        MANIFEST_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+        let resolved = Rc::new(LocalManifest::of(super::manifest::Manifest::read_entry(
+            &entry,
+        )?)?);
+        self.resolved.insert(id, resolved.clone());
+        Ok(Some(resolved))
     }
 }
 
@@ -1437,12 +1535,22 @@ impl HistoryRepo {
     /// [`Self::read_meta`] through an open repository, so a walk over many
     /// commits opens it once rather than once per commit.
     pub(crate) fn read_meta_in(repo: &gix::Repository, commit: &str) -> Result<Checkpoint> {
+        Self::read_meta_reusing(repo, &mut ManifestCache::default(), commit)
+    }
+
+    /// [`Self::read_meta_in`] over a walk: each distinct manifest is read and
+    /// resolved once for the walk, not once per checkpoint.
+    pub(crate) fn read_meta_reusing(
+        repo: &gix::Repository,
+        manifests: &mut ManifestCache,
+        commit: &str,
+    ) -> Result<Checkpoint> {
         #[cfg(test)]
         READ_META_CALLS.with(|count| count.set(count.get() + 1));
         let id = gix::ObjectId::from_hex(commit.as_bytes())?;
         let commit_object = repo.find_commit(id)?;
         let tree = commit_object.tree()?;
-        let manifest = super::manifest::Manifest::read_gix(&tree)?;
+        let manifest = manifests.resolve(&tree)?;
         let message = commit_object.message_raw()?;
         let message = String::from_utf8_lossy(message.as_ref()).trim().to_string();
         let own_record = message
@@ -1516,7 +1624,11 @@ impl HistoryRepo {
             .transpose()?
             .map(|commit| commit.tree())
             .transpose()?;
-        for change in Self::gix_changes(repo, parent_tree.as_ref(), &tree)? {
+        // One listing of this commit's tree answers both what changed and
+        // what the tree holds: a rebuild over a whole history otherwise walks
+        // every tree three times.
+        let (changes, files) = Self::gix_changes(repo, parent_tree.as_ref(), &tree)?;
+        for change in changes {
             if change.path.starts_with(".mise-history/") {
                 continue;
             }
@@ -1532,46 +1644,45 @@ impl HistoryRepo {
         record.tree.snapshot = Some(tree.id().to_string());
         record.tree.available = true;
         if let Some(manifest) = manifest {
-            let previous = if let Some(tree) = parent_tree.as_ref() {
-                super::manifest::Manifest::read_gix(tree)?.unwrap_or_default()
-            } else {
-                Default::default()
+            let previous = match parent_tree.as_ref() {
+                Some(tree) => manifests.resolve(tree)?,
+                None => None,
             };
-            for path in manifest
-                .permissions
-                .keys()
-                .chain(previous.permissions.keys())
-                .collect::<BTreeSet<_>>()
+            // the same manifest blob is the same saved rules: nothing moved
+            // between the commits, so the permission diff has nothing to add
+            if !previous
+                .as_ref()
+                .is_some_and(|previous| Rc::ptr_eq(&manifest, previous))
             {
-                if manifest.permissions.get(path) != previous.permissions.get(path) {
-                    let path = super::tracked::tree_path_to_display(path);
-                    if !record.changes.touches(&path) {
-                        record.changes.modified.push(path);
+                for path in manifest
+                    .permissions
+                    .keys()
+                    .chain(
+                        previous
+                            .as_ref()
+                            .into_iter()
+                            .flat_map(|previous| previous.permissions.keys()),
+                    )
+                    .collect::<BTreeSet<_>>()
+                {
+                    if manifest.permissions.get(path)
+                        != previous
+                            .as_ref()
+                            .and_then(|previous| previous.permissions.get(path))
+                    {
+                        let path = super::tracked::tree_path_to_display(path);
+                        if !record.changes.touches(&path) {
+                            record.changes.modified.push(path);
+                        }
                     }
                 }
             }
-            let tracked = manifest.saved_tracking()?;
-            record.tree.modes.clear();
-            let layout = super::sync::layout::Roots::current();
             // only the record under the key that governs the path on this
             // machine counts, the same key the pull planner applies: another
             // stream's record for a directory whose governing stream has
             // none (the default) is not this checkpoint's mode
-            for (portable, bits) in &manifest.permissions {
-                if let Some(path) = layout.locate(portable).path()
-                    && super::tracked::governing_key(&layout, &tracked.entries, path).as_deref()
-                        == Some(portable)
-                {
-                    record
-                        .tree
-                        .modes
-                        .insert(mise_util::file::display_path(path), *bits);
-                }
-            }
-            let mut coverage = tracked.coverage(&super::tracked::Walk {
-                entries: tracked.entries.clone(),
-                ..Default::default()
-            });
+            record.tree.modes = manifest.modes.clone();
+            let mut coverage = manifest.coverage.clone();
             // The writer's matcher determines known absences; rebuilding
             // metadata must not reinterpret an old snapshot as current.
             coverage.matcher = record.tree.coverage.matcher;
@@ -1592,7 +1703,7 @@ impl HistoryRepo {
             // nothing is written to the tree for it — so it has to be
             // carried forward like the other two
             coverage.nested.append(&mut record.tree.coverage.nested);
-            let files = Self::gix_tree_entries(repo, &tree)?;
+            let layout = super::sync::layout::Roots::current();
             // **Another machine's checkpoint did not save this machine's
             // version of a per-machine file.** Its tree has no stream for
             // this machine, which must not read as a saved absence: a
@@ -1635,7 +1746,6 @@ impl HistoryRepo {
             }
             record.tree.coverage = coverage;
             let mut roots: BTreeMap<String, RootRecord> = BTreeMap::new();
-            let layout = super::sync::layout::Roots::current();
             for file in files {
                 let located = layout.locate(&file.path);
                 let Some(path) = located.path() else {
@@ -1726,11 +1836,15 @@ impl HistoryRepo {
         Ok(entries)
     }
 
+    /// A commit's changes against its parent, and the listing of its own
+    /// tree the diff was measured on: **one walk of the tree answers both**,
+    /// where reading a whole history used to walk every tree three times.
     fn gix_changes(
         repo: &gix::Repository,
         from: Option<&gix::Tree<'_>>,
         to: &gix::Tree<'_>,
-    ) -> Result<Vec<Change>> {
+    ) -> Result<(Vec<Change>, Vec<TreeEntry>)> {
+        let to_entries = Self::gix_tree_entries(repo, to)?;
         let mut changes = vec![];
         Self::gix_diff_level(
             repo,
@@ -1740,7 +1854,7 @@ impl HistoryRepo {
             &mut changes,
         )?;
         changes.sort_by(|left, right| left.path.cmp(&right.path));
-        Ok(changes)
+        Ok((changes, to_entries))
     }
 
     /// One level of [`Self::gix_changes`]. A subtree whose id is the same on
@@ -4308,9 +4422,15 @@ mod tests {
         let b_tree = gix
             .find_tree(gix::ObjectId::from_hex(b.tree.as_bytes()).unwrap())
             .unwrap();
+        let (diff, listing) = HistoryRepo::gix_changes(&gix, Some(&a_tree), &b_tree).unwrap();
+        assert_eq!(diff, changes);
+        // the same walk answers what the tree holds, in path order
         assert_eq!(
-            HistoryRepo::gix_changes(&gix, Some(&a_tree), &b_tree).unwrap(),
-            changes
+            listing
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["home/.new", "home/.zshrc"]
         );
         let initial = repo.changes(None, &a.tree).unwrap();
         assert_eq!(initial.len(), 2);

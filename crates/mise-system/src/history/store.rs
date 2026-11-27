@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use eyre::{Result, WrapErr, bail, eyre};
 use serde::{Deserialize, Serialize};
 
+use super::checkpoint::Store;
 use super::journal::JournalEntry;
 use mise_util::file::{self, display_path};
 
@@ -1255,24 +1256,104 @@ pub(crate) fn remove_marker_in(state_dir: &Path) {
     let _ = std::fs::remove_file(operation_marker_in(state_dir));
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many checkpoint records this thread has materialized: the
+    /// payload a read costs. A replay of one path asks for the records it
+    /// replays, not for the whole history behind it.
+    pub(crate) static RECORD_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One index line's checkpoint record, read on its own.
+///
+/// **The one place a checkpoint record is materialized for a reader.**
+/// Listing, one selected replay, and a single lookup all come through here,
+/// so what a command costs in memory is the records it asks for rather than
+/// the length of the history. `None` when the cached record is missing: the
+/// repository is authoritative, and the next history command with a usable
+/// git rebuilds the index from it.
+pub(crate) fn record_in(state_dir: &Path, line: &IndexEntry) -> Result<Option<Entry>> {
+    #[cfg(test)]
+    RECORD_READS.with(|reads| reads.set(reads.get() + 1));
+    Ok(match read_meta_cache_in(state_dir, &line.uuid)? {
+        Some(checkpoint) => Some(Entry {
+            id: line.id,
+            commit: line.commit.clone(),
+            checkpoint,
+        }),
+        None => {
+            warn!(
+                "history: checkpoint {} ({}) has no cached record; run any history command with a usable git to rebuild the index",
+                line.id, line.uuid
+            );
+            None
+        }
+    })
+}
+
 /// Loads every indexed checkpoint, oldest first.
 pub(crate) fn list_in(state_dir: &Path) -> Result<Vec<Entry>> {
     let index = load_index_in(state_dir)?;
     let mut entries = Vec::with_capacity(index.entries.len());
     for line in &index.entries {
-        match read_meta_cache_in(state_dir, &line.uuid)? {
-            Some(checkpoint) => entries.push(Entry {
-                id: line.id,
-                commit: line.commit.clone(),
-                checkpoint,
-            }),
-            None => warn!(
-                "history: checkpoint {} ({}) has no cached record; run any history command with a usable git to rebuild the index",
-                line.id, line.uuid
-            ),
+        if let Some(entry) = record_in(state_dir, line)? {
+            entries.push(entry);
         }
     }
     Ok(entries)
+}
+
+/// Selected reads over the index: the checkpoints a command replays, without
+/// the history around them.
+///
+/// The [`Store`] type belongs to [`super::checkpoint`]; these reads live here
+/// because they are the same on-disk read [`list_in`] performs, one index
+/// line at a time, and the index is owned by this module.
+/// Whether one index line's record is on disk.
+///
+/// This is the visibility a listing has, answered without parsing the record:
+/// [`list_in`] drops a checkpoint whose cached record is missing, and a
+/// selection must count the same checkpoints, or `latest` would name one no
+/// command can show. A record that disappears between this check and the read
+/// is still a refusal, never a silent substitute.
+fn record_exists_in(state_dir: &Path, line: &IndexEntry) -> bool {
+    meta_cache_path_in(state_dir, &line.uuid).exists()
+}
+
+impl Store {
+    /// The index lines of the checkpoints a command can show, oldest first:
+    /// what selection needs before a single checkpoint record is read. A line
+    /// names its checkpoint and costs none of its payload.
+    pub(crate) fn handles(&self) -> Result<Vec<IndexEntry>> {
+        let state_dir = self.state_dir();
+        Ok(load_index_in(state_dir)?
+            .entries
+            .into_iter()
+            .filter(|line| record_exists_in(state_dir, line))
+            .collect())
+    }
+
+    /// The record one index line names, reading only that record.
+    pub(crate) fn record(&self, line: &IndexEntry) -> Result<Option<Entry>> {
+        record_in(self.state_dir(), line)
+    }
+
+    /// The record with this id, reading only that record.
+    pub(crate) fn record_by_id(&self, id: u64) -> Result<Option<Entry>> {
+        let index = load_index_in(self.state_dir())?;
+        match index.entries.iter().find(|line| line.id == id) {
+            Some(line) => record_in(self.state_dir(), line),
+            None => Ok(None),
+        }
+    }
+
+    /// The record with this uuid, reading only that record.
+    pub(crate) fn record_by_uuid(&self, uuid: &str) -> Result<Option<Entry>> {
+        match load_index_in(self.state_dir())?.by_uuid(uuid) {
+            Some(line) => record_in(self.state_dir(), line),
+            None => Ok(None),
+        }
+    }
 }
 
 /// How many checkpoints [`list_in`] would return, without parsing any record:
@@ -1319,8 +1400,17 @@ fn newest_in(state_dir: &Path, wanted: impl Fn(&Checkpoint) -> bool) -> Result<O
 }
 
 /// Turns `ID`, `latest`, `latest~N`, or `commit:<sha>` into a checkpoint id,
-/// resolved against `entries` (oldest first).
-pub(crate) fn resolve_ref(spec: &str, entries: &[Entry]) -> Result<u64> {
+/// resolved against the checkpoints a command may name, as `(id, uuid)`
+/// pairs oldest first.
+///
+/// **The one owner of the reference syntax.** A materialized record and an
+/// index line are asked the same question here, so a selection that reads
+/// no records accepts exactly what a listing accepts. It takes the pairs as an
+/// iterator, so answering a reference costs no copy of the list behind it.
+pub(crate) fn resolve_ref_parts<'a>(
+    spec: &str,
+    parts: impl DoubleEndedIterator<Item = (u64, &'a str)> + Clone,
+) -> Result<u64> {
     if let Some(rest) = spec.strip_prefix("latest") {
         let back: usize = match rest {
             "" => 0,
@@ -1329,15 +1419,15 @@ pub(crate) fn resolve_ref(spec: &str, entries: &[Entry]) -> Result<u64> {
                 .and_then(|n| n.parse().ok())
                 .ok_or_else(|| eyre!("invalid checkpoint reference {spec:?}"))?,
         };
-        return entries
-            .iter()
+        return parts
+            .clone()
             .rev()
             .nth(back)
-            .map(|entry| entry.id)
+            .map(|(id, _)| id)
             .ok_or_else(|| {
                 eyre!(
                     "no history checkpoint {spec} (only {} recorded)",
-                    entries.len()
+                    parts.count()
                 )
             });
     }
@@ -1347,10 +1437,10 @@ pub(crate) fn resolve_ref(spec: &str, entries: &[Entry]) -> Result<u64> {
         let id = spec.parse::<u64>().map_err(|_| {
             eyre!("invalid checkpoint ID {spec:?}; use commit:<sha> for a numeric commit hash")
         })?;
-        return entries
-            .iter()
-            .find(|entry| entry.id == id)
-            .map(|entry| entry.id)
+        return parts
+            .clone()
+            .find(|(part, _)| *part == id)
+            .map(|(id, _)| id)
             .ok_or_else(|| eyre!("no history checkpoint matches {spec:?}"));
     } else {
         spec
@@ -1358,15 +1448,25 @@ pub(crate) fn resolve_ref(spec: &str, entries: &[Entry]) -> Result<u64> {
     if prefix.is_empty() {
         bail!("invalid checkpoint reference {spec:?}");
     }
-    let matches: Vec<&Entry> = entries
-        .iter()
-        .filter(|entry| entry.checkpoint.uuid.starts_with(prefix))
-        .collect();
-    match matches.as_slice() {
-        [one] => Ok(one.id),
-        [] => bail!("no history checkpoint matches {spec:?}"),
-        _ => bail!("{spec:?} matches more than one checkpoint; use a longer prefix"),
+    // a uuid prefix names a checkpoint only when it names exactly one
+    let mut matches = parts.filter(|(_, uuid)| uuid.starts_with(prefix));
+    match (matches.next(), matches.next()) {
+        (Some((id, _)), None) => Ok(id),
+        (Some(_), Some(_)) => {
+            bail!("{spec:?} matches more than one checkpoint; use a longer prefix")
+        }
+        (None, _) => bail!("no history checkpoint matches {spec:?}"),
     }
+}
+
+/// [`resolve_ref_parts`] over materialized records (oldest first).
+pub(crate) fn resolve_ref(spec: &str, entries: &[Entry]) -> Result<u64> {
+    resolve_ref_parts(
+        spec,
+        entries
+            .iter()
+            .map(|entry| (entry.id, entry.checkpoint.uuid.as_str())),
+    )
 }
 
 pub fn now_rfc3339() -> String {

@@ -2621,6 +2621,24 @@ pub fn tree_path_to_display(tree_path: &str) -> String {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static OWNERSHIP_SEARCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread answered "which enrollment owns this path".
+/// A walk over a history must not pay it once per saved permission per
+/// checkpoint: every reader of directory modes goes through it.
+#[cfg(test)]
+pub(crate) fn reset_ownership_searches() {
+    OWNERSHIP_SEARCHES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn ownership_searches() -> usize {
+    OWNERSHIP_SEARCHES.with(std::cell::Cell::get)
+}
+
 /// Root aliases are portable through the home/config mapping. Aliases below
 /// those roots are not: canonicalizing them would silently change the enrolled
 /// destination on another machine. The leaf itself may still be a symlink.
@@ -2649,6 +2667,8 @@ pub(crate) fn owning_entry<'a>(
 /// uncovered one, and every selection and coverage decision downstream
 /// then goes the other way.
 pub(crate) fn owning_entry_index(entries: &[TrackedEntry], path: &Path) -> Option<usize> {
+    #[cfg(test)]
+    OWNERSHIP_SEARCHES.with(|count| count.set(count.get() + 1));
     entries
         .iter()
         .enumerate()

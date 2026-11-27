@@ -239,6 +239,64 @@ run = [
 description = 'Run tests with shuffling enabled'
 run = 'cargo +nightly test --all-features -- -Z unstable-options --shuffle'
 
+# A cold context is one with no index and no cached checkpoint metadata — a
+# machine that has just cloned the history. These are the two guarantees a
+# rollback on such a machine rests on, named for the proofs that gate them.
+["test:history"]
+description = "run the history model tests"
+run = "cargo test --all-features -p mise-system --lib -- history::"
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
+["test:history:cold-rollback"]
+description = "a cold rebuild derives each distinct manifest once, not once per checkpoint"
+run = "cargo test --all-features -p mise-system --lib -- history::checkpoint::tests::cold_rebuild_resolves_each_manifest_once"
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
+["test:history:cold-metadata-equivalence"]
+description = "a cold rebuild records exactly what a single commit read does"
+run = "cargo test --all-features -p mise-system --lib -- history::checkpoint::tests::cold_rebuild_matches_a_single_commit_read"
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
+["test:history:cold-restore"]
+description = "a cold encrypted history rolls back and undoes through the production path"
+run = "cargo test --all-features -p mise-system --lib -- history::checkpoint::tests::cold_restore"
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
+["test:history:replay-retention"]
+description = 'Prove rollback and undo read only the checkpoint records they replay'
+run = "cargo test -p mise-system --features vendored-lua --lib -- history::replay::retention"
+
+
+["test:history:retention"]
+description = "a full index rebuild holds one checkpoint payload at a time"
+run = """
+set -eu
+filter='history::checkpoint::tests::rebuild_index_holds_one_checkpoint_payload_at_a_time'
+listing=$(cargo test --all-features -p mise-system --lib -- --list)
+count=$(printf '%s\n' "$listing" | grep -c "$filter" || true)
+if [ "$count" -ne 1 ]; then
+  echo "expected 1 test matching $filter, found $count" >&2
+  exit 1
+fi
+cargo test --all-features -p mise-system --lib -- "$filter"
+"""
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
+["test:history:rebuild"]
+description = "a full index rebuild records every checkpoint row, id, and annotation"
+run = """
+set -eu
+filter='history::checkpoint::tests::rebuild_index_records_every_checkpoint_row'
+listing=$(cargo test --all-features -p mise-system --lib -- --list)
+count=$(printf '%s\n' "$listing" | grep -c "$filter" || true)
+if [ "$count" -ne 1 ]; then
+  echo "expected 1 test matching $filter, found $count" >&2
+  exit 1
+fi
+cargo test --all-features -p mise-system --lib -- "$filter"
+"""
+env = { CARGO_TERM_COLOR = "always", "RUST_TEST_THREADS" = "1" }
+
 [install-dev]
 description = 'Install the current project in debug mode'
 run = 'cargo install --path . --debug'
