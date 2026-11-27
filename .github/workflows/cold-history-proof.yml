@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install system dependencies
@@ -24,15 +24,16 @@ jobs:
         run: |
           curl --fail --location https://github.com/jdx/mise/releases/download/v2026.11.14/mise-v2026.11.14-linux-x64.tar.gz | tar -xz -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/mise/bin" >> "$GITHUB_PATH"
-      - name: Build public history API driver
+      - name: Build production CLI
         env:
           MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
           MISE_TASK_RUN_AUTO_INSTALL: "false"
           CARGO_BUILD_JOBS: "2"
-        run: mise run build:history-proof
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+          MISE_CARGO_BUILD_EXTRA_ARGS: --release
+        run: mise run build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: history-proof-linux-x64
-          path: target/release/examples/history-proof
+          name: mise-cold-linux-x64
+          path: target/release/mise
           if-no-files-found: error
           retention-days: 1
